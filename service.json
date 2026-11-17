@@ -63,6 +63,22 @@
         }
       },
       "required": false
+    },
+    {
+      "id": "qt-sqlite-driver",
+      "label": "Pilote SQLite de Qt",
+      "required_for": [
+        "storage"
+      ],
+      "packages": {
+        "debian": {
+          "build": [],
+          "runtime": [
+            "libqt6sql6-sqlite"
+          ]
+        }
+      },
+      "required": false
     }
   ]
 }
