@@ -22,6 +22,9 @@
       "exiftool": {
         "binary": "exiftool",
         "stay_open": true
+      },
+      "xmp": {
+        "enabled": true
       }
     }
   ]

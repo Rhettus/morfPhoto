@@ -6,6 +6,7 @@
 
 #include "morfphoto/FolderWatcher.h"
 #include "morfphoto/ContextFile.h"
+#include "morfphoto/LibraryMetadata.h"
 #include "morfphoto/PhotoScanner.h"
 
 #include <QDir>
@@ -56,7 +57,9 @@ bool isRelevantFile(const QString& name) {
     // Le scanner ignore les fichiers caches : inutile de declencher une passe pour eux.
     if (name.startsWith(QLatin1Char('.')))
         return false;
-    return fileTypeFor(QLatin1Char('.') + QFileInfo(name).suffix()) != QLatin1String("other");
+    const QString extension = QLatin1Char('.') + QFileInfo(name).suffix().toLower();
+    return fileTypeFor(extension) != QLatin1String("other") || extension == QLatin1String(".xmp")
+        || isExtendedImageExtension(extension);
 }
 #endif
 } // namespace
