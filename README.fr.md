@@ -88,6 +88,19 @@ POST /api/v1/purge               suppression DÉFINITIVE : {"scope":"folder|year
 Les racines autorisées sont déclarées dans la configuration ; les sélections
 gérées par l'API restent toujours à l'intérieur.
 
+### Clé d'API
+
+L'API est ouverte par défaut. Pour la protéger, définissez une clé avec la variable d'environnement
+`MORFPHOTO_API_KEY` ou `api_key` dans la configuration (la variable d'environnement a priorité). Chaque requête
+`/api/` doit alors la fournir :
+
+```sh
+curl -H "Authorization: Bearer VOTRE_CLE" http://127.0.0.1:8793/api/v1/photos/summary
+```
+
+Une clé absente ou erronée renvoie `401`. `/healthz`, `/status` et `/modules` restent ouverts pour la supervision.
+HTTP n'est pas chiffré : utilisez un proxy inverse TLS si le port est accessible au-delà d'un réseau de confiance.
+
 ## Compiler
 
 Nécessite **Qt 6** (Core, Network, Sql, Concurrent) et, à l'exécution, **ExifTool**.

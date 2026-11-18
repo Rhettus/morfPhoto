@@ -45,9 +45,10 @@ private:
     QByteArray buildStatusJson() const;
     void reply(QTcpSocket* sock, int code, const QByteArray& reason, const QByteArray& body,
                const QByteArray& contentType = QByteArrayLiteral("application/json; charset=utf-8"),
-               bool allowCors = false);
+               bool allowCors = false, const QByteArray& extraHeaders = {});
 
     ServiceConfig   m_config;
+    QByteArray      m_apiKey;
     ModuleRegistry* m_registry;
     QTcpServer*     m_server;
     QElapsedTimer   m_uptime;

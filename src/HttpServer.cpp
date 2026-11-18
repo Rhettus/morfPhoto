@@ -5,6 +5,7 @@
  */
 
 #include "morfphoto/HttpServer.h"
+#include "morfphoto/ApiAuth.h"
 #include "morfphoto/OriginCheck.h"
 #include "morfphoto/ModuleRegistry.h"
 #include "morfphoto/SelfDescription.h"
@@ -50,6 +51,7 @@ QByteArray reasonFor(int code) {
         case 201: return "Created";
         case 202: return "Accepted";
         case 400: return "Bad Request";
+        case 401: return "Unauthorized";
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
@@ -67,6 +69,9 @@ HttpServer::HttpServer(ServiceConfig config, ModuleRegistry* registry, QObject* 
       m_registry(registry),
       m_server(new QTcpServer(this)) {
     connect(m_server, &QTcpServer::newConnection, this, &HttpServer::onNewConnection);
+    // L'environnement prime : un secret de conteneur n'a pas a vivre dans un fichier.
+    const QString envKey = qEnvironmentVariable("MORFPHOTO_API_KEY").trimmed();
+    m_apiKey = (envKey.isEmpty() ? m_config.apiKey.trimmed() : envKey).toUtf8();
 }
 
 HttpServer::~HttpServer() = default;
@@ -129,6 +134,16 @@ void HttpServer::onSocketReadyRead(QTcpSocket* sock) {
     const QByteArray body   = buf.mid(bodyStart, needed);
 
     sock->setProperty("buf", QByteArray());
+
+    // Meme decoupe que handleRequest : la garde et le routage voient le meme chemin.
+    const int query = path.indexOf('?');
+    if (isApiPath(query < 0 ? path : path.left(query))
+        && !isAuthorized(headerValue(headerBlock, "Authorization"), m_apiKey)) {
+        reply(sock, 401, reasonFor(401), "{\"error\":\"unauthorized\"}",
+              QByteArrayLiteral("application/json; charset=utf-8"), false,
+              QByteArrayLiteral("WWW-Authenticate: Bearer\r\n"));
+        return;
+    }
     handleRequest(sock, method, path, body);
 }
 
@@ -211,7 +226,8 @@ QByteArray HttpServer::buildStatusJson() const {
 }
 
 void HttpServer::reply(QTcpSocket* sock, int code, const QByteArray& reason, const QByteArray& body,
-                       const QByteArray& contentType, bool allowCors) {
+                       const QByteArray& contentType, bool allowCors,
+                       const QByteArray& extraHeaders) {
     QByteArray resp;
     resp += "HTTP/1.1 " + QByteArray::number(code) + " " + reason + "\r\n";
     resp += "Content-Type: " + contentType + "\r\n";
@@ -219,6 +235,7 @@ void HttpServer::reply(QTcpSocket* sock, int code, const QByteArray& reason, con
     // CORS ouvert en lecture seule uniquement : jamais sur une ecriture (CSRF).
     if (allowCors)
         resp += "Access-Control-Allow-Origin: *\r\n";
+    resp += extraHeaders;
     resp += "Connection: close\r\n\r\n";
     resp += body;
     sock->write(resp);
