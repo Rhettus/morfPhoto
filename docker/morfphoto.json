@@ -1,0 +1,28 @@
+{
+  "_comment": "Configuration de l'image Docker. La base vit sur le volume /data (STATE_DIRECTORY), les photos sous /photos en lecture seule. Beacon coupe : une diffusion UDP ne sort pas d'un reseau bridge.",
+  "app_name": "morfPhoto",
+  "http_port": 8793,
+  "bind_address": "0.0.0.0",
+  "beacon": {
+    "enabled": false
+  },
+  "modules": [
+    {
+      "type": "photo",
+      "id": "photo-1",
+      "db_path": "",
+      "roots": ["/photos"],
+      "watch": {
+        "_comment": "Une passe au demarrage puis une par jour : rattrape ce qui a change pendant l'arret du conteneur.",
+        "interval_ms": 86400000,
+        "availability_timeout_ms": 5000,
+        "realtime": true,
+        "debounce_ms": 2000
+      },
+      "exiftool": {
+        "binary": "exiftool",
+        "stay_open": true
+      }
+    }
+  ]
+}

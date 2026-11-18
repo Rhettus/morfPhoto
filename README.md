@@ -144,6 +144,11 @@ push` replaces the deployed file with the one from the repo - keep a real
 (Use `service.py config` with no mode to only add a new version's keys while keeping
 your settings.)
 
+## Run with Docker
+
+A ready-made image with every dependency included is available for `linux/amd64` and `linux/arm64`. See the
+[Docker deployment guide](docs/en/DOCKER.md).
+
 ## License
 
 GPL-3.0-only - © 2026 morfredus (Frédéric Biron).

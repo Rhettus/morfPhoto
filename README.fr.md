@@ -148,6 +148,11 @@ Contrairement à `service.py update` (qui n'ajoute que les clés manquantes, san
 (Sans mode, `service.py config` n'ajoute que les clés d'une nouvelle version en gardant
 vos réglages.)
 
+## Lancer avec Docker
+
+Une image prête à l'emploi, toutes dépendances incluses, est disponible pour `linux/amd64` et `linux/arm64`.
+Voir le [guide de déploiement Docker](docs/fr/DOCKER.md).
+
 ## Licence
 
 GPL-3.0-only - © 2026 morfredus (Frédéric Biron).

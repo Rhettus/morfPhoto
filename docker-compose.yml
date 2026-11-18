@@ -1,0 +1,23 @@
+services:
+  morfphoto:
+    image: ${MORFPHOTO_IMAGE:-ghcr.io/rhettus/morfphoto:latest}
+    container_name: morfphoto
+    restart: unless-stopped
+    ports:
+      - "${MORFPHOTO_PORT:-8793}:8793"
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      MORFPHOTO_API_KEY: ${MORFPHOTO_API_KEY:-}
+    volumes:
+      - morfphoto-data:/data
+      - type: bind
+        source: ${PHOTOS_DIR:?Set PHOTOS_DIR in .env}
+        target: /photos
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  morfphoto-data:
+    name: morfphoto-data
