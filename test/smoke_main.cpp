@@ -24,6 +24,7 @@
 #include "morfphoto/PhotoScanner.h"
 #include "morfphoto/PhotoRepository.h"
 #include "morfphoto/ExifExtractor.h"
+#include "morfphoto/LibraryMetadata.h"
 #include "morfphoto/Indexer.h"
 #include "morfphoto/ContextFile.h"
 #include "morfphoto/SmbSourceNaming.h"
@@ -493,6 +494,166 @@ int main(int argc, char** argv) {
               "marqueur dans un nom de fichier ignore");
         CHECK(ExifExtractor::markerPos("x\n{ready3}", m) < 0, "marqueur sans fin de ligne: attendre");
         CHECK(ExifExtractor::markerPos("{ready3}\r\n", m) == 0, "marqueur CRLF reconnu");
+    }
+
+    // --- 10) Bibliotheque : EXIF + XMP reunis ---
+    {
+        const QString baseDir = base;
+        CHECK(decimalLabel(2.55, 1) == QLatin1String("2.5"), "libelle: 2.55 -> 2.5 (valeur binaire)");
+        CHECK(decimalLabel(2.25, 1) == QLatin1String("2.3"), "libelle: 2.25 -> 2.3 (demi superieur)");
+        CHECK(decimalLabel(35.0, 0) == QLatin1String("35"), "libelle: 35 mm entier");
+        CHECK(decimalLabel(2.0, 1) == QLatin1String("2"), "libelle: f/2 sans decimale");
+        CHECK(shutterLabel(0.004) == QLatin1String("1/250"), "libelle: vitesse rapide en fraction");
+        CHECK(shutterLabel(0.5) == QLatin1String("0.5s"), "libelle: vitesse lente en secondes");
+
+        const QByteArray ns =
+            "xmlns:x=\"adobe:ns:meta/\" xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" "
+            "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+            "xmlns:lr=\"http://ns.adobe.com/lightroom/1.0/\" xmlns:darktable=\"http://darktable.sf.net/\" "
+            "xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" xmlns:immage=\"https://github.com/Rhettus/immage/ns/1.0/\"";
+        auto xmp = [&ns](const QByteArray& attributes, const QByteArray& body) {
+            return "<x:xmpmeta " + ns + "><rdf:RDF><rdf:Description rdf:about=\"\" " + attributes + ">"
+                   + body + "</rdf:Description></rdf:RDF></x:xmpmeta>";
+        };
+        const QByteArray bag =
+            "<darktable:history><rdf:Seq><rdf:li darktable:num=\"0\"/></rdf:Seq></darktable:history>"
+            "<darktable:colorlabels><rdf:Seq><rdf:li>0</rdf:li><rdf:li>3</rdf:li></rdf:Seq></darktable:colorlabels>"
+            "<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Titre</rdf:li></rdf:Alt></dc:title>"
+            "<dc:subject><rdf:Bag><rdf:li>japan</rdf:li></rdf:Bag></dc:subject>"
+            "<lr:hierarchicalSubject><rdf:Bag><rdf:li>travel|japan</rdf:li>"
+            "<rdf:li>darktable|format|orf</rdf:li></rdf:Bag></lr:hierarchicalSubject>";
+        const QByteArray edited = xmp(
+            "xmp:Rating=\"4\" darktable:xmp_version=\"5\" darktable:history_auto_hash=\"a\" "
+            "darktable:history_basic_hash=\"b\" darktable:history_current_hash=\"c\" "
+            "exif:DateTimeOriginal=\"2023:02:19 17:52:53.000\" exif:GPSLatitude=\"48,30.0S\" "
+            "exif:GPSLongitude=\"2,15.0E\"", bag);
+
+        ExifData exifBase;
+        exifBase.takenAt = QStringLiteral("2020-01-01 00:00:00");
+        exifBase.rating = 1;
+        exifBase.latitude = 10.0;
+        exifBase.longitude = 20.0;
+        exifBase.raw[QStringLiteral("Subject")] = QStringLiteral("embedded");
+
+        const SidecarData data = parseSidecar(edited);
+        CHECK(data.ok && !data.properties.contains(QStringLiteral("darktable:history")),
+              "xmp: sidecar lu, historique d'edition ignore");
+        const LibraryVersion v = mergeVersion(0, QStringLiteral("/x.xmp"), &data, exifBase);
+        CHECK(v.rating == 4 && !v.rejected, "xmp: la note du sidecar l'emporte");
+        CHECK(v.labels == (1 | 8), "xmp: etiquettes darktable en bits");
+        CHECK(v.edited.toBool(), "xmp: empreinte differente de auto et basic -> retouchee");
+        CHECK(v.keywords == QStringList{QStringLiteral("travel|japan")},
+              "xmp: hierarchie conservee, etiquettes darktable| exclues");
+        CHECK(v.takenAt.toString() == QLatin1String("2023-02-19 17:52:53"), "xmp: date du sidecar prioritaire");
+        CHECK(qFuzzyCompare(v.latitude.toDouble(), -48.5), "xmp: GPS sud converti");
+        CHECK(v.title.toString() == QLatin1String("Titre"), "xmp: titre lu");
+
+        const SidecarData autoOnly = parseSidecar(xmp(
+            "darktable:xmp_version=\"5\" darktable:history_auto_hash=\"a\" "
+            "darktable:history_current_hash=\"a\" xmp:Rating=\"-1\"", ""));
+        const LibraryVersion av = mergeVersion(0, QStringLiteral("/x.xmp"), &autoOnly, exifBase);
+        CHECK(av.edited.isValid() && !av.edited.toBool(), "xmp: reglages automatiques seuls -> non retouchee");
+        CHECK(av.rejected && av.rating == 0, "xmp: note -1 -> rejetee");
+        CHECK(av.keywords.isEmpty(), "xmp: sidecar darktable sans mot-cle fait foi");
+
+        const SidecarData managed = parseSidecar(xmp("immage:locationManaged=\"True\"", ""));
+        CHECK(mergeVersion(0, QStringLiteral("/x.xmp"), &managed, exifBase).latitude.isNull(),
+              "xmp: locationManaged -> GPS retire volontairement");
+        const SidecarData foreign = parseSidecar(xmp("xmp:Label=\"Green\"", ""));
+        const LibraryVersion fv = mergeVersion(0, QStringLiteral("/x.xmp"), &foreign, exifBase);
+        CHECK(fv.labels == 4 && !fv.edited.isValid(), "xmp: autre logiciel -> etiquette lue, retouche inconnue");
+        CHECK(fv.keywords == QStringList{QStringLiteral("embedded")}, "xmp: mots-cles embarques en repli");
+        CHECK(!parseSidecar("<x:xmpmeta><broken").ok, "xmp: sidecar invalide signale");
+
+        const LibraryFileLabels labels = fileLabels(QStringLiteral("a.jpeg"), exifBase);
+        CHECK(labels.kind == QLatin1String("JPEG") && labels.extension == QLatin1String("JPG"),
+              "xmp: type de fichier comme le client");
+        CHECK(fileLabels(QStringLiteral("a.ORF"), exifBase).kind == QLatin1String("RAW"), "xmp: groupe RAW");
+
+        // Cycle complet sur disque.
+        const QString lib = baseDir + QStringLiteral("/library");
+        QDir().mkpath(lib + QStringLiteral("/2024/sub"));
+        auto put = [](const QString& path, const QByteArray& bytes) {
+            QFile f(path);
+            if (f.open(QIODevice::WriteOnly)) f.write(bytes);
+        };
+        writeBytes(lib + QStringLiteral("/2024/a.nef"), 100);
+        writeBytes(lib + QStringLiteral("/2024/a_01.nef"), 110);       // vrai fichier, pas une copie
+        writeBytes(lib + QStringLiteral("/2024/b.jpg"), 120);
+        writeBytes(lib + QStringLiteral("/2024/sub/c.sr2"), 130);      // format supplementaire
+        put(lib + QStringLiteral("/2024/a.nef.xmp"), edited);
+        put(lib + QStringLiteral("/2024/a_02.nef.xmp"), xmp(
+            "xmp:Rating=\"2\" darktable:xmp_version=\"5\"",
+            "<dc:subject><rdf:Bag><rdf:li>copy-only</rdf:li></rdf:Bag></dc:subject>"));
+        put(lib + QStringLiteral("/2024/a_01.nef.xmp"), xmp("xmp:Rating=\"5\"", ""));
+        put(lib + QStringLiteral("/2024/b.xmp"), xmp("xmp:Rating=\"3\"", ""));
+
+        PhotoRepository lrepo(QStringLiteral("smoke:library"));
+        CHECK(lrepo.open(lib + QStringLiteral("/db.sqlite")), "bibliotheque: base ouverte (migration v7)");
+        const int libFolder = lrepo.addFolder(lib, lib, QVariant(), true, false, QVariant(), nowIso());
+
+        Indexer plain(&lrepo, nullptr, {lib});
+        plain.run(IndexMode::Full, {}, QStringLiteral("cli"));
+        CHECK(lrepo.summary().value(QStringLiteral("files_present")).toInt() == 3,
+              "bibliotheque desactivee: formats supplementaires ignores");
+        CHECK(lrepo.libraryList({}, 1, 50).value(QStringLiteral("total")).toInt() == 0,
+              "bibliotheque desactivee: aucune donnee XMP");
+
+        Indexer lidx(&lrepo, nullptr, {lib});
+        lidx.setLibraryEnabled(true);
+        lidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        CHECK(lrepo.libraryList({}, 1, 50).value(QStringLiteral("total")).toInt() == 4,
+              "bibliotheque: photos existantes relues + nouveau format");
+
+        auto total = [&lrepo](const LibraryFilter& f) {
+            return lrepo.libraryList(f, 1, 50).value(QStringLiteral("total")).toInt();
+        };
+        LibraryFilter parent; parent.keywords = {QStringLiteral("travel")};
+        CHECK(total(parent) == 1, "filtre: un mot-cle parent couvre ses enfants");
+        LibraryFilter partial; partial.keywords = {QStringLiteral("trav")};
+        CHECK(total(partial) == 0, "filtre: un debut de mot n'est pas un parent");
+        LibraryFilter sameVersion; sameVersion.keywords = {QStringLiteral("copy-only")}; sameVersion.minRating = 4;
+        CHECK(total(sameVersion) == 0, "filtre: toutes les conditions sur la meme version");
+        LibraryFilter copyOnly; copyOnly.keywords = {QStringLiteral("copy-only")}; copyOnly.minRating = 2;
+        const QJsonObject copyPage = lrepo.libraryList(copyOnly, 1, 50);
+        const QJsonObject item = copyPage.value(QStringLiteral("items")).toArray().at(0).toObject();
+        CHECK(item.value(QStringLiteral("matched_versions")).toArray() == QJsonArray{2},
+              "filtre: version correspondante indiquee");
+        CHECK(item.value(QStringLiteral("versions")).toArray().size() == 2, "versions: copies imbriquees");
+        CHECK(item.value(QStringLiteral("relative_path")).toString() == QLatin1String("2024/a.nef"),
+              "versions: chemin relatif a la racine");
+        LibraryFilter editedOnly; editedOnly.edited = QStringLiteral("edited");
+        CHECK(total(editedOnly) == 1, "filtre: retouchees");
+        LibraryFilter uneditedOnly; uneditedOnly.edited = QStringLiteral("unedited");
+        CHECK(total(uneditedOnly) == 1, "filtre: sans sidecar -> non retouchee, inconnu exclu");
+        LibraryFilter realFile; realFile.filename = QStringLiteral("a_01"); realFile.minRating = 5;
+        CHECK(total(realFile) == 1, "sidecar: un vrai fichier a_01 garde le sien");
+        LibraryFilter shared; shared.filename = QStringLiteral("b.jpg"); shared.minRating = 3;
+        CHECK(total(shared) == 1, "sidecar: repli sur b.xmp");
+        LibraryFilter kind; kind.kinds = {QStringLiteral("RAW")};
+        CHECK(total(kind) == 3, "filtre: groupe RAW");
+        LibraryFilter folder; folder.folderPath = lib + QStringLiteral("/2024");
+        CHECK(total(folder) == 3, "filtre: dossier seul");
+        folder.recursive = true;
+        CHECK(total(folder) == 4, "filtre: dossier et sous-dossiers");
+
+        const QJsonObject facets = lrepo.libraryFacets({});
+        bool parentCounted = false;
+        for (const QJsonValue& value : facets.value(QStringLiteral("keywords")).toArray())
+            parentCounted = parentCounted || (value.toObject().value(QStringLiteral("value")).toString() == QLatin1String("travel")
+                                              && value.toObject().value(QStringLiteral("count")).toInt() == 1);
+        CHECK(parentCounted, "facettes: le niveau parent est compte");
+
+        // Seul le sidecar change : detecte sans toucher a l'image.
+        put(lib + QStringLiteral("/2024/b.xmp"), xmp("xmp:Rating=\"1\" dc:format=\"changed\"", ""));
+        lidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        LibraryFilter lowered; lowered.filename = QStringLiteral("b.jpg"); lowered.minRating = 2;
+        CHECK(total(lowered) == 0, "sidecar modifie -> nouvelle note prise en compte");
+
+        lrepo.purgeFolder(libFolder);
+        CHECK(lrepo.libraryList({}, 1, 50).value(QStringLiteral("total")).toInt() == 0,
+              "purge: donnees XMP effacees avec le fichier");
+        lrepo.close();
     }
 
     // Anti-CSRF : Origin different de Host sur une ecriture = refus.

@@ -63,8 +63,10 @@ bool probeAccessible(const QString& path, int timeoutMs);
 // false (source perdue en cours de route). Sans callback, le scan va toujours au
 // bout et `completed` vaut true. C'est le mécanisme qui borne le « ça a l'air
 // figé » sans imposer de deadline arbitraire à un gros parcours légitime.
+// `library` : relève aussi les sidecars `.xmp` et les formats supplémentaires.
 ScanResult scanFolder(const QString& folder, bool recursive,
-                      const std::function<bool()>& stillAvailable = {});
+                      const std::function<bool()>& stillAvailable = {},
+                      bool library = false);
 
 // Compte les fichiers image sans les charger en mémoire (pas d'EXIF, pas de
 // FileInfo). Utile aux tests et à un diagnostic ; l'indexation n'en fait plus

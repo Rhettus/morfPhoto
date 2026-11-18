@@ -109,6 +109,23 @@ cmake --preset mingw        # or linux / linux-arm64
 cmake --build --preset mingw
 ```
 
+## Library API (EXIF + XMP)
+
+Set `xmp.enabled` to `true` in the module configuration to index EXIF and XMP together, including darktable
+sidecars, keywords, colour labels, ratings, rejected state, edit status and virtual copies. Sidecars are read
+only. The next pass reads each photo once, and extra formats such as CRW, SR2, AVIF and JXL are indexed too.
+
+```
+GET /api/v1/library          filtered photos, each with its nested versions
+GET /api/v1/library/facets   filterable values with counts
+GET /api/v1/library/{id}     one photo, with raw_exif and raw_xmp
+```
+
+Filters: `min_rating`, `rejected` (`hide`, `only`), `edited` (`edited`, `unedited`), `labels` (bits: red 1, yellow 2,
+green 4, blue 8, purple 16), `unlabeled`, `taken_from`, `taken_to`, `folder_path`, `recursive`, `filename`, and the
+repeatable `kind`, `camera`, `body`, `lens`, `keyword`, `iso`, `aperture`, `focal`, `shutter`. All conditions must
+match the same version, and `matched_versions` lists the ones that did.
+
 ## Run
 
 ```sh

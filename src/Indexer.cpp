@@ -9,6 +9,7 @@
 #include "morfphoto/ExifExtractor.h"
 #include "morfphoto/PhotoScanner.h"
 #include "morfphoto/ContextFile.h"
+#include "morfphoto/LibraryMetadata.h"
 
 #include <QDateTime>
 #include <QSet>
@@ -26,6 +27,9 @@ namespace {
 QString nowIso() {
     return QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
 }
+
+// Garde-fou : un fichier .xmp demesure n'est pas un sidecar.
+constexpr qint64 kMaxSidecarBytes = 64 * 1024 * 1024;
 } // namespace
 
 Indexer::Indexer(PhotoRepository* repo, ExifExtractor* extractor, QStringList roots,
@@ -154,6 +158,8 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
     }
 
     const KnownFiles known = m_repo->existingFilesInFolder(folder.id);
+    const QHash<int, QString> fingerprints = m_library ? m_repo->libraryFingerprints(folder.id)
+                                                       : QHash<int, QString>();
     QSet<QString> seen;
     QSet<QString> dirs;   // répertoires distincts vus, pour la découverte de contexte
 
@@ -161,7 +167,8 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
     // source meurt en plein parcours, le scan s'arrête et signale l'incomplétude.
     const ScanResult scan = scanFolder(
         folder.path, folder.recursive,
-        [this, &folder]() { return probeAccessible(folder.rootPath, m_probeTimeoutMs); });
+        [this, &folder]() { return probeAccessible(folder.rootPath, m_probeTimeoutMs); },
+        m_library);
 
     // Total « connu pour l'instant » = fichiers déjà listés. Ça grandit dossier
     // après dossier ; le pourcentage se recalcule sans second parcours.
@@ -192,15 +199,34 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
         if (it == known.end()) {
             ExifData exif;
             const bool ok = extract(runId, info.path, counts, exif);
-            m_repo->insertFile(folder.id, info, exif, ok, nowIso());
+            const int fileId = m_repo->insertFile(folder.id, info, exif, ok, nowIso());
+            if (m_library && fileId > 0)
+                applyLibrary(fileId, info, runId, counts);
             ++counts.created;
         } else if (mode == IndexMode::Full || it->size != info.size || it->mtime != info.mtime) {
             ExifData exif;
             const bool ok = extract(runId, info.path, counts, exif);
             m_repo->updateFile(it->id, info, exif, ok, nowIso());
+            if (m_library)
+                applyLibrary(it->id, info, runId, counts);
             ++counts.updated;
         } else {
             m_repo->touchSeen(it->id, nowIso());
+            if (m_library) {
+                const auto known = fingerprints.constFind(it->id);
+                if (known == fingerprints.constEnd()) {
+                    // Indexee avant l'activation : il manque les champs demandes a ExifTool.
+                    ExifData exif;
+                    const bool ok = extract(runId, info.path, counts, exif);
+                    m_repo->updateFile(it->id, info, exif, ok, nowIso());
+                    applyLibrary(it->id, info, runId, counts);
+                    ++counts.updated;
+                } else if (*known != info.sidecarFingerprint) {
+                    // Seul le sidecar a change : inutile de relire l'image.
+                    applyLibrary(it->id, info, runId, counts);
+                    ++counts.updated;
+                }
+            }
         }
     }
 
@@ -246,6 +272,36 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
 
     m_repo->setFolderScanned(folder.id, nowIso());
     return false;
+}
+
+void Indexer::applyLibrary(int fileId, const FileInfo& info, int runId, RunCounts& counts) {
+    const ExifData base = m_repo->libraryBase(fileId);
+    QVector<LibraryVersion> versions;
+    for (const SidecarRef& ref : info.sidecars) {
+        // `photo_01` et `photo_001` designent la meme version : garder la premiere.
+        if (!versions.isEmpty() && versions.last().version == ref.version)
+            continue;
+        SidecarData data;
+        QFile file(ref.path);
+        if (file.size() <= kMaxSidecarBytes && file.open(QIODevice::ReadOnly))
+            data = parseSidecar(file.readAll());
+        if (data.ok) {
+            versions << mergeVersion(ref.version, ref.path, &data, base);
+        } else {
+            // Un sidecar illisible ne bloque jamais la passe, mais son etat reste inconnu.
+            m_repo->logError(runId, ref.path, QStringLiteral("xmp"),
+                             QStringLiteral("sidecar illisible"), nowIso());
+            ++counts.errors;
+            LibraryVersion version = mergeVersion(ref.version, QString(), nullptr, base);
+            version.edited = QVariant();
+            versions << version;
+        }
+    }
+    if (versions.isEmpty())
+        versions << mergeVersion(0, QString(), nullptr, base);
+    for (LibraryVersion& version : versions)
+        version.copy = version.version != versions.first().version;
+    m_repo->storeLibrary(fileId, info.sidecarFingerprint, fileLabels(info.filename, base), versions);
 }
 
 void Indexer::refreshContexts(const QSet<QString>& directories, int runId, RunCounts& counts) {

@@ -66,6 +66,7 @@ PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* 
     const QJsonObject exif = params.value(QStringLiteral("exiftool")).toObject();
     m_exiftoolBinary = exif.value(QStringLiteral("binary")).toString(QStringLiteral("exiftool"));
     m_stayOpen       = exif.value(QStringLiteral("stay_open")).toBool(true);
+    m_library = params.value(QStringLiteral("xmp")).toObject().value(QStringLiteral("enabled")).toBool(false);
 }
 
 PhotoModule::~PhotoModule() {
@@ -201,8 +202,10 @@ void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QString trigger
         PhotoRepository repo(QStringLiteral("morfphoto:index:%1").arg(pass));
         if (repo.open(m_dbPath)) {
             ExifExtractor extractor(m_exiftoolBinary, m_stayOpen);
+            extractor.setLibraryTags(m_library);
             extractor.open();
             Indexer indexer(&repo, &extractor, roots, m_probeTimeoutMs);
+            indexer.setLibraryEnabled(m_library);
             // Relais de progression : l'Indexer rappelle depuis CE thread ; on recopie
             // sous verrou dans les membres lus par observableState() (thread HTTP).
             indexer.setProgressCallback([this](const IndexProgress& p) {
@@ -461,6 +464,19 @@ QJsonArray PhotoModule::lenses()  const { return m_readRepo ? m_readRepo->distin
 QJsonArray PhotoModule::focals()  const { return m_readRepo ? m_readRepo->distinctFocals()  : QJsonArray{}; }
 QJsonArray PhotoModule::years()   const { return m_readRepo ? m_readRepo->years()           : QJsonArray{}; }
 QJsonObject PhotoModule::photoDataset() const { return m_readRepo ? m_readRepo->photoDataset() : QJsonObject{}; }
+
+// --- Bibliothèque -----------------------------------------------------------
+
+QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int pageSize) const {
+    return m_readRepo ? m_readRepo->libraryList(filter, page, pageSize) : QJsonObject{};
+}
+QJsonObject PhotoModule::libraryFacets(const LibraryFilter& filter) const {
+    return m_readRepo ? m_readRepo->libraryFacets(filter) : QJsonObject{};
+}
+QJsonObject PhotoModule::libraryPhoto(int fileId, bool* found) const {
+    if (!m_readRepo) { if (found) *found = false; return {}; }
+    return m_readRepo->libraryPhoto(fileId, found);
+}
 
 // --- Contexte photographique (morfphoto-context/2) --------------------------
 
