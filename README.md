@@ -85,6 +85,18 @@ POST /api/v1/purge               PERMANENT deletion: {"scope":"folder|year|camer
 Allowed roots are declared in the configuration; selections managed through the API
 always stay inside them.
 
+### API key
+
+The API is open by default. To protect it, set a key with the `MORFPHOTO_API_KEY` environment variable or
+`api_key` in the configuration (the environment variable wins). Every `/api/` request must then send it:
+
+```sh
+curl -H "Authorization: Bearer YOUR_KEY" http://127.0.0.1:8793/api/v1/photos/summary
+```
+
+A missing or wrong key returns `401`. `/healthz`, `/status` and `/modules` stay open for monitoring. HTTP is
+not encrypted, so use a TLS reverse proxy if the port is reachable beyond a trusted network.
+
 ## Build
 
 Needs **Qt 6** (Core, Network, Sql, Concurrent) and, at runtime, **ExifTool**.

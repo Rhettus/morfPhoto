@@ -7,6 +7,9 @@
   "http_port": 8793,
   "bind_address": "0.0.0.0",
 
+  "_comment_api_key": "Cle exigee sur /api/ via l'en-tete 'Authorization: Bearer <cle>'. Vide = pas d'authentification. La variable d'environnement MORFPHOTO_API_KEY a priorite. /healthz, /status et /modules restent ouverts.",
+  "api_key": "",
+
   "beacon": {
     "_comment": "Annonce de presence sur le LAN (protocole morfBeacon, port du parc).",
     "enabled": true,

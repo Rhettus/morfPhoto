@@ -28,6 +28,7 @@
 #include "morfphoto/ContextFile.h"
 #include "morfphoto/SmbSourceNaming.h"
 #include "morfphoto/OriginCheck.h"
+#include "morfphoto/ApiAuth.h"
 
 using namespace morfphoto;
 
@@ -501,6 +502,18 @@ int main(int argc, char** argv) {
     CHECK(isCrossOriginWrite("POST", "http://evil.example", "pi:8791"), "origine tierce: refus");
     CHECK(isCrossOriginWrite("DELETE", "null", "pi:8791"), "Origin null: refus");
     CHECK(!isCrossOriginWrite("GET", "http://evil.example", "pi:8791"), "GET jamais bloque");
+
+    // Cle d'API : optionnelle, exigee seulement sur /api/ quand elle est configuree.
+    CHECK(isAuthorized("", ""), "cle: sans cle configuree, tout passe");
+    CHECK(isAuthorized("Bearer s3cret", "s3cret"), "cle: bonne cle acceptee");
+    CHECK(isAuthorized("bearer   s3cret ", "s3cret"), "cle: schema insensible a la casse");
+    CHECK(!isAuthorized("", "s3cret"), "cle: en-tete absent refuse");
+    CHECK(!isAuthorized("Bearer faux", "s3cret"), "cle: mauvaise cle refusee");
+    CHECK(!isAuthorized("Bearer s3cret2", "s3cret"), "cle: cle plus longue refusee");
+    CHECK(!isAuthorized("Basic s3cret", "s3cret"), "cle: autre schema refuse");
+    CHECK(!isAuthorized("Bearer ", "s3cret"), "cle: valeur vide refusee");
+    CHECK(isApiPath("/api/v1/photos"), "cle: /api/ protege");
+    CHECK(!isApiPath("/healthz") && !isApiPath("/status"), "cle: supervision ouverte");
 
     repo2.close();
     QDir(base).removeRecursively();
