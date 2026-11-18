@@ -2,7 +2,7 @@ name: Docker image
 
 on:
   push:
-    branches: [main]
+    branches: [main, fork/nas]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -36,8 +36,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ steps.version.outputs.value }},enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/fork/nas' }}
+            type=raw,value=${{ steps.version.outputs.value }},enable=${{ github.ref == 'refs/heads/fork/nas' }}
             type=semver,pattern={{version}}
             type=sha
 
