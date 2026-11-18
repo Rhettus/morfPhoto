@@ -9,8 +9,10 @@
 #include "morfphoto/ExifExtractor.h"
 #include "morfphoto/PhotoScanner.h"
 #include "morfphoto/ContextFile.h"
+#include "morfphoto/FolderWatcher.h"
 #include "morfphoto/Paths.h"
 
+#include <QThread>
 #include <QTimer>
 #include <QtConcurrent>
 #include <QDateTime>
@@ -62,6 +64,8 @@ PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* 
     // Délai borné des sondes d'accessibilité de racine (tolérance aux montages
     // distants). Configurable : pas de seuil en dur (règle 11 morfSystem).
     m_probeTimeoutMs = watch.value(QStringLiteral("availability_timeout_ms")).toInt(m_probeTimeoutMs);
+    m_realtime   = watch.value(QStringLiteral("realtime")).toBool(false);
+    m_debounceMs = watch.value(QStringLiteral("debounce_ms")).toInt(m_debounceMs);
 
     const QJsonObject exif = params.value(QStringLiteral("exiftool")).toObject();
     m_exiftoolBinary = exif.value(QStringLiteral("binary")).toString(QStringLiteral("exiftool"));
@@ -125,12 +129,73 @@ bool PhotoModule::start() {
         triggerIndex(IndexMode::Incremental, {}, QStringLiteral("watch"));
     }
 
+    if (m_realtime)
+        startWatcher();
+
     m_started = true;
     return true;
 }
 
+void PhotoModule::startWatcher() {
+    m_realtimeRetry = new QTimer(this);
+    m_realtimeRetry->setSingleShot(true);
+    m_realtimeRetry->setInterval(1000);
+    connect(m_realtimeRetry, &QTimer::timeout, this, &PhotoModule::submitRealtime);
+
+    m_watcherThread = new QThread(this);
+    m_watcher = new FolderWatcher(m_debounceMs, m_probeTimeoutMs);
+    m_watcher->moveToThread(m_watcherThread);
+    connect(m_watcherThread, &QThread::finished, m_watcher, &QObject::deleteLater);
+    connect(m_watcher, &FolderWatcher::foldersChanged, this, [this](const QVector<int>& ids) {
+        for (int id : ids)
+            m_pendingRealtime.insert(id);
+        submitRealtime();
+    });
+    m_watcherThread->start();
+    refreshWatcher();
+}
+
+void PhotoModule::stopWatcher() {
+    if (!m_watcherThread)
+        return;
+    m_realtimeRetry->stop();
+    m_watcher->requestStop();
+    m_watcherThread->quit();
+    if (!m_watcherThread->wait(15000)) {
+        m_watcherThread->terminate();
+        m_watcherThread->wait();
+    }
+    delete m_watcherThread;
+    m_watcherThread = nullptr;
+    m_watcher = nullptr;
+}
+
+void PhotoModule::refreshWatcher() {
+    if (!m_watcher || !m_readRepo)
+        return;
+    QVector<WatchTarget> targets;
+    for (const FolderRow& folder : m_readRepo->activeFolders())
+        targets.push_back({folder.id, folder.path, folder.recursive});
+    FolderWatcher* watcher = m_watcher;
+    QMetaObject::invokeMethod(watcher, [watcher, targets]() { watcher->setTargets(targets); },
+                              Qt::QueuedConnection);
+}
+
+void PhotoModule::submitRealtime() {
+    if (m_pendingRealtime.isEmpty())
+        return;
+    const QVector<int> ids(m_pendingRealtime.cbegin(), m_pendingRealtime.cend());
+    // Une passe tourne deja : elle a pu manquer ce changement, on repassera apres elle.
+    if (triggerIndex(IndexMode::Incremental, ids, QStringLiteral("inotify"))
+            .value(QStringLiteral("accepted")).toBool())
+        m_pendingRealtime.clear();
+    else
+        m_realtimeRetry->start();
+}
+
 void PhotoModule::stop() {
     m_started = false;
+    stopWatcher();
     if (m_watchTimer) {
         m_watchTimer->stop();
         m_watchTimer->deleteLater();
@@ -289,6 +354,8 @@ QJsonObject PhotoModule::observableState() const {
     QJsonObject watch;
     watch["auto"]        = (m_intervalMs > 0);
     watch["interval_ms"] = m_intervalMs;
+    if (m_watcher)
+        watch["realtime"] = m_watcher->statusJson();
     o["watch"] = watch;
 
     // État du prérequis ExifTool. Un binaire absent ne fait pas tomber le service
@@ -709,12 +776,14 @@ bool PhotoModule::addFolder(const QString& path, const QVariant& label, bool rec
             return false;
         m_readRepo->setFolderMedia(existing, removable, volumeLabel);
         if (out) *out = findById(m_readRepo->listFoldersDetail(), existing);
+        refreshWatcher();
         return true;
     }
 
     const int id = m_readRepo->addFolder(path, root, label, recursive, removable, volumeLabel, nowIso());
     if (id < 0) { if (error) *error = QStringLiteral("insertion impossible"); return false; }
     if (out) *out = findById(m_readRepo->listFoldersDetail(), id);
+    refreshWatcher();
     return true;
 }
 
@@ -723,6 +792,7 @@ bool PhotoModule::setFolderEnabled(int folderId, bool enabled, QJsonObject* out)
         return false;
     m_readRepo->setFolderEnabled(folderId, enabled);
     if (out) *out = findById(m_readRepo->listFoldersDetail(), folderId);
+    refreshWatcher();
     return true;
 }
 
@@ -781,6 +851,7 @@ QJsonObject PhotoModule::purge(const QString& scope, const QVariant& value) {
         return o;
     }
     o["deleted"] = deleted;
+    refreshWatcher();
     return o;
 }
 
@@ -789,6 +860,7 @@ bool PhotoModule::removeFolder(int folderId) {
         return false;
     // Retrait DOUX : historique conservé, sélection désactivée (voir contrat).
     m_readRepo->softDeleteFolder(folderId, nowIso());
+    refreshWatcher();
     return true;
 }
 
@@ -796,6 +868,7 @@ bool PhotoModule::restoreFolder(int folderId, QJsonObject* out) {
     if (!m_readRepo || !m_readRepo->getFolder(folderId))
         return false;
     m_readRepo->restoreFolder(folderId);
+    refreshWatcher();
     if (out) *out = findById(m_readRepo->listFoldersDetail(), folderId);
     // Raviver les fichiers tout de suite plutôt que d'attendre la passe périodique.
     triggerIndex(IndexMode::Incremental, {folderId}, QStringLiteral("restore"));

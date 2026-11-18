@@ -16,7 +16,9 @@
 #include <QVector>
 #include <QMutex>
 #include <QFuture>
+#include <QSet>
 
+class QThread;
 class QTimer;
 
 // -----------------------------------------------------------------------------
@@ -38,6 +40,7 @@ class QTimer;
 namespace morfphoto {
 
 class PhotoRepository;
+class FolderWatcher;
 
 class PhotoModule : public IModule {
     Q_OBJECT
@@ -135,6 +138,12 @@ public:
     QJsonObject triggerIndex(IndexMode mode, const QVector<int>& folderIds, const QString& trigger);
 
 private:
+    // Surveillance inotify (optionnelle, watch.realtime) : voir FolderWatcher.
+    void startWatcher();
+    void stopWatcher();
+    void refreshWatcher();
+    void submitRealtime();
+
     void reconcileRoots();
     void doPass(IndexMode mode, QVector<int> folderIds, QString trigger); // thread du pool
     QString matchingRoot(const QString& path) const;
@@ -173,6 +182,13 @@ private:
 
     PhotoRepository* m_readRepo = nullptr;  // connexion du thread principal
     QTimer*          m_watchTimer = nullptr;
+
+    bool           m_realtime = false;     // defaut : aucune surveillance de fond
+    int            m_debounceMs = 2000;
+    QThread*       m_watcherThread = nullptr;
+    FolderWatcher* m_watcher = nullptr;
+    QTimer*        m_realtimeRetry = nullptr;
+    QSet<int>      m_pendingRealtime;      // selections en attente d'une passe
 
     // Cache du resume (thread HTTP uniquement) : voir PhotoModule::summary().
     mutable QJsonObject m_summaryCache;

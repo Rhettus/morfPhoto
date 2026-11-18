@@ -55,6 +55,7 @@ add_library(morfPhoto STATIC
     src/PhotoScanner.cpp                  # parcours FS + garde-fou de perimetre
     src/ContextFile.cpp                   # lecture/ecriture .morfphoto.json (contexte par dossier)
     src/Indexer.cpp                       # passe de reconciliation (verdict, garde passe-unique)
+    src/FolderWatcher.cpp                 # surveillance inotify (mise a jour quasi temps reel)
     src/PhotoModule.cpp                   # module metier : assemble tout le domaine
     src/SourceManager.cpp                 # sources SMB poussees (montage via helper privilegie)
     src/PhotoApi.cpp                      # routage /api/v1 (delegue par HttpServer)
@@ -65,6 +66,7 @@ add_library(morfPhoto STATIC
     include/morfphoto/PhotoScanner.h
     include/morfphoto/ContextFile.h
     include/morfphoto/Indexer.h
+    include/morfphoto/FolderWatcher.h
     include/morfphoto/PhotoModule.h
     include/morfphoto/SourceManager.h
     include/morfphoto/PhotoApi.h

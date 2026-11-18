@@ -20,8 +20,11 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QVariantMap>
+#include <QEventLoop>
+#include <QTimer>
 
 #include "morfphoto/PhotoScanner.h"
+#include "morfphoto/FolderWatcher.h"
 #include "morfphoto/PhotoRepository.h"
 #include "morfphoto/ExifExtractor.h"
 #include "morfphoto/Indexer.h"
@@ -474,6 +477,54 @@ int main(int argc, char** argv) {
               "contexte: json retire -> dossier redevient non qualifie");
         crepo.close();
     }
+
+#ifdef Q_OS_LINUX
+    // --- 9) Surveillance inotify : seuls les changements utiles signalent la selection ---
+    {
+        const QString wdir = base + QStringLiteral("/watch");
+        const QString flat = base + QStringLiteral("/watch-flat");
+        QDir().mkpath(wdir + QStringLiteral("/old"));
+        QDir().mkpath(flat + QStringLiteral("/sub"));
+        FolderWatcher watcher(50, 1000);
+        QVector<int> changed;
+        QEventLoop loop;
+        QObject::connect(&watcher, &FolderWatcher::foldersChanged, &loop,
+                         [&](const QVector<int>& ids) { changed = ids; loop.quit(); });
+        // Attend un signal (ou le delai) puis rend les selections signalees.
+        auto waitChange = [&](int ms) {
+            changed.clear();
+            QTimer::singleShot(ms, &loop, &QEventLoop::quit);
+            loop.exec();
+            return changed;
+        };
+        watcher.setTargets({{7, wdir, true}, {8, flat, false}});
+        CHECK(watcher.statusJson().value(QStringLiteral("state")).toString() == QLatin1String("active"),
+              "inotify: surveillance active");
+
+        writeBytes(wdir + QStringLiteral("/n.jpg"), 10);
+        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: nouvelle photo -> selection signalee");
+        writeBytes(wdir + QStringLiteral("/notes.txt"), 10);
+        CHECK(waitChange(300).isEmpty(), "inotify: fichier non image ignore");
+        QFile::rename(wdir + QStringLiteral("/n.jpg"), wdir + QStringLiteral("/m.jpg"));
+        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: renommage signale");
+        QFile::remove(wdir + QStringLiteral("/m.jpg"));
+        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: suppression signalee");
+
+        QDir().mkpath(wdir + QStringLiteral("/new"));
+        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: nouveau dossier signale");
+        writeBytes(wdir + QStringLiteral("/new/p.jpg"), 10);
+        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: photo dans un nouveau dossier signalee");
+        QDir(wdir).rename(QStringLiteral("old"), QStringLiteral("renamed"));
+        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: dossier renomme signale");
+        writeBytes(wdir + QStringLiteral("/renamed/q.jpg"), 10);
+        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: photo dans un dossier renomme signalee");
+
+        writeBytes(flat + QStringLiteral("/sub/x.jpg"), 10);
+        CHECK(waitChange(300).isEmpty(), "inotify: selection non recursive ignore ses sous-dossiers");
+        writeBytes(flat + QStringLiteral("/y.jpg"), 10);
+        CHECK(waitChange(2000) == QVector<int>{8}, "inotify: selection non recursive voit son dossier");
+    }
+#endif
 
     // --- Revue C++ 2026-11-07 : fonctions pures de securite ---
     // `$` Qt accepte un NL final : les controles ancres doivent le refuser.

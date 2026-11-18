@@ -116,6 +116,16 @@ cmake --build --preset mingw
 curl http://127.0.0.1:8793/api/v1/photos/summary
 ```
 
+## Near-real-time updates (Linux)
+
+Set `watch.realtime` to `true` in the module configuration to update the database within seconds of a photo
+being added, changed, renamed or removed. morfPhoto watches the selections with inotify and runs its normal
+incremental pass on the affected selection, after `watch.debounce_ms` of quiet (default `2000`). It is off by
+default. `GET /api/v1/index/status` reports the state under `watch.realtime`.
+
+Network mounts (SMB, NFS) are not watched, because inotify cannot see changes made by other machines. Each
+directory uses one watch: if `fs.inotify.max_user_watches` is too low, raise it with `sysctl`.
+
 ## Install as a service
 
 ```sh
