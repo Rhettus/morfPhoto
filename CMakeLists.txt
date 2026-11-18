@@ -54,6 +54,7 @@ add_library(morfPhoto STATIC
     src/ExifExtractor.cpp                 # extraction ExifTool (QProcess -stay_open)
     src/PhotoScanner.cpp                  # parcours FS + garde-fou de perimetre
     src/ContextFile.cpp                   # lecture/ecriture .morfphoto.json (contexte par dossier)
+    src/LibraryMetadata.cpp               # fusion EXIF + XMP (sidecars, versions, libelles)
     src/Indexer.cpp                       # passe de reconciliation (verdict, garde passe-unique)
     src/FolderWatcher.cpp                 # surveillance inotify (mise a jour quasi temps reel)
     src/PhotoModule.cpp                   # module metier : assemble tout le domaine
@@ -64,6 +65,7 @@ add_library(morfPhoto STATIC
     include/morfphoto/PhotoRepository.h
     include/morfphoto/ExifExtractor.h
     include/morfphoto/PhotoScanner.h
+    include/morfphoto/LibraryMetadata.h
     include/morfphoto/ContextFile.h
     include/morfphoto/Indexer.h
     include/morfphoto/FolderWatcher.h

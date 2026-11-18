@@ -17,6 +17,8 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QDebug>
+#include <QMap>
+#include <QSet>
 
 #include <utility>
 
@@ -353,10 +355,10 @@ KnownFiles PhotoRepository::existingFilesInFolder(int folderId) {
     return map;
 }
 
-void PhotoRepository::insertFile(int folderId, const FileInfo& info, const ExifData& exif,
-                                 bool exifOk, const QString& now) {
+int PhotoRepository::insertFile(int folderId, const FileInfo& info, const ExifData& exif,
+                                bool exifOk, const QString& now) {
     QSqlQuery q(db());
-    run(q, QStringLiteral(
+    const bool inserted = run(q, QStringLiteral(
              "INSERT INTO files (folder_id, path, directory, filename, extension, file_type, "
              "size, mtime, state, exif_ok, first_seen_at, last_seen_at, last_indexed_at, "
              "taken_at, make, camera_model, lens, focal_length, focal_length_35mm, aperture, "
@@ -369,6 +371,7 @@ void PhotoRepository::insertFile(int folderId, const FileInfo& info, const ExifD
          exif.focalLength35mm, exif.aperture, exif.shutterSpeed, exif.shutterSpeedS,
          exif.iso, exif.exposureCompensation, exif.rating, exif.latitude, exif.longitude,
          rawExifVariant(exif)});
+    return inserted ? q.lastInsertId().toInt() : -1;
 }
 
 void PhotoRepository::updateFile(int fileId, const FileInfo& info, const ExifData& exif,
@@ -417,6 +420,378 @@ void PhotoRepository::markMissing(const QVector<int>& fileIds, const QString& no
     run(q, QStringLiteral("UPDATE files SET state = 'missing', disappeared_at = ? "
                           "WHERE id IN (%1) AND state != 'missing'").arg(holders.join(',')),
         binds);
+}
+
+// --- Bibliothèque -----------------------------------------------------------
+
+namespace {
+
+const char* const kLibraryFrom =
+    " FROM files f"
+    " JOIN library_files lf ON lf.file_id = f.id"
+    " JOIN library_versions v ON v.file_id = f.id"
+    " JOIN folders fo ON fo.id = f.folder_id";
+
+// Qt lie une QString nulle en NULL SQL ; un libelle absent est ici une chaine vide.
+QString notNull(const QString& value) {
+    return value.isNull() ? QStringLiteral("") : value;
+}
+
+void addIn(QStringList& clauses, QVariantList& binds, const QString& column, const QStringList& values) {
+    if (values.isEmpty())
+        return;
+    QStringList holders;
+    for (const QString& value : values) { holders << QStringLiteral("?"); binds << notNull(value); }
+    clauses << QStringLiteral("%1 IN (%2)").arg(column, holders.join(QLatin1Char(',')));
+}
+
+// Toutes les conditions portent sur la MEME version : une note sur une copie et un
+// mot-cle sur une autre ne font pas une photo qui repond aux deux.
+QString libraryWhere(const LibraryFilter& f, QVariantList& binds) {
+    QStringList c = {QStringLiteral("f.state = 'present'")};
+    if (f.minRating > 0) {
+        c << QStringLiteral("v.rejected = 0 AND v.rating >= ?");
+        binds << f.minRating;
+    }
+    if (f.rejected == QLatin1String("hide")) c << QStringLiteral("v.rejected = 0");
+    if (f.rejected == QLatin1String("only")) c << QStringLiteral("v.rejected = 1");
+    // Un etat inconnu (NULL) ne satisfait jamais un filtre choisi.
+    if (f.edited == QLatin1String("edited"))   c << QStringLiteral("v.edited = 1");
+    if (f.edited == QLatin1String("unedited")) c << QStringLiteral("v.edited = 0");
+    if (f.labels || f.unlabeled) {
+        c << (f.unlabeled ? QStringLiteral("((v.labels & ?) != 0 OR v.labels = 0)")
+                          : QStringLiteral("(v.labels & ?) != 0"));
+        binds << f.labels;
+    }
+    if (!f.kinds.isEmpty()) {
+        QStringList either;
+        addIn(either, binds, QStringLiteral("lf.ext_label"), f.kinds);
+        addIn(either, binds, QStringLiteral("lf.kind_label"), f.kinds);
+        c << QLatin1Char('(') + either.join(QStringLiteral(" OR ")) + QLatin1Char(')');
+    }
+    addIn(c, binds, QStringLiteral("lf.camera_label"), f.cameras);
+    addIn(c, binds, QStringLiteral("lf.body_key"), f.bodies);
+    addIn(c, binds, QStringLiteral("f.lens"), f.lenses);
+    addIn(c, binds, QStringLiteral("lf.iso_label"), f.iso);
+    addIn(c, binds, QStringLiteral("lf.aperture_label"), f.aperture);
+    addIn(c, binds, QStringLiteral("lf.focal_label"), f.focal);
+    addIn(c, binds, QStringLiteral("lf.shutter_label"), f.shutter);
+    for (const QString& keyword : f.keywords) {
+        // « a » couvre « a|b » : '}' suit immediatement '|' dans l'ordre binaire.
+        c << QStringLiteral("EXISTS (SELECT 1 FROM library_keywords k WHERE k.version_id = v.id "
+                            "AND (k.keyword = ? OR (k.keyword >= ? AND k.keyword < ?)))");
+        binds << keyword << keyword + QLatin1Char('|') << keyword + QLatin1Char('}');
+    }
+    if (!f.takenFrom.isEmpty()) { c << QStringLiteral("substr(v.taken_at, 1, 10) >= ?"); binds << f.takenFrom; }
+    if (!f.takenTo.isEmpty())   { c << QStringLiteral("substr(v.taken_at, 1, 10) <= ?"); binds << f.takenTo; }
+    if (!f.folderPath.isEmpty()) {
+        if (f.recursive) {
+            c << QStringLiteral("(f.directory = ? OR (f.directory >= ? AND f.directory < ?))");
+            binds << f.folderPath << f.folderPath + QLatin1Char('/') << f.folderPath + QLatin1Char('0');
+        } else {
+            c << QStringLiteral("f.directory = ?");
+            binds << f.folderPath;
+        }
+    }
+    if (!f.filename.isEmpty()) {
+        c << QStringLiteral("instr(lower(f.filename), lower(?)) > 0");
+        binds << f.filename;
+    }
+    return QStringLiteral(" WHERE ") + c.join(QStringLiteral(" AND "));
+}
+
+} // namespace
+
+QHash<int, QString> PhotoRepository::libraryFingerprints(int folderId) {
+    QHash<int, QString> out;
+    QSqlQuery q(db());
+    run(q, QStringLiteral("SELECT lf.file_id, lf.fingerprint FROM library_files lf "
+                          "JOIN files f ON f.id = lf.file_id WHERE f.folder_id = ?"), {folderId});
+    while (q.next())
+        out.insert(q.value(0).toInt(), q.value(1).toString());
+    return out;
+}
+
+ExifData PhotoRepository::libraryBase(int fileId) {
+    ExifData base;
+    QSqlQuery q(db());
+    run(q, QStringLiteral("SELECT taken_at, make, camera_model, lens, focal_length, aperture, "
+                          "shutter_speed_s, iso, rating, latitude, longitude, raw_exif "
+                          "FROM files WHERE id = ?"), {fileId});
+    if (!q.next())
+        return base;
+    base.takenAt = q.value(0);
+    base.make = q.value(1);
+    base.cameraModel = q.value(2);
+    base.lens = q.value(3);
+    base.focalLength = q.value(4);
+    base.aperture = q.value(5);
+    base.shutterSpeedS = q.value(6);
+    base.iso = q.value(7);
+    base.rating = q.value(8);
+    base.latitude = q.value(9);
+    base.longitude = q.value(10);
+    base.raw = QJsonDocument::fromJson(q.value(11).toString().toUtf8()).object();
+    base.ok = true;
+    return base;
+}
+
+void PhotoRepository::storeLibrary(int fileId, const QString& fingerprint, const LibraryFileLabels& l,
+                                   const QVector<LibraryVersion>& versions) {
+    QSqlDatabase database = db();
+    const bool inTransaction = database.transaction();
+    {
+        QSqlQuery del(database);
+        run(del, QStringLiteral("DELETE FROM library_versions WHERE file_id = ?"), {fileId});
+        QSqlQuery file(database);
+        run(file, QStringLiteral(
+                "INSERT OR REPLACE INTO library_files (file_id, fingerprint, kind_label, ext_label, "
+                "camera_label, body_key, body_serial, iso_label, aperture_label, focal_label, "
+                "shutter_label) VALUES (?,?,?,?,?,?,?,?,?,?,?)"),
+            {fileId, notNull(fingerprint), notNull(l.kind), notNull(l.extension), notNull(l.camera),
+             notNull(l.bodyKey), notNull(l.bodySerial), notNull(l.iso), notNull(l.aperture),
+             notNull(l.focal), notNull(l.shutter)});
+        for (const LibraryVersion& v : versions) {
+            const QVariant raw = v.rawXmp.isEmpty() ? QVariant()
+                : QVariant(QString::fromUtf8(QJsonDocument(v.rawXmp).toJson(QJsonDocument::Compact)));
+            const QVariant edited = v.edited.isValid() ? QVariant(v.edited.toBool() ? 1 : 0) : QVariant();
+            QSqlQuery row(database);
+            run(row, QStringLiteral(
+                    "INSERT INTO library_versions (file_id, version, is_copy, sidecar, rating, rejected, "
+                    "labels, edited, taken_at, latitude, longitude, title, description, creator, rights, "
+                    "version_name, raw_xmp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+                {fileId, v.version, v.copy ? 1 : 0, v.sidecar.isEmpty() ? QVariant() : QVariant(v.sidecar),
+                 v.rating, v.rejected ? 1 : 0, v.labels, edited, v.takenAt, v.latitude, v.longitude,
+                 v.title, v.description, v.creator, v.rights, v.versionName, raw});
+            const QVariant versionId = row.lastInsertId();
+            for (const QString& keyword : v.keywords) {
+                QSqlQuery k(database);
+                run(k, QStringLiteral("INSERT OR IGNORE INTO library_keywords (version_id, keyword) "
+                                      "VALUES (?, ?)"), {versionId, keyword});
+            }
+        }
+    }
+    if (inTransaction)
+        database.commit();
+}
+
+QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHash<int, QString>& matched,
+                                         bool withRaw) {
+    if (fileIds.isEmpty())
+        return {};
+    QStringList idList;
+    for (int id : fileIds)
+        idList << QString::number(id);    // entiers venus de la base : interpolation sure
+    const QString ids = idList.join(QLatin1Char(','));
+
+    QHash<int, QJsonArray> keywords;
+    {
+        QSqlQuery q(db());
+        q.exec(QStringLiteral("SELECT k.version_id, k.keyword FROM library_keywords k "
+                              "JOIN library_versions v ON v.id = k.version_id "
+                              "WHERE v.file_id IN (%1) ORDER BY k.keyword").arg(ids));
+        while (q.next())
+            keywords[q.value(0).toInt()].append(q.value(1).toString());
+    }
+
+    QHash<int, QJsonArray> versions;
+    {
+        QSqlQuery q(db());
+        q.exec(QStringLiteral("SELECT id, file_id, version, is_copy, sidecar, rating, rejected, labels, "
+                              "edited, taken_at, latitude, longitude, title, description, creator, rights, "
+                              "version_name%1 FROM library_versions WHERE file_id IN (%2) ORDER BY version")
+                   .arg(withRaw ? QStringLiteral(", raw_xmp") : QString(), ids));
+        while (q.next()) {
+            QJsonObject o = rowToJson(q);
+            const int versionId = o.take(QStringLiteral("id")).toInt();
+            const int fileId = o.take(QStringLiteral("file_id")).toInt();
+            o["copy"] = o.take(QStringLiteral("is_copy")).toInt() != 0;
+            o["rejected"] = o.value(QStringLiteral("rejected")).toInt() != 0;
+            const QJsonValue edited = o.value(QStringLiteral("edited"));
+            o["edited"] = edited.isNull() ? QJsonValue(QJsonValue::Null) : QJsonValue(edited.toInt() != 0);
+            o["has_sidecar"] = !o.value(QStringLiteral("sidecar")).isNull();
+            o["keywords"] = keywords.value(versionId);
+            if (withRaw) {
+                const QJsonDocument raw = QJsonDocument::fromJson(o.value(QStringLiteral("raw_xmp")).toString().toUtf8());
+                o["raw_xmp"] = raw.isObject() ? QJsonValue(raw.object()) : QJsonValue(QJsonValue::Null);
+            }
+            versions[fileId].append(o);
+        }
+    }
+
+    QHash<int, QJsonObject> rows;
+    {
+        QSqlQuery q(db());
+        q.exec(QStringLiteral(
+            "SELECT f.id, f.path, fo.root_path AS root, f.directory, f.filename, f.extension, f.file_type, "
+            "f.size, f.mtime, f.make, f.camera_model, f.lens, f.focal_length, f.focal_length_35mm, "
+            "f.aperture, f.shutter_speed, f.shutter_speed_s, f.iso, f.exposure_compensation, "
+            "lf.kind_label AS kind, lf.ext_label AS file_ext, lf.camera_label AS camera, lf.body_key, "
+            "lf.body_serial, lf.iso_label, lf.aperture_label, lf.focal_label, lf.shutter_label%1 "
+            "FROM files f JOIN library_files lf ON lf.file_id = f.id JOIN folders fo ON fo.id = f.folder_id "
+            "WHERE f.id IN (%2)").arg(withRaw ? QStringLiteral(", f.raw_exif") : QString(), ids));
+        while (q.next()) {
+            QJsonObject o = rowToJson(q);
+            const int id = o.value(QStringLiteral("id")).toInt();
+            const QString root = o.value(QStringLiteral("root")).toString();
+            // Le client voit ces fichiers sous un autre chemin que le conteneur.
+            o["relative_path"] = QDir(root).relativeFilePath(o.value(QStringLiteral("path")).toString());
+            o["versions"] = versions.value(id);
+            if (matched.contains(id)) {
+                QJsonArray list;
+                for (const QString& version : matched.value(id).split(QLatin1Char(',')))
+                    list.append(version.toInt());
+                o["matched_versions"] = list;
+            }
+            rows.insert(id, o);
+        }
+    }
+
+    QJsonArray items;
+    for (int id : fileIds)
+        if (rows.contains(id))
+            items.append(rows.value(id));
+    return items;
+}
+
+QJsonObject PhotoRepository::libraryList(const LibraryFilter& filter, int page, int pageSize) {
+    QVariantList binds;
+    const QString tail = QLatin1String(kLibraryFrom) + libraryWhere(filter, binds);
+
+    int total = 0;
+    {
+        QSqlQuery q(db());
+        run(q, QStringLiteral("SELECT COUNT(DISTINCT f.id)") + tail, binds);
+        if (q.next())
+            total = q.value(0).toInt();
+    }
+
+    page = qBound(1, page, 1000000);
+    pageSize = qMax(1, pageSize);
+    QVariantList pageBinds = binds;
+    pageBinds << pageSize << static_cast<qint64>(page - 1) * pageSize;
+    QVector<int> ids;
+    QHash<int, QString> matched;
+    {
+        QSqlQuery q(db());
+        run(q, QStringLiteral("SELECT f.id, GROUP_CONCAT(v.version)") + tail +
+                   QStringLiteral(" GROUP BY f.id ORDER BY MIN(v.taken_at) IS NULL, MIN(v.taken_at), f.id "
+                                  "LIMIT ? OFFSET ?"), pageBinds);
+        while (q.next()) {
+            ids << q.value(0).toInt();
+            matched.insert(q.value(0).toInt(), q.value(1).toString());
+        }
+    }
+
+    QJsonObject o;
+    o["items"]     = libraryItems(ids, matched, false);
+    o["total"]     = total;
+    o["page"]      = page;
+    o["page_size"] = pageSize;
+    return o;
+}
+
+QJsonObject PhotoRepository::libraryPhoto(int fileId, bool* found) {
+    const QJsonArray items = libraryItems({fileId}, {}, true);
+    if (found) *found = !items.isEmpty();
+    return items.isEmpty() ? QJsonObject() : items.first().toObject();
+}
+
+QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
+    // Chaque liste ignore son propre choix : choisir un boitier ne masque pas les autres.
+    auto counted = [this](const LibraryFilter& f, const QString& column, const QString& order,
+                          bool keepEmpty = false) {
+        QVariantList binds;
+        QString where = libraryWhere(f, binds);
+        where += QStringLiteral(" AND %1 IS NOT NULL").arg(column);
+        if (!keepEmpty)
+            where += QStringLiteral(" AND %1 != ''").arg(column);
+        QSqlQuery q(db());
+        run(q, QStringLiteral("SELECT %1 AS value, COUNT(*) AS count").arg(column) +
+                   QLatin1String(kLibraryFrom) + where +
+                   QStringLiteral(" GROUP BY %1 ORDER BY %2").arg(column, order), binds);
+        QJsonArray out;
+        while (q.next())
+            out.append(QJsonObject{{QStringLiteral("value"), q.value(0).toString()},
+                                   {QStringLiteral("count"), q.value(1).toInt()}});
+        return out;
+    };
+    auto without = [&filter](QStringList LibraryFilter::*member) {
+        LibraryFilter f = filter;
+        (f.*member).clear();
+        return f;
+    };
+
+    QJsonObject o;
+    {
+        // Le groupe RAW d'abord, puis chaque extension, comme la liste du client.
+        const LibraryFilter f = without(&LibraryFilter::kinds);
+        QVariantList binds;
+        QSqlQuery q(db());
+        run(q, QStringLiteral("SELECT COUNT(*)") + QLatin1String(kLibraryFrom) + libraryWhere(f, binds) +
+                   QStringLiteral(" AND lf.kind_label = 'RAW'"), binds);
+        QJsonArray kinds;
+        if (q.next() && q.value(0).toInt() > 0)
+            kinds.append(QJsonObject{{QStringLiteral("value"), QStringLiteral("RAW")},
+                                     {QStringLiteral("count"), q.value(0).toInt()}});
+        for (const QJsonValue& value : counted(f, QStringLiteral("lf.ext_label"),
+                                               QStringLiteral("lf.kind_label != 'RAW', lf.ext_label")))
+            kinds.append(value);
+        o["kinds"] = kinds;
+    }
+    o["cameras"]  = counted(without(&LibraryFilter::cameras), QStringLiteral("lf.camera_label"), QStringLiteral("value"));
+    o["bodies"]   = counted(without(&LibraryFilter::bodies), QStringLiteral("lf.body_key"), QStringLiteral("value"), true);
+    o["lenses"]   = counted(without(&LibraryFilter::lenses), QStringLiteral("f.lens"), QStringLiteral("value"));
+    o["iso"]      = counted(without(&LibraryFilter::iso), QStringLiteral("lf.iso_label"), QStringLiteral("MIN(f.iso)"));
+    o["aperture"] = counted(without(&LibraryFilter::aperture), QStringLiteral("lf.aperture_label"), QStringLiteral("MIN(f.aperture)"));
+    o["focal"]    = counted(without(&LibraryFilter::focal), QStringLiteral("lf.focal_label"), QStringLiteral("MIN(f.focal_length)"));
+    o["shutter"]  = counted(without(&LibraryFilter::shutter), QStringLiteral("lf.shutter_label"), QStringLiteral("MIN(f.shutter_speed_s)"));
+
+    {
+        LibraryFilter f = filter;
+        f.takenFrom.clear();
+        f.takenTo.clear();
+        o["months"] = counted(f, QStringLiteral("substr(v.taken_at, 1, 7)"), QStringLiteral("value DESC"));
+    }
+    {
+        // Un mot-cle compte sa version une fois, et chaque niveau au-dessus aussi.
+        const LibraryFilter f = without(&LibraryFilter::keywords);
+        QVariantList binds;
+        QSqlQuery q(db());
+        run(q, QStringLiteral("SELECT v.id, k.keyword") + QLatin1String(kLibraryFrom) +
+                   QStringLiteral(" JOIN library_keywords k ON k.version_id = v.id") +
+                   libraryWhere(f, binds) + QStringLiteral(" ORDER BY v.id"), binds);
+        QMap<QString, int> counts;
+        QSet<QString> levels;
+        int current = -1;
+        auto flush = [&]() { for (const QString& level : levels) ++counts[level]; levels.clear(); };
+        while (q.next()) {
+            if (q.value(0).toInt() != current) { flush(); current = q.value(0).toInt(); }
+            const QStringList parts = q.value(1).toString().split(QLatin1Char('|'));
+            for (int n = 1; n <= parts.size(); ++n)
+                levels.insert(parts.mid(0, n).join(QLatin1Char('|')));
+        }
+        flush();
+        QJsonArray keywords;
+        for (auto it = counts.constBegin(); it != counts.constEnd(); ++it)
+            keywords.append(QJsonObject{{QStringLiteral("value"), it.key()}, {QStringLiteral("count"), it.value()}});
+        o["keywords"] = keywords;
+    }
+    {
+        LibraryFilter f = filter;
+        f.rejected.clear();
+        QVariantList binds;
+        QSqlQuery q(db());
+        run(q, QStringLiteral("SELECT COUNT(*), COALESCE(SUM(v.rejected), 0)") + QLatin1String(kLibraryFrom) +
+                   libraryWhere(f, binds), binds);
+        if (q.next()) {
+            const int all = q.value(0).toInt();
+            const int rejected = q.value(1).toInt();
+            o["rejected"] = QJsonObject{{QStringLiteral("all"), all}, {QStringLiteral("hide"), all - rejected},
+                                        {QStringLiteral("only"), rejected}};
+        }
+    }
+    return o;
 }
 
 // --- Passes -----------------------------------------------------------------

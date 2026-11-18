@@ -35,6 +35,9 @@ public:
     ExifExtractor(QString binary, bool stayOpen);
     ~ExifExtractor();
 
+    // Demande aussi les champs de la bibliothèque (mots-clés, étiquette, numéro de série...).
+    void setLibraryTags(bool enabled) { m_libraryTags = enabled; }
+
     void open();     // démarre le process persistant (idempotent)
     void close();    // arrête proprement le process
 
@@ -65,6 +68,7 @@ private:
     bool       m_stayOpen;
     QProcess*  m_proc = nullptr;
     int        m_counter = 0;   // numérote les -execute pour synchroniser
+    bool       m_libraryTags = false;
 };
 
 } // namespace morfphoto

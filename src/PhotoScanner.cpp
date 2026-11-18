@@ -5,10 +5,12 @@
  */
 
 #include "morfphoto/PhotoScanner.h"
+#include "morfphoto/LibraryMetadata.h"
 
 #include <QDir>
 #include <QDirIterator>
 #include <QFileInfo>
+#include <QHash>
 #include <QSet>
 
 #include <chrono>
@@ -61,7 +63,17 @@ QString fileTypeFor(const QString& extension) {
     if (rawExtensions().contains(ext))
         return QStringLiteral("raw");
     const QString t = explicitType(ext);
-    return t.isEmpty() ? QStringLiteral("other") : t;
+    if (!t.isEmpty())
+        return t;
+    // Formats lus seulement par la bibliotheque : jamais rencontres sans elle.
+    static const QSet<QString> extendedRaw = {
+        ".ari", ".bay", ".crw", ".dcs", ".fff", ".k25", ".mdc", ".ori", ".sr2", ".srf",
+    };
+    if (extendedRaw.contains(ext))
+        return QStringLiteral("raw");
+    if (ext == QLatin1String(".hif"))
+        return QStringLiteral("heic");
+    return QStringLiteral("other");
 }
 
 bool isWithinRoots(const QString& candidate, const QStringList& roots) {
@@ -100,7 +112,7 @@ bool probeAccessible(const QString& path, int timeoutMs) {
 }
 
 ScanResult scanFolder(const QString& folder, bool recursive,
-                      const std::function<bool()>& stillAvailable) {
+                      const std::function<bool()>& stillAvailable, bool library) {
     // Intervalle de contrôle : consulter stillAvailable toutes les N entrées suffit
     // à borner la réactivité sans transformer chaque fichier en sonde réseau.
     constexpr int kCheckEvery = 256;
@@ -109,6 +121,7 @@ ScanResult scanFolder(const QString& folder, bool recursive,
     const QDirIterator::IteratorFlags flags =
         recursive ? QDirIterator::Subdirectories : QDirIterator::NoIteratorFlags;
     QDirIterator it(folder, QDir::Files | QDir::NoDotAndDotDot, flags);
+    QHash<QString, QVector<SidecarRef>> sidecars;
     int since = 0;
     while (it.hasNext()) {
         // Vérifier AVANT de toucher l'entrée suivante : si la source a disparu, on
@@ -122,7 +135,12 @@ ScanResult scanFolder(const QString& folder, bool recursive,
         it.next();
         const QFileInfo fi = it.fileInfo();
         const QString ext = QStringLiteral(".") + fi.suffix().toLower();
-        if (!isImageExtension(ext))
+        if (library && ext == QLatin1String(".xmp")) {
+            sidecars[fi.absolutePath()].push_back(
+                {0, fi.absoluteFilePath(), fi.size(), fi.lastModified().toSecsSinceEpoch()});
+            continue;
+        }
+        if (!isImageExtension(ext) && !(library && isExtendedImageExtension(ext)))
             continue;
         FileInfo info;
         info.path      = fi.absoluteFilePath();
@@ -134,6 +152,8 @@ ScanResult scanFolder(const QString& folder, bool recursive,
         info.mtime     = fi.lastModified().toSecsSinceEpoch();
         res.files.push_back(info);
     }
+    if (library)
+        assignSidecars(res.files, sidecars);
     // Arrivé au bout du parcours : le scan est fiable et complet.
     res.completed = true;
     return res;

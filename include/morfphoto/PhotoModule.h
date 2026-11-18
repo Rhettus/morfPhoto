@@ -7,6 +7,7 @@
 #pragma once
 #include "morfphoto/IModule.h"
 #include "morfphoto/Indexer.h"
+#include "morfphoto/LibraryMetadata.h"
 #include "morfphoto/SourceManager.h"
 
 #include <QJsonObject>
@@ -69,6 +70,12 @@ public:
     QJsonObject indexStatus() const;
     // Export compact des photos presentes pour la couche d'analyse (morfAnalytics).
     QJsonObject photoDataset() const;
+
+    // --- Bibliothèque : EXIF + XMP réunis, servis depuis la base (xmp.enabled) ---
+    bool        libraryEnabled() const { return m_library; }
+    QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize) const;
+    QJsonObject libraryFacets(const LibraryFilter& filter) const;
+    QJsonObject libraryPhoto(int fileId, bool* found) const;
 
     // --- Contexte photographique par répertoire (morfphoto-context/2) ---
     // Lectures : la liste des répertoires + leur contexte (écran de qualification
@@ -164,6 +171,7 @@ private:
     SourceManager m_sourceManager{QStringLiteral("morfphoto")};
     QString     m_exiftoolBinary;
     bool        m_stayOpen = true;
+    bool        m_library = false;   // défaut : indexation et API inchangées
     // Cadence de la réconciliation automatique. Défaut : 0 => passe automatique
     // DÉSACTIVÉE, indexation UNIQUEMENT à la demande (API /index ou bouton PhotoHub).
     // C'est le mode qui ne met AUCUNE pression de fond sur la machine - le choix par

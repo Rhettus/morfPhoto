@@ -13,6 +13,7 @@
 #include <QSqlDatabase>
 #include <QVariantMap>
 
+#include "morfphoto/LibraryMetadata.h"
 #include "morfphoto/PhotoTypes.h"
 
 // -----------------------------------------------------------------------------
@@ -63,8 +64,8 @@ public:
 
     // --- Fichiers : verdict et écritures d'indexation ---
     KnownFiles existingFilesInFolder(int folderId);
-    void insertFile(int folderId, const FileInfo& info, const ExifData& exif,
-                    bool exifOk, const QString& now);
+    int  insertFile(int folderId, const FileInfo& info, const ExifData& exif,
+                    bool exifOk, const QString& now);   // id de la ligne créée
     void updateFile(int fileId, const FileInfo& info, const ExifData& exif,
                     bool exifOk, const QString& now);
     void touchSeen(int fileId, const QString& now);
@@ -88,6 +89,15 @@ public:
     QJsonArray listContexts(const QString& statusFilter);
     // Contexte d'UN répertoire, ou { directory, status:"unqualified" } s'il n'y en a pas.
     QJsonObject getContext(const QString& directory);
+
+    // --- Bibliothèque (EXIF + XMP réunis, voir LibraryMetadata.h) ---
+    QHash<int, QString> libraryFingerprints(int folderId);   // id de fichier -> empreinte
+    ExifData libraryBase(int fileId);                        // ce que l'image elle-même contient
+    void storeLibrary(int fileId, const QString& fingerprint, const LibraryFileLabels& labels,
+                      const QVector<LibraryVersion>& versions);
+    QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize);
+    QJsonObject libraryFacets(const LibraryFilter& filter);
+    QJsonObject libraryPhoto(int fileId, bool* found);
 
     // --- Passes d'indexation ---
     int  startRun(const QString& mode, const QString& trigger, const QString& startedAt);
@@ -132,6 +142,7 @@ public:
 private:
     bool applyMigrations();
     QJsonArray distinct(const QString& column, const QString& label);
+    QJsonArray libraryItems(const QVector<int>& fileIds, const QHash<int, QString>& matched, bool withRaw);
     QSqlDatabase db() const;
 
     QString m_connectionName;

@@ -9,6 +9,8 @@
 #include <QVariant>
 #include <QJsonObject>
 #include <QHash>
+#include <QStringList>
+#include <QVector>
 
 // -----------------------------------------------------------------------------
 // Types partagés du domaine photo : ce que le scan sait d'un fichier (FileInfo),
@@ -21,6 +23,15 @@
 // -----------------------------------------------------------------------------
 namespace morfphoto {
 
+// Un sidecar `.xmp` rattaché à une image. `version` : 0 pour l'original, N pour la
+// copie virtuelle darktable `photo_NN.ext.xmp`.
+struct SidecarRef {
+    int     version = 0;
+    QString path;
+    qint64  size  = 0;
+    qint64  mtime = 0;
+};
+
 // Ce que le parcours du disque connaît d'un fichier, sans avoir lu son EXIF.
 struct FileInfo {
     QString path;          // chemin complet
@@ -30,6 +41,9 @@ struct FileInfo {
     QString fileType;      // raw|jpeg|tiff|heic|png|webp|other
     qint64  size  = 0;
     qint64  mtime = 0;     // epoch entier, tel que le système de fichiers
+    // Renseignés seulement quand la bibliothèque (xmp.enabled) est activée.
+    QVector<SidecarRef> sidecars;
+    QString sidecarFingerprint;
 };
 
 // Métadonnées extraites d'un fichier, mappées sur les colonnes de `files`.

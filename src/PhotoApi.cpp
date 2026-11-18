@@ -13,6 +13,7 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QStringList>
+#include <QDate>
 
 namespace morfphoto {
 
@@ -46,6 +47,66 @@ int positiveIntParam(const QUrlQuery& q, const QString& key, int fallback) {
     return (ok && n >= 1) ? n : -1;
 }
 
+// Lit les criteres de GET /api/v1/library. false + *detail si une valeur est invalide.
+bool parseLibraryFilter(const QUrlQuery& query, LibraryFilter* f, QString* detail) {
+    auto list = [&query](const char* key) {
+        return query.allQueryItemValues(QLatin1String(key), QUrl::FullyDecoded);
+    };
+    auto text = [&query](const char* key) {
+        return query.queryItemValue(QLatin1String(key), QUrl::FullyDecoded);
+    };
+    auto flag = [&text](const char* key) {
+        return text(key) == QLatin1String("true") || text(key) == QLatin1String("1");
+    };
+    auto boundedInt = [&text, detail](const char* key, int max, int* out) {
+        if (text(key).isEmpty())
+            return true;
+        bool ok = false;
+        *out = text(key).toInt(&ok);
+        if (ok && *out >= 0 && *out <= max)
+            return true;
+        *detail = QStringLiteral("`%1` doit etre compris entre 0 et %2").arg(QLatin1String(key)).arg(max);
+        return false;
+    };
+    if (!boundedInt("min_rating", 5, &f->minRating) || !boundedInt("labels", 31, &f->labels))
+        return false;
+
+    f->rejected = text("rejected");
+    f->edited = text("edited");
+    if (!QStringList{"", "all", "hide", "only"}.contains(f->rejected)) {
+        *detail = QStringLiteral("`rejected` : all, hide ou only");
+        return false;
+    }
+    if (!QStringList{"", "all", "edited", "unedited"}.contains(f->edited)) {
+        *detail = QStringLiteral("`edited` : all, edited ou unedited");
+        return false;
+    }
+    f->takenFrom = text("taken_from");
+    f->takenTo = text("taken_to");
+    for (const QString& date : {f->takenFrom, f->takenTo}) {
+        if (!date.isEmpty() && !QDate::fromString(date, QStringLiteral("yyyy-MM-dd")).isValid()) {
+            *detail = QStringLiteral("date attendue au format AAAA-MM-JJ : %1").arg(date);
+            return false;
+        }
+    }
+    f->unlabeled = flag("unlabeled");
+    f->recursive = flag("recursive");
+    f->kinds = list("kind");
+    f->cameras = list("camera");
+    f->bodies = list("body");
+    f->lenses = list("lens");
+    f->keywords = list("keyword");
+    f->iso = list("iso");
+    f->aperture = list("aperture");
+    f->focal = list("focal");
+    f->shutter = list("shutter");
+    f->filename = text("filename");
+    f->folderPath = text("folder_path");
+    while (f->folderPath.size() > 1 && f->folderPath.endsWith(QLatin1Char('/')))
+        f->folderPath.chop(1);
+    return true;
+}
+
 } // namespace
 
 PhotoApi::PhotoApi(PhotoModule* module) : m_module(module) {}
@@ -63,6 +124,36 @@ PhotoApi::Result PhotoApi::handle(const QByteArray& method, const QString& path,
     sub = sub.mid(QStringLiteral("/api/v1").size());
     const QStringList seg = sub.split('/', Qt::SkipEmptyParts);
     const QUrlQuery query(queryString);
+
+    // ---- /library... : EXIF + XMP reunis, servis depuis la base sans toucher au disque ----
+    if (!seg.isEmpty() && seg[0] == QLatin1String("library")) {
+        if (!m_module->libraryEnabled())
+            return error(404, QStringLiteral("library_disabled"), QStringLiteral("activer xmp.enabled"));
+        if (method != "GET")
+            return error(405, QStringLiteral("method_not_allowed"));
+        if (seg.size() == 2 && seg[1] != QLatin1String("facets")) {
+            bool okId = false;
+            const int id = seg[1].toInt(&okId);
+            bool found = false;
+            const QJsonObject photo = okId ? m_module->libraryPhoto(id, &found) : QJsonObject();
+            if (!found)
+                return error(404, QStringLiteral("not_found"), path);
+            return ok(photo);
+        }
+        if (seg.size() > 2)
+            return error(404, QStringLiteral("not_found"), path);
+        LibraryFilter filter;
+        QString detail;
+        if (!parseLibraryFilter(query, &filter, &detail))
+            return error(400, QStringLiteral("bad_request"), detail);
+        if (seg.size() == 2)
+            return ok(m_module->libraryFacets(filter));
+        const int page = positiveIntParam(query, QStringLiteral("page"), 1);
+        const int pageSize = positiveIntParam(query, QStringLiteral("page_size"), kDefaultPageSize);
+        if (page < 0 || pageSize < 0)
+            return error(400, QStringLiteral("bad_request"), QStringLiteral("page/page_size invalide"));
+        return ok(m_module->libraryList(filter, page, qMin(pageSize, kMaxPageSize)));
+    }
 
     // ---- /photos... ----
     if (!seg.isEmpty() && seg[0] == QLatin1String("photos")) {
