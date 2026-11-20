@@ -28,7 +28,8 @@ déduplication et interprétation vivent dans une couche distincte (morfAnalytic
 - **Extrait l'EXIF via ExifTool** (`QProcess`, mode persistant `-stay_open`) et
   stocke les valeurs **brutes** : 49, 50 et 51 mm restent 49, 50 et 51 ; un RAW et
   son JPEG sont deux lignes distinctes. La vitesse est gardée en `1/250` et en
-  secondes.
+  secondes. Régler `exiftool.parallel_reads` sur `true` permet deux lectures
+  EXIF simultanées pendant l’indexation. Cette option est active dans l’image NAS.
 - **Indexe à la demande par défaut** : `watch.interval_ms` vaut `0` par défaut, donc
   aucune passe de fond - la base n'est mise à jour que sur demande (bouton PhotoHub ou
   `POST /api/v1/index`), sans aucune pression de fond sur la machine. Mettre une cadence

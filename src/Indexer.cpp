@@ -182,7 +182,24 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
         m_pFilesTotal = m_pFilesDiscovered;
     reportProgress(counts.seen);
 
-    for (const FileInfo& info : scan.files) {
+    constexpr qsizetype kExifBatchSize = 64;
+    QHash<QString, QPair<ExifData, QString>> exifBatch;
+    for (qsizetype i = 0; i < scan.files.size(); ++i) {
+        if (m_parallelExif && m_extractor && i % kExifBatchSize == 0) {
+            QStringList paths;
+            const qsizetype end = qMin(i + kExifBatchSize, scan.files.size());
+            for (qsizetype j = i; j < end; ++j) {
+                const FileInfo& candidate = scan.files.at(j);
+                const auto previous = known.constFind(candidate.path);
+                const bool needsExif = previous == known.constEnd() || mode == IndexMode::Full ||
+                    previous->size != candidate.size || previous->mtime != candidate.mtime ||
+                    (m_library && !fingerprints.contains(previous->id));
+                if (needsExif && isWithinRoots(candidate.path, m_roots))
+                    paths.append(candidate.path);
+            }
+            exifBatch = m_extractor->extractBatch(paths);
+        }
+        const FileInfo& info = scan.files.at(i);
         // Défense en profondeur : ne jamais rien indexer hors des racines globales.
         if (!isWithinRoots(info.path, m_roots))
             continue;
@@ -198,14 +215,14 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
         auto it = known.find(info.path);
         if (it == known.end()) {
             ExifData exif;
-            const bool ok = extract(runId, info.path, counts, exif);
+            const bool ok = extract(runId, info.path, counts, exif, exifBatch);
             const int fileId = m_repo->insertFile(folder.id, info, exif, ok, nowIso());
             if (m_library && fileId > 0)
                 applyLibrary(fileId, info, runId, counts);
             ++counts.created;
         } else if (mode == IndexMode::Full || it->size != info.size || it->mtime != info.mtime) {
             ExifData exif;
-            const bool ok = extract(runId, info.path, counts, exif);
+            const bool ok = extract(runId, info.path, counts, exif, exifBatch);
             m_repo->updateFile(it->id, info, exif, ok, nowIso());
             if (m_library)
                 applyLibrary(it->id, info, runId, counts);
@@ -217,7 +234,7 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
                 if (known == fingerprints.constEnd()) {
                     // Indexee avant l'activation : il manque les champs demandes a ExifTool.
                     ExifData exif;
-                    const bool ok = extract(runId, info.path, counts, exif);
+                    const bool ok = extract(runId, info.path, counts, exif, exifBatch);
                     m_repo->updateFile(it->id, info, exif, ok, nowIso());
                     applyLibrary(it->id, info, runId, counts);
                     ++counts.updated;
@@ -354,11 +371,18 @@ void Indexer::refreshContexts(const QSet<QString>& directories, int runId, RunCo
     }
 }
 
-bool Indexer::extract(int runId, const QString& path, RunCounts& counts, ExifData& out) {
+bool Indexer::extract(int runId, const QString& path, RunCounts& counts, ExifData& out,
+                      QHash<QString, QPair<ExifData, QString>>& batch) {
     if (!m_extractor)
         return false;
     QString error;
-    out = m_extractor->extract(path, &error);
+    if (auto cached = batch.find(path); cached != batch.end()) {
+        out = std::move(cached->first);
+        error = std::move(cached->second);
+        batch.erase(cached);
+    } else {
+        out = m_extractor->extract(path, &error);
+    }
     if (!out.ok) {
         // Une erreur d'extraction est journalisée et la passe continue.
         m_repo->logError(runId, path, QStringLiteral("exif"), error, nowIso());

@@ -56,7 +56,8 @@ docker compose up -d
 ```
 
 Au premier démarrage, morfPhoto déclare `/photos` et lance l'indexation. Une grande photothèque peut prendre
-du temps, car les métadonnées de chaque photo sont lues. Aux démarrages suivants,
+du temps, car les métadonnées de chaque photo sont lues. L’image NAS extrait les
+EXIF avec jusqu’à deux processus ExifTool. Aux démarrages suivants,
 le conteneur sert l’index existant dès l’ouverture. La surveillance suit les changements
 en fonctionnement et une passe quotidienne rattrape ceux effectués pendant l’arrêt.
 Pour un rattrapage immédiat, demander une passe incrémentale avec `POST /api/v1/index`.

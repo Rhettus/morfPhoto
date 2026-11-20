@@ -71,6 +71,7 @@ PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* 
     const QJsonObject exif = params.value(QStringLiteral("exiftool")).toObject();
     m_exiftoolBinary = exif.value(QStringLiteral("binary")).toString(QStringLiteral("exiftool"));
     m_stayOpen       = exif.value(QStringLiteral("stay_open")).toBool(true);
+    m_parallelExif   = exif.value(QStringLiteral("parallel_reads")).toBool(false);
     m_library = params.value(QStringLiteral("xmp")).toObject().value(QStringLiteral("enabled")).toBool(false);
 }
 
@@ -269,6 +270,7 @@ void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QString trigger
             extractor.open();
             Indexer indexer(&repo, &extractor, roots, m_probeTimeoutMs);
             indexer.setLibraryEnabled(m_library);
+            indexer.setParallelExif(m_parallelExif);
             // Relais de progression : l'Indexer rappelle depuis CE thread ; on recopie
             // sous verrou dans les membres lus par observableState() (thread HTTP).
             indexer.setProgressCallback([this](const IndexProgress& p) {

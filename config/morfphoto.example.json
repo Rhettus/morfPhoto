@@ -41,7 +41,8 @@
       "exiftool": {
         "_comment": "ExifTool est un PREREQUIS SYSTEME, non installe par service.py : `sudo apt install libimage-exiftool-perl` (Debian/Ubuntu/Raspberry Pi OS). Sans lui, les fichiers sont indexes mais les metadonnees restent vides ; /api/v1/index/status l'annonce alors dans last_error. 'binary' : nom sur le PATH, ou chemin complet (utile sous Windows). 'stay_open' : garder un process ExifTool ouvert (bien plus rapide sur une grosse phototheque).",
         "binary": "exiftool",
-        "stay_open": true
+        "stay_open": true,
+        "parallel_reads": false
       },
       "xmp": {
         "_comment": "'enabled' : reunit EXIF et XMP (sidecars darktable compris) et ouvre GET /api/v1/library. Indexe aussi les formats supplementaires (CRW, SR2, AVIF, JXL...). Defaut false : indexation et API inchangees. A l'activation, la passe suivante relit chaque photo une fois. Les sidecars ne sont jamais modifies.",

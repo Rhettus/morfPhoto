@@ -171,6 +171,7 @@ private:
     SourceManager m_sourceManager{QStringLiteral("morfphoto")};
     QString     m_exiftoolBinary;
     bool        m_stayOpen = true;
+    bool        m_parallelExif = false;
     bool        m_library = false;   // défaut : indexation et API inchangées
     // Cadence de la réconciliation automatique. Défaut : 0 => passe automatique
     // DÉSACTIVÉE, indexation UNIQUEMENT à la demande (API /index ou bouton PhotoHub).

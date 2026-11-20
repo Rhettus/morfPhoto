@@ -84,6 +84,7 @@ public:
     // thread de la passe.
     // Relève aussi les sidecars XMP et réunit EXIF + XMP (voir LibraryMetadata.h).
     void setLibraryEnabled(bool enabled) { m_library = enabled; }
+    void setParallelExif(bool enabled) { m_parallelExif = enabled; }
 
     using ProgressFn = std::function<void(const IndexProgress&)>;
     void setProgressCallback(ProgressFn cb) { m_progress = std::move(cb); }
@@ -95,7 +96,8 @@ private:
     // (avant ou pendant le scan) : la passe sera alors close en 'interrupted'.
     bool reconcileFolder(const FolderRow& folder, IndexMode mode, int runId,
                          RunCounts& counts, QSet<QString>& unavailableRoots);
-    bool extract(int runId, const QString& path, RunCounts& counts, ExifData& out);
+    bool extract(int runId, const QString& path, RunCounts& counts, ExifData& out,
+                 QHash<QString, QPair<ExifData, QString>>& batch);
     void applyLibrary(int fileId, const FileInfo& info, int runId, RunCounts& counts);
 
     // Découverte du CONTEXTE (morfphoto-context/2) pour les répertoires scannés d'une
@@ -114,6 +116,7 @@ private:
     QStringList      m_roots;
     int              m_probeTimeoutMs;
     bool             m_library = false;
+    bool             m_parallelExif = false;
 
     QMutex          m_runMutex;    // garde « une seule passe » (tryLock)
     mutable QMutex  m_stateMutex;  // protège l'état observable

@@ -22,7 +22,8 @@
       },
       "exiftool": {
         "binary": "exiftool",
-        "stay_open": true
+        "stay_open": true,
+        "parallel_reads": true
       },
       "xmp": {
         "enabled": true

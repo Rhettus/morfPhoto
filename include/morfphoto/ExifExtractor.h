@@ -5,7 +5,8 @@
  */
 
 #pragma once
-#include <QString>
+#include <QHash>
+#include <QStringList>
 #include "morfphoto/PhotoTypes.h"
 
 class QProcess;
@@ -51,6 +52,7 @@ public:
     // Lit les métadonnées d'un fichier. `ok` vaut true en cas de succès ; sinon
     // `error` décrit l'échec (le runner le journalise et poursuit la passe).
     ExifData extract(const QString& path, QString* error);
+    QHash<QString, QPair<ExifData, QString>> extractBatch(const QStringList& paths);
 
     // Mappe une sortie JSON d'ExifTool sur ExifData. Statique et public pour être
     // testable sans lancer ExifTool (le cœur fragile de la souveraineté des valeurs).
