@@ -57,6 +57,8 @@ private:
     QElapsedTimer   m_uptime;
     QThreadPool     m_thumbnailPool;
     int             m_thumbnailRequests = 0;
+    QThreadPool     m_cachedThumbnailPool;
+    int             m_cachedThumbnailRequests = 0;
     int             m_semanticRequests = 0;
 };
 

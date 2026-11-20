@@ -51,32 +51,43 @@ constexpr qint64 kMinThumbnailFreeBytes = 512 * 1024 * 1024;
 constexpr int kThumbnailEdge = 400;
 constexpr qint64 kMaxThumbnailJpegBytes = 1024 * 1024;
 constexpr auto kThumbnailCacheVersion = "grid-400-v1";
+constexpr auto kJpegThumbnailCacheVersion = "grid-400-jpeg-v2";
 
-QByteArray gridThumbnail(QByteArray source, int* thumbnailEdge) {
-    QBuffer input(&source);
-    input.open(QIODevice::ReadOnly);
-    QImageReader reader(&input, "jpeg");
+QImage readGridImage(QImageReader& reader) {
     const QSize size = reader.size();
     if (size.isEmpty())
         return {};
-    const int edge = qMax(size.width(), size.height());
-    if (edge > kThumbnailEdge)
+    if (qMax(size.width(), size.height()) > kThumbnailEdge)
         reader.setScaledSize(size.scaled(kThumbnailEdge, kThumbnailEdge, Qt::KeepAspectRatio)
                                  .expandedTo(QSize(1, 1)));
     reader.setAutoTransform(true);
     const QImage image = reader.read();
-    if (image.isNull() || qMax(image.width(), image.height()) > kThumbnailEdge)
-        return {};
-    *thumbnailEdge = qMax(image.width(), image.height());
-    if (edge <= kThumbnailEdge && source.size() <= kMaxThumbnailJpegBytes)
-        return source;
+    return qMax(image.width(), image.height()) <= kThumbnailEdge ? image : QImage{};
+}
 
+QByteArray encodeGridImage(const QImage& image) {
+    if (image.isNull())
+        return {};
     QByteArray jpeg;
     QBuffer output(&jpeg);
     output.open(QIODevice::WriteOnly);
     QImageWriter writer(&output, "jpeg");
     writer.setQuality(85);
     return writer.write(image) ? jpeg : QByteArray();
+}
+
+QByteArray gridThumbnail(QByteArray source, int* thumbnailEdge) {
+    QBuffer input(&source);
+    input.open(QIODevice::ReadOnly);
+    QImageReader reader(&input, "jpeg");
+    const QSize original = reader.size();
+    const QImage image = readGridImage(reader);
+    if (image.isNull())
+        return {};
+    *thumbnailEdge = qMax(image.width(), image.height());
+    if (qMax(original.width(), original.height()) <= kThumbnailEdge && source.size() <= kMaxThumbnailJpegBytes)
+        return source;
+    return encodeGridImage(image);
 }
 
 // Retrouve le détail d'une sélection par son id dans une liste déjà chargée.
@@ -337,7 +348,7 @@ void PhotoModule::warmThumbnails() {
         PhotoRepository repo(QStringLiteral("morfphoto:thumbnail-warmer"));
         if (!repo.open(dbPath))
             return result;
-        const QString checkpoint = QDir(root).filePath(QStringLiteral(".warm-through-") + QString::fromLatin1(kThumbnailCacheVersion));
+        const QString checkpoint = QDir(root).filePath(QStringLiteral(".warm-through-") + QString::fromLatin1(kJpegThumbnailCacheVersion));
         qint64 cursor = 0;
         {
             QFile input(checkpoint);
@@ -856,39 +867,49 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
                          QString::fromLatin1(key.mid(2, 1)));
         const QString stem = QString::fromLatin1(key);
         const QString legacy = shard.filePath(stem + QStringLiteral(".jpg"));
-        const QString target = shard.filePath(stem + '-' + QString::fromLatin1(kThumbnailCacheVersion)
-                                              + QStringLiteral(".jpg"));
+        const bool jpegSource = fileTypeFor(QLatin1Char('.') + file.suffix()) == QLatin1String("jpeg");
+        const auto cachePath = [&](const char* version) {
+            return shard.filePath(stem + '-' + QString::fromLatin1(version) + QStringLiteral(".jpg"));
+        };
+        const QString target = cachePath(jpegSource ? kJpegThumbnailCacheVersion : kThumbnailCacheVersion);
+        const QString previous = jpegSource ? cachePath(kThumbnailCacheVersion) : QString{};
         QFile cached(target);
         if (cacheEnabled && cached.open(QIODevice::ReadOnly)) {
             const QByteArray jpeg = cached.read(kMaxThumbnailJpegBytes + 1);
             if (jpeg.size() <= kMaxThumbnailJpegBytes && jpeg.startsWith("\xff\xd8"))
                 return jpeg;
         }
-        if (!ready)
+        if ((requireCache && !prewarm) || (!jpegSource && !ready))
             return {};
 
-        auto extract = [&](const QString& tag) -> QByteArray {
-            QProcess process;
-            process.start(binary, {QStringLiteral("-b"), tag, QStringLiteral("--"),
-                                   file.absoluteFilePath()});
-            if (!process.waitForStarted(requireCache ? 1000 : 3000) ||
-                !process.waitForFinished(requireCache ? 3000 : 8000)) {
-                process.kill();
-                process.waitForFinished(1000);
-                return {};
-            }
-            return process.readAllStandardOutput();
-        };
-        int edge = 0;
-        QByteArray jpeg = gridThumbnail(extract(QStringLiteral("-ThumbnailImage")), &edge);
-        for (const auto& tag : {QStringLiteral("-PreviewImage"), QStringLiteral("-JpgFromRaw")}) {
-            if (edge >= kThumbnailEdge)
-                break;
-            int previewEdge = 0;
-            auto preview = gridThumbnail(extract(tag), &previewEdge);
-            if (!preview.isEmpty() && previewEdge > edge) {
-                jpeg = std::move(preview);
-                edge = previewEdge;
+        QByteArray jpeg;
+        if (jpegSource) {
+            QImageReader reader(file.absoluteFilePath(), "jpeg");
+            jpeg = encodeGridImage(readGridImage(reader));
+        } else {
+            auto extract = [&](const QString& tag) -> QByteArray {
+                QProcess process;
+                process.start(binary, {QStringLiteral("-b"), tag, QStringLiteral("--"),
+                                       file.absoluteFilePath()});
+                if (!process.waitForStarted(requireCache ? 1000 : 3000) ||
+                    !process.waitForFinished(requireCache ? 3000 : 8000)) {
+                    process.kill();
+                    process.waitForFinished(1000);
+                    return {};
+                }
+                return process.readAllStandardOutput();
+            };
+            int edge = 0;
+            jpeg = gridThumbnail(extract(QStringLiteral("-ThumbnailImage")), &edge);
+            for (const auto& tag : {QStringLiteral("-PreviewImage"), QStringLiteral("-JpgFromRaw")}) {
+                if (edge >= kThumbnailEdge)
+                    break;
+                int previewEdge = 0;
+                auto preview = gridThumbnail(extract(tag), &previewEdge);
+                if (!preview.isEmpty() && previewEdge > edge) {
+                    jpeg = std::move(preview);
+                    edge = previewEdge;
+                }
             }
         }
         if (jpeg.isEmpty() || jpeg.size() > kMaxThumbnailJpegBytes)
@@ -912,21 +933,25 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
                                                  QDir::Time | QDir::Reversed);
         qint64 bytes = jpeg.size();
         for (const QFileInfo& entry : entries)
-            if (entry.absoluteFilePath() != target)
+            if (entry.absoluteFilePath() != target && entry.absoluteFilePath() != previous)
                 bytes += entry.size();
         if (prewarm && bytes > kShardBytes)
             return jpeg;
         for (const QFileInfo& entry : entries) {
             if (bytes <= kShardBytes)
                 break;
-            if (entry.absoluteFilePath() != target && QFile::remove(entry.absoluteFilePath()))
+            if (entry.absoluteFilePath() != target && entry.absoluteFilePath() != previous &&
+                QFile::remove(entry.absoluteFilePath()))
                 bytes -= entry.size();
         }
         if (bytes <= kShardBytes) {
             QSaveFile output(target);
             if (output.open(QIODevice::WriteOnly) && output.write(jpeg) == jpeg.size() &&
-                output.commit())
+                output.commit()) {
+                if (!previous.isEmpty())
+                    QFile::remove(previous);
                 writes->fetch_add(1);
+            }
         }
         return jpeg;
     };

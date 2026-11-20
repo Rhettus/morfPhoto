@@ -16,6 +16,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QImage>
 #include <QDateTime>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -24,6 +25,7 @@
 #include <QTimer>
 
 #include "morfphoto/PhotoScanner.h"
+#include "morfphoto/PhotoModule.h"
 #include "morfphoto/FolderWatcher.h"
 #include "morfphoto/PhotoRepository.h"
 #include "morfphoto/ExifExtractor.h"
@@ -740,6 +742,16 @@ int main(int argc, char** argv) {
     CHECK(!isApiPath("/healthz") && !isApiPath("/status"), "cle: supervision ouverte");
 
     repo2.close();
+    {
+        const QString jpegPath = base + QStringLiteral("/plain.JPG");
+        QImage original(800, 600, QImage::Format_RGB32);
+        original.fill(Qt::blue);
+        CHECK(original.save(jpegPath, "JPEG"), "thumbnail: write fixture without an embedded preview");
+        PhotoModule photos(QStringLiteral("smoke:thumbnails"), QJsonObject{{"roots", QJsonArray{base}}});
+        const QImage thumbnail = QImage::fromData(photos.thumbnailReader(false)(jpegPath), "JPEG");
+        CHECK(thumbnail.size() == QSize(400, 300),
+              "thumbnail: scale the original JPEG without ExifTool and preserve its aspect ratio");
+    }
     QDir(base).removeRecursively();
 
     std::printf(failures ? "\n%d test(s) en echec\n" : "\nTous les tests passent\n", failures);

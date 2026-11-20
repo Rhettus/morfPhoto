@@ -79,6 +79,7 @@ HttpServer::HttpServer(ServiceConfig config, ModuleRegistry* registry, QObject* 
     connect(m_server, &QTcpServer::newConnection, this, &HttpServer::onNewConnection);
     // L'environnement prime : un secret de conteneur n'a pas a vivre dans un fichier.
     m_thumbnailPool.setMaxThreadCount(2);
+    m_cachedThumbnailPool.setMaxThreadCount(2);
     const QString envKey = qEnvironmentVariable("MORFPHOTO_API_KEY").trimmed();
     m_apiKey = (envKey.isEmpty() ? m_config.apiKey.trimmed() : envKey).toUtf8();
 }
@@ -281,7 +282,8 @@ void HttpServer::serveThumbnail(QTcpSocket* sock, const QByteArray& method,
     }
     IModule* mod = m_registry ? m_registry->firstOfType(QStringLiteral("photo")) : nullptr;
     const auto* photos = qobject_cast<PhotoModule*>(mod);
-    if (!photos || m_thumbnailRequests >= 8) {
+    int& requests = requireCache ? m_cachedThumbnailRequests : m_thumbnailRequests;
+    if (!photos || requests >= 8) {
         reply(sock, 503, reasonFor(503), "{\"error\":\"thumbnail_unavailable\"}");
         return;
     }
@@ -289,13 +291,26 @@ void HttpServer::serveThumbnail(QTcpSocket* sock, const QByteArray& method,
     // Le travail ne retient ni le module ni la socket. Le thread HTTP seul
     // installe et retire les demandes et publie les réponses.
     disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
-    ++m_thumbnailRequests;
-    auto* watcher = new QFutureWatcher<QByteArray>(this);
-    connect(watcher, &QFutureWatcher<QByteArray>::finished, this,
-            [this, socket = QPointer<QTcpSocket>(sock), watcher] {
-        --m_thumbnailRequests;
-        const QByteArray jpeg = watcher->result();
+    ++requests;
+    struct ThumbnailResult {
+        QByteArray jpeg;
+        qint64 queueMs;
+        qint64 readMs;
+    };
+    QElapsedTimer queued;
+    queued.start();
+    const bool logCached = requireCache && sock->property("httpLogRoute").isValid();
+    auto* watcher = new QFutureWatcher<ThumbnailResult>(this);
+    connect(watcher, &QFutureWatcher<ThumbnailResult>::finished, this,
+            [this, socket = QPointer<QTcpSocket>(sock), watcher, logCached, requireCache] {
+        --(requireCache ? m_cachedThumbnailRequests : m_thumbnailRequests);
+        const auto result = watcher->result();
+        const auto& jpeg = result.jpeg;
         watcher->deleteLater();
+        if (logCached) {
+            qInfo().noquote() << "morfPhoto HTTP thumbnail cache" << (jpeg.isEmpty() ? "miss" : "hit")
+                              << "queue_ms" << result.queueMs << "read_ms" << result.readMs;
+        }
         if (!socket)
             return;
         if (jpeg.isEmpty())
@@ -303,7 +318,13 @@ void HttpServer::serveThumbnail(QTcpSocket* sock, const QByteArray& method,
         else
             reply(socket, 200, reasonFor(200), jpeg, "image/jpeg", true);
     });
-    watcher->setFuture(QtConcurrent::run(&m_thumbnailPool, photos->thumbnailReader(requireCache), path));
+    auto* pool = requireCache ? &m_cachedThumbnailPool : &m_thumbnailPool;
+    watcher->setFuture(QtConcurrent::run(pool,
+        [read = photos->thumbnailReader(requireCache), path, queued] {
+            const qint64 queueMs = queued.elapsed();
+            auto jpeg = read(path);
+            return ThumbnailResult{std::move(jpeg), queueMs, queued.elapsed() - queueMs};
+        }));
 }
 
 QByteArray HttpServer::buildStatusJson() const {
