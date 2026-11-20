@@ -130,6 +130,23 @@ void HttpServer::onSocketReadyRead(QTcpSocket* sock) {
     const int lineEnd = buf.indexOf("\r\n");
     const QList<QByteArray> parts = buf.left(lineEnd).split(' ');
     const QByteArray method = parts.value(0);
+    if (qEnvironmentVariableIntValue("MORFPHOTO_HTTP_DEBUG") == 1) {
+        const QByteArray path = parts.value(1).split('?').value(0);
+        const char* route = "other";
+        if (path == "/healthz")
+            route = "health";
+        else if (path == "/api/v1/library" || path.startsWith("/api/v1/library/"))
+            route = "catalog";
+        else if (path.startsWith("/api/v1/thumbnail"))
+            route = "thumbnail";
+        else if (path == "/api/v1/search/semantic")
+            route = "semantic";
+        else if (path == "/api/v1/index/status")
+            route = "index-status";
+        sock->setProperty("httpLogRoute", QString::fromLatin1(route));
+        sock->setProperty("httpLogStartMs", m_uptime.elapsed());
+    }
+
 
     // Anti-CSRF : une ecriture portant un Origin different de Host vient d'une page tierce.
     if (isCrossOriginWrite(method, headerValue(headerBlock, "Origin"),
@@ -321,6 +338,12 @@ QByteArray HttpServer::buildStatusJson() const {
 void HttpServer::reply(QTcpSocket* sock, int code, const QByteArray& reason, const QByteArray& body,
                        const QByteArray& contentType, bool allowCors,
                        const QByteArray& extraHeaders) {
+    const auto route = sock->property("httpLogRoute");
+    if (route.isValid()) {
+        qInfo().noquote() << "morfPhoto HTTP" << route.toString() << "status" << code
+                          << "handler_ms" << m_uptime.elapsed() - sock->property("httpLogStartMs").toLongLong()
+                          << "bytes" << body.size();
+    }
     QByteArray resp;
     resp += "HTTP/1.1 " + QByteArray::number(code) + " " + reason + "\r\n";
     resp += "Content-Type: " + contentType + "\r\n";
@@ -337,7 +360,12 @@ void HttpServer::reply(QTcpSocket* sock, int code, const QByteArray& reason, con
         return;
     }
     // Qt drains queued bytes before closing. Bound the drain for clients that stop reading.
-    QTimer::singleShot(10000, sock, [sock] { sock->abort(); });
+    QTimer::singleShot(10000, sock, [sock, route] {
+        if (route.isValid())
+            qWarning().noquote() << "morfPhoto HTTP drain timed out" << route.toString()
+                                 << "queued_bytes" << sock->bytesToWrite();
+        sock->abort();
+    });
     sock->disconnectFromHost();
 }
 
