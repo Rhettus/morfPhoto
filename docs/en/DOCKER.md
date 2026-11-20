@@ -56,7 +56,10 @@ docker compose up -d
 ```
 
 On first start, morfPhoto registers `/photos` and begins indexing. A large library can take a while, because
-metadata is read from every photo.
+metadata is read from every photo. On later starts, the container serves the saved
+index immediately. Live watching handles changes while it runs. A daily scan
+catches changes made while it was stopped. To catch up sooner, request an
+incremental scan with `POST /api/v1/index`.
 
 ## 4. Check that it works
 

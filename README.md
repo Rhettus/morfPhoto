@@ -30,8 +30,10 @@ layer (morfAnalytics).
 - **Indexes on demand by default**: `watch.interval_ms` defaults to `0`, meaning no
   background pass runs - the database updates only when asked (PhotoHub button or
   `POST /api/v1/index`), for zero background pressure on the machine. Set a positive
-  cadence (e.g. `86400000`, once a day) to also run a periodic reconciliation. One
-  pass at a time - a concurrent request is refused, never queued.
+  cadence (e.g. `86400000`, once a day) to run periodic reconciliation. With a
+  positive cadence, set `watch.scan_on_startup` to `false` to skip the immediate
+  pass and serve the saved index while waiting for the first scheduled scan.
+  One pass runs at a time. Concurrent requests are refused.
 - **Never destroys implicitly**: a vanished file is marked missing; removing a
   folder is a soft retire that preserves its history. Permanent deletion exists
   (`POST /api/v1/purge`, by folder, year, camera or all), but it stays an **explicit**,

@@ -61,6 +61,7 @@ PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* 
 
     const QJsonObject watch = params.value(QStringLiteral("watch")).toObject();
     m_intervalMs = watch.value(QStringLiteral("interval_ms")).toInt(m_intervalMs);
+    m_scanOnStartup = watch.value(QStringLiteral("scan_on_startup")).toBool(m_scanOnStartup);
     // Délai borné des sondes d'accessibilité de racine (tolérance aux montages
     // distants). Configurable : pas de seuil en dur (règle 11 morfSystem).
     m_probeTimeoutMs = watch.value(QStringLiteral("availability_timeout_ms")).toInt(m_probeTimeoutMs);
@@ -113,11 +114,8 @@ bool PhotoModule::start() {
         m_exiftoolDetail = detail;
     }
 
-    // Surveillance périodique : réconciliation incrémentale à cadence fixe. Une
-    // cadence <= 0 désactive complètement l'automatique : aucune passe périodique,
-    // aucune passe au démarrage. La base n'évolue plus alors que sur demande
-    // explicite (API /index ou bouton PhotoHub) - utile pour ne mettre AUCUNE
-    // pression de fond sur une machine modeste ou une source réseau.
+    // Une cadence positive active la réconciliation périodique. La première
+    // passe peut être différée jusqu'au premier déclenchement du minuteur.
     if (m_intervalMs > 0) {
         m_watchTimer = new QTimer(this);
         m_watchTimer->setInterval(m_intervalMs);
@@ -126,8 +124,8 @@ bool PhotoModule::start() {
         });
         m_watchTimer->start();
 
-        // Première passe dès le démarrage, pour rendre la base cohérente tout de suite.
-        triggerIndex(IndexMode::Incremental, {}, QStringLiteral("watch"));
+        if (m_scanOnStartup)
+            triggerIndex(IndexMode::Incremental, {}, QStringLiteral("watch"));
     }
 
     if (m_realtime)
@@ -357,6 +355,7 @@ QJsonObject PhotoModule::observableState() const {
     QJsonObject watch;
     watch["auto"]        = (m_intervalMs > 0);
     watch["interval_ms"] = m_intervalMs;
+    watch["scan_on_startup"] = m_intervalMs > 0 && m_scanOnStartup;
     if (m_watcher)
         watch["realtime"] = m_watcher->statusJson();
     o["watch"] = watch;

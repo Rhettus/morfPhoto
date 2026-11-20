@@ -178,7 +178,8 @@ private:
     // défaut. Une valeur positive réactive une passe périodique (ex. 86400000 = une
     // fois par jour) ; attention, une passe re-parcourt et `stat` tout l'arbre
     // surveillé plus une sonde par racine, coûteux surtout sur un montage réseau.
-    int         m_intervalMs = 0;   // 0 = à la demande uniquement (défaut)
+    int         m_intervalMs = 0;   // 0 = pas de réconciliation planifiée
+    bool        m_scanOnStartup = true;
     // Délai borné des sondes d'accessibilité d'une racine (montages distants) :
     // au-delà, la racine est déclarée indisponible plutôt que de rester figé.
     int         m_probeTimeoutMs = 5000;

@@ -33,8 +33,10 @@ déduplication et interprétation vivent dans une couche distincte (morfAnalytic
   aucune passe de fond - la base n'est mise à jour que sur demande (bouton PhotoHub ou
   `POST /api/v1/index`), sans aucune pression de fond sur la machine. Mettre une cadence
   positive (ex. `86400000`, une fois par jour) pour réactiver une réconciliation
-  périodique. Une seule passe à la fois - une demande concurrente est refusée, jamais
-  empilée.
+  périodique. Avec une cadence positive, régler `watch.scan_on_startup` sur
+  `false` permet de servir l’index existant dès le démarrage et de différer la
+  première passe jusqu’à l’échéance du minuteur. Une seule passe s’exécute à la
+  fois. Les demandes concurrentes sont refusées.
 - **Ne détruit jamais implicitement** : un fichier disparu est marqué absent ;
   retirer un dossier est un retrait doux qui conserve son historique. La suppression
   définitive existe (`POST /api/v1/purge`, par dossier, année, boîtier ou totale),

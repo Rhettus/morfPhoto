@@ -13,8 +13,9 @@
       "db_path": "",
       "roots": ["/photos"],
       "watch": {
-        "_comment": "Une passe au demarrage puis une par jour : rattrape ce qui a change pendant l'arret du conteneur.",
+        "_comment": "Au redemarrage, reutilise l'index existant. La passe quotidienne rattrape les changements faits pendant l'arret.",
         "interval_ms": 86400000,
+        "scan_on_startup": false,
         "availability_timeout_ms": 5000,
         "realtime": true,
         "debounce_ms": 2000
