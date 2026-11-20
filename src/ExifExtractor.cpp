@@ -6,6 +6,7 @@
 
 #include "morfphoto/ExifExtractor.h"
 
+#include <QFileInfo>
 #include <QProcess>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -49,8 +50,8 @@ constexpr int kTimeoutMs = 15000;
 // Sonde de disponibilité (« -ver ») : plus courte, elle ne lit pas de fichier.
 constexpr int kProbeTimeoutMs = 5000;
 
-// Assemble le bloc d'arguments commun (JSON, charset, format de date, tags, fichier).
-QStringList argBlock(const QString& path, bool libraryTags) {
+// Assemble le bloc d'arguments commun (JSON, charset, format de date, tags).
+QStringList argBlock(bool libraryTags) {
     QStringList args;
     args << QStringLiteral("-json")
          << QStringLiteral("-charset") << QStringLiteral("filename=UTF8")
@@ -60,9 +61,6 @@ QStringList argBlock(const QString& path, bool libraryTags) {
     if (libraryTags)
         for (const char* t : kLibraryTags)
             args << QString::fromLatin1(t);
-    // `--` : ExifTool traite ensuite tout ce qui suit comme un nom de fichier, meme s'il
-    // commence par `-` (sinon un fichier nomme « -execute » serait lu comme une option).
-    args << QStringLiteral("--") << path;
     return args;
 }
 
@@ -181,16 +179,17 @@ ExifData ExifExtractor::extract(const QString& path, QString* error) {
     QString localError;
     QString* err = error ? error : &localError;
     err->clear();
+    const bool persistent = m_stayOpen && m_proc;
+    const QString file = persistent ? QFileInfo(path).absoluteFilePath() : path;
 
     // Le protocole argfile est ligne par ligne : un \n ou \r dans le nom injecterait des
     // arguments ExifTool arbitraires (ex. « -overwrite_original »). Fichier refuse.
-    if (path.contains(QLatin1Char('\n')) || path.contains(QLatin1Char('\r'))) {
+    if (file.contains(QLatin1Char('\n')) || file.contains(QLatin1Char('\r'))) {
         *err = QStringLiteral("ExifTool: nom de fichier avec saut de ligne refuse");
         return {};
     }
 
-    const QString json = (m_stayOpen && m_proc) ? readPersistent(path, err)
-                                                : readOnce(path, err);
+    const QString json = persistent ? readPersistent(file, err) : readOnce(file, err);
     if (!err->isEmpty())
         return {};
     return mapTags(json, err);
@@ -202,8 +201,11 @@ QString ExifExtractor::readPersistent(const QString& path, QString* error) {
 
     // Pousser le bloc d'arguments, un par ligne, puis l'ordre d'exécution numéroté.
     QByteArray payload;
-    for (const QString& a : argBlock(path, m_libraryTags))
+    for (const QString& a : argBlock(m_libraryTags))
         payload += a.toUtf8() + "\n";
+    // Un chemin absolu ne peut pas être pris pour une option. Dans le flux
+    // persistant, « -- » ferait aussi passer « -executeN » pour un fichier.
+    payload += path.toUtf8() + "\n";
     payload += "-execute" + QByteArray::number(m_counter) + "\n";
     m_proc->write(payload);
     m_proc->waitForBytesWritten(kTimeoutMs);
@@ -226,7 +228,7 @@ QString ExifExtractor::readPersistent(const QString& path, QString* error) {
 
 QString ExifExtractor::readOnce(const QString& path, QString* error) {
     QProcess proc;
-    proc.start(m_binary, argBlock(path, m_libraryTags));
+    proc.start(m_binary, argBlock(m_libraryTags) << QStringLiteral("--") << path);
     if (!proc.waitForFinished(kTimeoutMs)) {
         *error = QStringLiteral("ExifTool: delai depasse pour %1").arg(path);
         return {};
