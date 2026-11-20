@@ -4,15 +4,22 @@
 import json
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from PIL import UnidentifiedImageError
-
 BATCH_SIZE = 32
 MAX_PREVIEW_BYTES = 32 * 1024 * 1024
+
+
+class PhotoFailure(Exception):
+    """A preview or inference failure attributable to an individual photo."""
+
+
+class PhotoStalled(PhotoFailure):
+    """A photo that stopped the vision process from responding."""
 
 
 def catalog_rows(db, after):
@@ -68,45 +75,60 @@ class PhotoApi:
             return body
 
 
-def pass_catalog(catalog, api, model, index, report, searching):
+def pass_catalog(catalog, api, vision, index, report, searching, quarantined):
     cursor = 0
-    progress = {"eligible": 0, "indexed": 0, "failed": 0}
+    progress = {"eligible": 0, "indexed": 0, "failed": 0, "photo_id": None, "pause_reason": None}
     with closing(sqlite3.connect(catalog.as_uri() + "?mode=ro", uri=True)) as db:
         progress["eligible"] = db.execute("""
             SELECT count(*) FROM files f JOIN folders d ON d.id = f.folder_id
             WHERE f.state = 'present' AND d.enabled = 1 AND d.deleted_at IS NULL
         """).fetchone()[0]
 
+    def pause_reason():
+        if searching.is_set():
+            return "semantic_search"
+        if api.indexing():
+            return "photo_indexing"
+        return None
+
     while True:
-        if searching.is_set() or api.indexing():
-            report("paused", progress)
+        if reason := pause_reason():
+            report("paused", {**progress, "phase": "backfill", "pause_reason": reason})
             return
         with closing(sqlite3.connect(catalog.as_uri() + "?mode=ro", uri=True)) as db:
             rows = catalog_rows(db, cursor)
         if not rows:
             index.prune(catalog)
-            report("idle", progress)
+            report("idle", {**progress, "phase": "waiting", "pause_reason": None})
             return
         for photo_id, path, size, mtime in rows:
             revision = fingerprint(path, size, mtime)
             if index.current(photo_id, revision):
                 progress["indexed"] += 1
                 continue
-            if searching.is_set() or api.indexing():
-                report("paused", progress)
+            if reason := pause_reason():
+                report("paused", {**progress, "phase": "backfill", "pause_reason": reason})
                 return
+            if quarantined.get(photo_id) == revision:
+                progress["failed"] += 1
+                continue
+
+            def report_phase(phase):
+                report("warming", {**progress, "phase": phase, "photo_id": photo_id})
+
             try:
-                vector = model.image(api.preview(path))
-            except HTTPError as error:
-                if error.code != 404:
-                    raise
-                error.close()
+                vector = vision.image(path, report_phase)
+            except PhotoFailure as error:
+                if isinstance(error, PhotoStalled):
+                    quarantined[photo_id] = revision
                 progress["failed"] += 1
+                report("warming", {**progress, "phase": "photo_failed", "photo_id": photo_id,
+                                   "last_error": str(error)})
+                print(f"CLIP skipped photo {photo_id}: {error}", flush=True)
                 continue
-            except (UnidentifiedImageError, ValueError):
-                progress["failed"] += 1
-                continue
+            report_phase("save_embedding")
             index.store(photo_id, revision, vector)
+            progress["last_progress_at"] = datetime.now(timezone.utc).isoformat()
             progress["indexed"] += 1
-        report("warming", progress)
+        report("warming", {**progress, "phase": "backfill", "pause_reason": None})
         cursor = rows[-1][0]

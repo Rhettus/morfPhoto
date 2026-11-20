@@ -7,12 +7,14 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Event, Thread
+from datetime import datetime, timezone
 from urllib.error import URLError
 
 from backfill import PhotoApi, pass_catalog
 from index import EmbeddingIndex
-from model import ClipModel, EMBEDDING_VERSION
+from model import TextModel, EMBEDDING_VERSION
 from search import SemanticSearch
+from vision_worker import VisionWorker
 
 
 def main():
@@ -21,19 +23,26 @@ def main():
     if not 1 <= threads <= 16:
         raise ValueError("MORFPHOTO_CLIP_THREADS must be between 1 and 16")
     catalog = Path(os.environ.get("STATE_DIRECTORY", "/data")) / "photos.db"
-    api = PhotoApi(os.environ.get("MORFPHOTO_API_KEY"))
+    key = os.environ.get("MORFPHOTO_API_KEY")
+    api = PhotoApi(key)
+    status = {}
+
     def report(state, progress):
+        now = datetime.now(timezone.utc).isoformat()
+        status.update(progress)
+        status.update(state=state, updated_at=now)
         pending = root / ".status.tmp"
-        pending.write_text(json.dumps({"state": state, **progress}))
+        pending.write_text(json.dumps(status, ensure_ascii=False))
         pending.replace(root / "status.json")
 
-    report("starting", {})
+    print("CLIP worker loading model", flush=True)
+    report("starting", {"phase": "model_load"})
     try:
-        model = ClipModel(root / "model", threads)
-    except Exception:
-        report("error", {})
+        model = TextModel(root / "model", threads)
+        index = EmbeddingIndex(root / "embeddings.db", EMBEDDING_VERSION)
+    except Exception as error:
+        report("error", {"last_error": type(error).__name__})
         raise
-    index = EmbeddingIndex(root / "embeddings.db", EMBEDDING_VERSION)
     search = SemanticSearch(api, model, index)
     searching = Event()
 
@@ -65,15 +74,22 @@ def main():
     def backfill():
         import time
 
+        vision = VisionWorker(root / "model", threads, key)
+        quarantined = {}
         while True:
             try:
-                pass_catalog(catalog, api, model, index, report, searching)
+                pass_catalog(catalog, api, vision, index, report, searching, quarantined)
             except (URLError, TimeoutError, sqlite3.OperationalError) as error:
-                report("retrying", {})
+                report("retrying", {"last_error": type(error).__name__})
                 print(f"CLIP backfill will retry: {error}", flush=True)
+            except Exception as error:
+                report("error", {"last_error": type(error).__name__})
+                vision.close()
+                raise
             time.sleep(30)
 
     with HTTPServer(("127.0.0.1", 8794), Handler) as server:
+        print("CLIP worker ready", flush=True)
         Thread(target=backfill, daemon=True).start()
         server.serve_forever()
 

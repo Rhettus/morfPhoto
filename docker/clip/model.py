@@ -18,8 +18,9 @@ ASSETS = {
 }
 
 
-def verify_assets(root):
-    for name, expected in ASSETS.items():
+def verify_assets(root, names):
+    for name in names:
+        expected = ASSETS[name]
         with (root / name).open("rb") as asset:
             if len(expected) == 64:
                 digest = hashlib.file_digest(asset, "sha256").hexdigest()
@@ -39,28 +40,27 @@ def normalize(output):
     return vector / norm
 
 
-class ClipModel:
-    def __init__(self, root, cpu_threads):
-        verify_assets(root)
+def session(root, tower, threads):
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = threads
+    options.inter_op_num_threads = 1
+    return ort.InferenceSession(
+        str(root / "onnx" / f"{tower}_model.onnx"),
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+
+
+class TextModel:
+    def __init__(self, root, threads):
+        verify_assets(root, ("onnx/text_model.onnx", "tokenizer.json"))
         self.tokenizer = Tokenizer.from_file(str(root / "tokenizer.json"))
         self.tokenizer.enable_truncation(max_length=77)
         self.tokenizer.enable_padding(length=77, pad_id=49407, pad_token="<|endoftext|>")
         probe = self.tokenizer.encode("a photo of a cat")
         if probe.ids[:7] != [49406, 320, 1125, 539, 320, 2368, 49407]:
             raise ValueError("Incompatible CLIP tokenizer")
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = cpu_threads
-        options.inter_op_num_threads = 1
-        self.text_session = self._session(root, "text", options)
-        self.vision_session = self._session(root, "vision", options)
-
-    @staticmethod
-    def _session(root, tower, options):
-        return ort.InferenceSession(
-            str(root / "onnx" / f"{tower}_model.onnx"),
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
+        self.text_session = session(root, "text", threads)
 
     def text(self, query):
         if not query.strip() or len(query.encode("utf-8")) > 65536:
@@ -72,6 +72,12 @@ class ClipModel:
         }
         feed = {item.name: inputs[item.name] for item in self.text_session.get_inputs()}
         return normalize(self.text_session.run(["text_embeds"], feed)[0])
+
+
+class VisionModel:
+    def __init__(self, root, threads):
+        verify_assets(root, ("onnx/vision_model.onnx",))
+        self.vision_session = session(root, "vision", threads)
 
     def image(self, preview):
         with Image.open(BytesIO(preview)) as image:
