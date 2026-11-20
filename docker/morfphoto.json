@@ -23,7 +23,7 @@
       "exiftool": {
         "binary": "exiftool",
         "stay_open": true,
-        "parallel_reads": true
+        "workers": 2
       },
       "xmp": {
         "enabled": true

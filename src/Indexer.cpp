@@ -185,7 +185,7 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
     constexpr qsizetype kExifBatchSize = 64;
     QHash<QString, QPair<ExifData, QString>> exifBatch;
     for (qsizetype i = 0; i < scan.files.size(); ++i) {
-        if (m_parallelExif && m_extractor && i % kExifBatchSize == 0) {
+        if (m_exifWorkers > 1 && m_extractor && i % kExifBatchSize == 0) {
             QStringList paths;
             const qsizetype end = qMin(i + kExifBatchSize, scan.files.size());
             for (qsizetype j = i; j < end; ++j) {
@@ -197,7 +197,7 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
                 if (needsExif && isWithinRoots(candidate.path, m_roots))
                     paths.append(candidate.path);
             }
-            exifBatch = m_extractor->extractBatch(paths);
+            exifBatch = m_extractor->extractBatch(paths, m_exifWorkers);
         }
         const FileInfo& info = scan.files.at(i);
         // Défense en profondeur : ne jamais rien indexer hors des racines globales.

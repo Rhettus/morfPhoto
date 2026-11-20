@@ -9,6 +9,7 @@ services:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       MORFPHOTO_API_KEY: ${MORFPHOTO_API_KEY:-}
+      MORFPHOTO_EXIF_WORKERS: ${MORFPHOTO_EXIF_WORKERS:-2}
     volumes:
       - morfphoto-data:/data
       - type: bind

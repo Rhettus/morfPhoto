@@ -31,7 +31,12 @@ Edit `.env`:
 | `PUID`, `PGID` | No | Account the service runs as. It must be able to read `PHOTOS_DIR`. Default `1000`. |
 | `MORFPHOTO_PORT` | No | Port published on the host. Default `8793`. |
 | `MORFPHOTO_API_KEY` | No | Key that protects the API, in images with API key support. Empty means no key. |
+| `MORFPHOTO_EXIF_WORKERS` | No | Number of concurrent ExifTool readers (1–4). Default `2`. |
 | `MORFPHOTO_IMAGE` | No | Image to run, for example to pin a version. |
+
+For an existing deployment, update `docker-compose.yml` with the new
+`MORFPHOTO_EXIF_WORKERS` environment entry before setting it in `.env`. Recreate
+the container after changing the value.
 
 To find the right `PUID` and `PGID`, run `id` as a user who can read the photos:
 
@@ -56,8 +61,7 @@ docker compose up -d
 ```
 
 On first start, morfPhoto registers `/photos` and begins indexing. A large library can take a while, because
-metadata is read from every photo. The NAS image extracts EXIF with up to two
-ExifTool processes. On later starts, the container serves the saved
+metadata is read from every photo. On later starts, the container serves the saved
 index immediately. Live watching handles changes while it runs. A daily scan
 catches changes made while it was stopped. To catch up sooner, request an
 incremental scan with `POST /api/v1/index`.

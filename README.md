@@ -27,8 +27,8 @@ layer (morfAnalytics).
 - **Extracts EXIF via ExifTool** (`QProcess`, persistent `-stay_open` mode) and
   stores values **raw**: 49, 50 and 51 mm stay 49, 50 and 51; a RAW and its JPEG
   are two distinct rows. Shutter speed is kept both as `1/250` and in seconds.
-  Set `exiftool.parallel_reads` to `true` to allow two concurrent EXIF reads
-  during indexing. It is enabled in the NAS image.
+  Set `exiftool.workers` to 1–4 concurrent EXIF readers during indexing.
+  `MORFPHOTO_EXIF_WORKERS` overrides it. The NAS image defaults to two readers.
 - **Indexes on demand by default**: `watch.interval_ms` defaults to `0`, meaning no
   background pass runs - the database updates only when asked (PhotoHub button or
   `POST /api/v1/index`), for zero background pressure on the machine. Set a positive

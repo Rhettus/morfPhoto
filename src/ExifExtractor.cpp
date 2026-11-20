@@ -15,6 +15,7 @@
 
 #include <future>
 #include <utility>
+#include <vector>
 
 namespace morfphoto {
 
@@ -196,29 +197,36 @@ ExifData ExifExtractor::extract(const QString& path, QString* error) {
     return mapTags(json, err);
 }
 
-QHash<QString, QPair<ExifData, QString>> ExifExtractor::extractBatch(const QStringList& paths) {
-    auto readLane = [&paths](ExifExtractor& extractor, qsizetype first) {
-        QHash<QString, QPair<ExifData, QString>> results;
-        for (qsizetype i = first; i < paths.size(); i += 2) {
+QHash<QString, QPair<ExifData, QString>> ExifExtractor::extractBatch(const QStringList& paths,
+                                                                   int workers) {
+    using Results = QHash<QString, QPair<ExifData, QString>>;
+    const qsizetype lanes = qMin<qsizetype>(qMax(1, workers), paths.size());
+    auto readLane = [&paths, lanes](ExifExtractor& extractor, qsizetype first) {
+        Results results;
+        for (qsizetype i = first; i < paths.size(); i += lanes) {
             QString error;
             ExifData data = extractor.extract(paths.at(i), &error);
             results.insert(paths.at(i), {std::move(data), std::move(error)});
         }
         return results;
     };
-    if (paths.size() < 2)
-        return readLane(*this, 0);
+    if (paths.isEmpty())
+        return {};
 
-    // Chaque voie possède son QProcess. Le thread de la passe ne reprend les
-    // écritures SQLite qu'une fois les résultats des deux voies disponibles.
-    auto worker = std::async(std::launch::async, [&] {
-        ExifExtractor extractor(m_binary, m_stayOpen);
-        extractor.setLibraryTags(m_libraryTags);
-        extractor.open();
-        return readLane(extractor, 1);
-    });
+    // Chaque voie possède son QProcess. Les résultats sont réunis avant de
+    // reprendre les écritures SQLite dans le thread de la passe.
+    std::vector<std::future<Results>> workersInFlight;
+    for (qsizetype lane = 1; lane < lanes; ++lane) {
+        workersInFlight.push_back(std::async(std::launch::async | std::launch::deferred, [&, lane] {
+            ExifExtractor extractor(m_binary, m_stayOpen);
+            extractor.setLibraryTags(m_libraryTags);
+            extractor.open();
+            return readLane(extractor, lane);
+        }));
+    }
     auto results = readLane(*this, 0);
-    results.insert(worker.get());
+    for (auto& worker : workersInFlight)
+        results.insert(worker.get());
     return results;
 }
 

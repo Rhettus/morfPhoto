@@ -84,7 +84,7 @@ public:
     // thread de la passe.
     // Relève aussi les sidecars XMP et réunit EXIF + XMP (voir LibraryMetadata.h).
     void setLibraryEnabled(bool enabled) { m_library = enabled; }
-    void setParallelExif(bool enabled) { m_parallelExif = enabled; }
+    void setExifWorkers(int workers) { m_exifWorkers = workers; }
 
     using ProgressFn = std::function<void(const IndexProgress&)>;
     void setProgressCallback(ProgressFn cb) { m_progress = std::move(cb); }
@@ -116,7 +116,7 @@ private:
     QStringList      m_roots;
     int              m_probeTimeoutMs;
     bool             m_library = false;
-    bool             m_parallelExif = false;
+    int              m_exifWorkers = 1;
 
     QMutex          m_runMutex;    // garde « une seule passe » (tryLock)
     mutable QMutex  m_stateMutex;  // protège l'état observable

@@ -31,7 +31,12 @@ Modifiez `.env` :
 | `PUID`, `PGID` | Non | Compte d'exécution du service. Il doit pouvoir lire `PHOTOS_DIR`. Défaut `1000`. |
 | `MORFPHOTO_PORT` | Non | Port publié sur l'hôte. Défaut `8793`. |
 | `MORFPHOTO_API_KEY` | Non | Clé protégeant l'API, pour les images qui la prennent en charge. Vide = aucune clé. |
+| `MORFPHOTO_EXIF_WORKERS` | Non | Nombre de lectures ExifTool simultanées (1–4). Valeur par défaut `2`. |
 | `MORFPHOTO_IMAGE` | Non | Image à exécuter, par exemple pour figer une version. |
+
+Pour un déploiement existant, ajouter la variable d’environnement
+`MORFPHOTO_EXIF_WORKERS` dans `docker-compose.yml` avant de la définir dans
+`.env`. Recréer le conteneur après chaque modification de la valeur.
 
 Pour trouver les bonnes valeurs de `PUID` et `PGID`, lancez `id` avec un compte qui peut lire les photos :
 
@@ -56,8 +61,7 @@ docker compose up -d
 ```
 
 Au premier démarrage, morfPhoto déclare `/photos` et lance l'indexation. Une grande photothèque peut prendre
-du temps, car les métadonnées de chaque photo sont lues. L’image NAS extrait les
-EXIF avec jusqu’à deux processus ExifTool. Aux démarrages suivants,
+du temps, car les métadonnées de chaque photo sont lues. Aux démarrages suivants,
 le conteneur sert l’index existant dès l’ouverture. La surveillance suit les changements
 en fonctionnement et une passe quotidienne rattrape ceux effectués pendant l’arrêt.
 Pour un rattrapage immédiat, demander une passe incrémentale avec `POST /api/v1/index`.
