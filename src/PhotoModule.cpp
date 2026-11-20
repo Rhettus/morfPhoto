@@ -21,6 +21,9 @@
 #include <QMutexLocker>
 #include <QHostInfo>
 #include <QFile>
+#include <QImageReader>
+#include <QImageWriter>
+#include <QBuffer>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileInfo>
@@ -44,6 +47,37 @@ namespace morfphoto {
 namespace {
 QString nowIso() { return QDateTime::currentDateTimeUtc().toString(Qt::ISODate); }
 constexpr qint64 kMinThumbnailFreeBytes = 512 * 1024 * 1024;
+
+constexpr int kThumbnailEdge = 400;
+constexpr qint64 kMaxThumbnailJpegBytes = 1024 * 1024;
+constexpr auto kThumbnailCacheVersion = "grid-400-v1";
+
+QByteArray gridThumbnail(QByteArray source, int* thumbnailEdge) {
+    QBuffer input(&source);
+    input.open(QIODevice::ReadOnly);
+    QImageReader reader(&input, "jpeg");
+    const QSize size = reader.size();
+    if (size.isEmpty())
+        return {};
+    const int edge = qMax(size.width(), size.height());
+    if (edge > kThumbnailEdge)
+        reader.setScaledSize(size.scaled(kThumbnailEdge, kThumbnailEdge, Qt::KeepAspectRatio)
+                                 .expandedTo(QSize(1, 1)));
+    reader.setAutoTransform(true);
+    const QImage image = reader.read();
+    if (image.isNull() || qMax(image.width(), image.height()) > kThumbnailEdge)
+        return {};
+    *thumbnailEdge = qMax(image.width(), image.height());
+    if (edge <= kThumbnailEdge && source.size() <= kMaxThumbnailJpegBytes)
+        return source;
+
+    QByteArray jpeg;
+    QBuffer output(&jpeg);
+    output.open(QIODevice::WriteOnly);
+    QImageWriter writer(&output, "jpeg");
+    writer.setQuality(85);
+    return writer.write(image) ? jpeg : QByteArray();
+}
 
 // Retrouve le détail d'une sélection par son id dans une liste déjà chargée.
 QJsonObject findById(const QJsonArray& folders, int id) {
@@ -303,7 +337,7 @@ void PhotoModule::warmThumbnails() {
         PhotoRepository repo(QStringLiteral("morfphoto:thumbnail-warmer"));
         if (!repo.open(dbPath))
             return result;
-        const QString checkpoint = QDir(root).filePath(QStringLiteral(".warm-through"));
+        const QString checkpoint = QDir(root).filePath(QStringLiteral(".warm-through-") + QString::fromLatin1(kThumbnailCacheVersion));
         qint64 cursor = 0;
         {
             QFile input(checkpoint);
@@ -792,7 +826,6 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
     return [roots = m_roots, binary = m_exiftoolBinary, ready = m_exiftoolReady,
             probeMs = m_probeTimeoutMs, cacheRoot, requireCache, prewarm,
             writes = m_thumbnailWrites](const QString& path) -> QByteArray {
-        constexpr qint64 kMaxJpegBytes = 1024 * 1024;
         constexpr qint64 kShardBytes = 2 * 1024 * 1024;
         if (!QDir::isAbsolutePath(path) || path.contains(QChar::Null))
             return {};
@@ -817,11 +850,14 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
         const QByteArray key = hash.result().toHex();
         const QDir shard(cacheRoot + '/' + QString::fromLatin1(key.left(2)) + '/' +
                          QString::fromLatin1(key.mid(2, 1)));
-        const QString target = shard.filePath(QString::fromLatin1(key) + QStringLiteral(".jpg"));
+        const QString stem = QString::fromLatin1(key);
+        const QString legacy = shard.filePath(stem + QStringLiteral(".jpg"));
+        const QString target = shard.filePath(stem + '-' + QString::fromLatin1(kThumbnailCacheVersion)
+                                              + QStringLiteral(".jpg"));
         QFile cached(target);
         if (cacheEnabled && cached.open(QIODevice::ReadOnly)) {
-            const QByteArray jpeg = cached.read(kMaxJpegBytes + 1);
-            if (jpeg.size() <= kMaxJpegBytes && jpeg.startsWith("\xff\xd8"))
+            const QByteArray jpeg = cached.read(kMaxThumbnailJpegBytes + 1);
+            if (jpeg.size() <= kMaxThumbnailJpegBytes && jpeg.startsWith("\xff\xd8"))
                 return jpeg;
         }
         if (!ready)
@@ -837,20 +873,27 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
                 process.waitForFinished(1000);
                 return {};
             }
-            const QByteArray jpeg = process.readAllStandardOutput();
-            return jpeg.startsWith("\xff\xd8") && (!requireCache || jpeg.size() <= kMaxJpegBytes)
-                ? jpeg : QByteArray();
+            return process.readAllStandardOutput();
         };
-        QByteArray jpeg = extract(QStringLiteral("-ThumbnailImage"));
-        if (jpeg.isEmpty())
-            jpeg = extract(QStringLiteral("-PreviewImage"));
-        if (jpeg.isEmpty())
+        int edge = 0;
+        QByteArray jpeg = gridThumbnail(extract(QStringLiteral("-ThumbnailImage")), &edge);
+        for (const auto& tag : {QStringLiteral("-PreviewImage"), QStringLiteral("-JpgFromRaw")}) {
+            if (edge >= kThumbnailEdge)
+                break;
+            int previewEdge = 0;
+            auto preview = gridThumbnail(extract(tag), &previewEdge);
+            if (!preview.isEmpty() && previewEdge > edge) {
+                jpeg = std::move(preview);
+                edge = previewEdge;
+            }
+        }
+        if (jpeg.isEmpty() || jpeg.size() > kMaxThumbnailJpegBytes)
             return {};
 
         const QFileInfo now(file.absoluteFilePath());
         if (now.size() != size || now.lastModified() != modified)
             return {};
-        if (!cacheEnabled || jpeg.size() > kMaxJpegBytes)
+        if (!cacheEnabled)
             return jpeg;
         const QStorageInfo disk(cacheRoot);
         if (!disk.isValid() || disk.bytesAvailable() < kMinThumbnailFreeBytes ||
@@ -859,6 +902,8 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
         QLockFile lock(shard.filePath(QStringLiteral(".write.lock")));
         if (!lock.tryLock(prewarm ? 100 : 0))
             return jpeg;
+        // Retire the old format under the existing shard lock and budget.
+        QFile::remove(legacy);
         const auto entries = shard.entryInfoList({QStringLiteral("*.jpg")}, QDir::Files,
                                                  QDir::Time | QDir::Reversed);
         qint64 bytes = jpeg.size();

@@ -14,7 +14,7 @@ RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        libqt6core6t64 libqt6network6 libqt6sql6 libqt6sql6-sqlite libqt6concurrent6 \
+        libqt6core6t64 libqt6gui6 libqt6network6 libqt6sql6 libqt6sql6-sqlite libqt6concurrent6 \
         libimage-exiftool-perl curl ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 COPY docker/clip/requirements.txt /tmp/clip-requirements.txt

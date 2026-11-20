@@ -22,7 +22,7 @@ set(CMAKE_AUTOMOC ON)
 # Core + Network : serveur HTTP entrant, client HTTP sortant, JSON.
 # Sql : base SQLite locale du domaine photo (source de verite des metadonnees).
 # Concurrent : chaque passe d'indexation tourne sur un thread du pool.
-find_package(Qt6 REQUIRED COMPONENTS Core Network Sql Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Sql Concurrent)
 
 # --- Enregistrement des compilations (best-effort) ------------------------
 # Chronometre le vrai travail des compilateurs et signale la duree a
@@ -89,7 +89,7 @@ target_include_directories(morfPhoto PUBLIC
 
 target_link_libraries(morfPhoto
     PUBLIC  Qt6::Core Qt6::Network Qt6::Sql Qt6::Concurrent
-    PRIVATE morfBeacon::morfBeacon)
+    PRIVATE Qt6::Gui morfBeacon::morfBeacon)
 
 # Numero de version accessible depuis le code.
 target_compile_definitions(morfPhoto PUBLIC MORFPHOTO_VERSION="${PROJECT_VERSION}")

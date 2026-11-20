@@ -3,6 +3,14 @@
 Le format s'inspire de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/)
 et du [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Unreleased]
+
+### Changed
+
+- NAS grid thumbnails fit within 400 × 400 pixels without upscaling. morfPhoto
+  uses a larger embedded camera preview when available and refreshes the existing
+  cache as it warms.
+
 ## [0.15.5] - 2026-11-18
 
 ### Fixed

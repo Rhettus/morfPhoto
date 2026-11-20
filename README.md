@@ -78,7 +78,7 @@ GET  /api/v1/contexts            directories + photographic context (filter ?sta
 GET  /api/v1/context             one directory's context (?directory=...); unqualified if no valid .morfphoto.json
 PUT  /api/v1/context             write .morfphoto.json: {directory, context, subject, motif?, description?} (context+subject required)
 DELETE /api/v1/context           remove .morfphoto.json (?directory=...): the folder becomes unqualified again
-GET  /api/v1/thumbnail           image/jpeg thumbnail of a file (?path=...); embedded preview via exiftool (JPEG and RAW)
+GET  /api/v1/thumbnail           image/jpeg thumbnail of a file (?path=...); embedded preview via exiftool (JPEG and RAW), up to 400 × 400 pixels
 GET  /api/v1/roots               allowed roots (config + validated SMB mounts)
 GET  /api/v1/sources             pushed SMB sources (+ mounted, reachable)
 GET  /api/v1/sources/ready       privileged helper startable
@@ -218,6 +218,12 @@ Check the `clip` object of the authenticated `GET /api/v1/index/status`
 response for progress. Authenticated clients can query originals with
 `POST /api/v1/search/semantic`, passing `text`, `folder_path`, and optionally
 `recursive`, `filters`, `size`, and the previous response's `next` cursor.
+
+Grid thumbnails fit within 400 × 400 pixels. morfPhoto prefers a larger
+embedded camera preview when the small thumbnail cannot fill that size, keeps
+the aspect ratio, and never enlarges smaller previews. After an upgrade,
+background warming revisits indexed photos and gradually replaces their older
+thumbnail files within the existing cache budget.
 
 The `thumbnails.cached` index-status counter reports JPEG files currently on
 thumbnail-cache storage, including files written before the last container
