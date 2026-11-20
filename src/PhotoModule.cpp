@@ -22,6 +22,7 @@
 #include <QHostInfo>
 #include <QFile>
 #include <QDir>
+#include <QDirIterator>
 #include <QFileInfo>
 #include <QProcess>
 #include <QCryptographicHash>
@@ -270,16 +271,34 @@ void PhotoModule::warmThumbnails() {
         m_thumbnailWarmPass = nullptr;
         m_thumbnailWarmStop.reset();
         m_thumbnailChecked += result.checked;
+        if (result.cached >= 0) {
+            m_thumbnailCached = result.cached;
+            m_thumbnailCountedAt = QDateTime::currentMSecsSinceEpoch();
+        }
         m_thumbnailCaughtUp = !result.more;
         m_thumbnailTimer->start(result.more ? 250 : 10000);
     });
     auto future = QtConcurrent::run([dbPath = m_dbPath, stop = m_thumbnailWarmStop,
                                     read = thumbnailReader(true, true), workers = m_thumbnailWorkers,
+                                    count = QDateTime::currentMSecsSinceEpoch() - m_thumbnailCountedAt >= 30000,
                                     root = qEnvironmentVariable("MORFPHOTO_THUMBNAIL_CACHE_DIR")] {
         ThumbnailWarmBatch result;
         const QStorageInfo disk(root);
-        if (!QDir::isAbsolutePath(root) || !QDir(root).exists() ||
-            !disk.isValid() || disk.bytesAvailable() < kMinThumbnailFreeBytes)
+        if (!QDir::isAbsolutePath(root) || !QDir(root).exists())
+            return result;
+        if (count) {
+            QDirIterator files(root, {QStringLiteral("*.jpg")}, QDir::Files | QDir::NoSymLinks,
+                               QDirIterator::Subdirectories);
+            qint64 cached = 0;
+            while (!stop->load() && files.hasNext()) {
+                files.next();
+                ++cached;
+            }
+            if (stop->load())
+                return result;
+            result.cached = cached;
+        }
+        if (!disk.isValid() || disk.bytesAvailable() < kMinThumbnailFreeBytes)
             return result;
         PhotoRepository repo(QStringLiteral("morfphoto:thumbnail-warmer"));
         if (!repo.open(dbPath))
@@ -613,6 +632,7 @@ QJsonObject PhotoModule::indexStatus() const {
         {"workers", m_thumbnailWorkers},
         {"checked", m_thumbnailChecked},
         {"generated", m_thumbnailWrites->load()},
+        {"cached", m_thumbnailCached < 0 ? QJsonValue() : QJsonValue(m_thumbnailCached)},
     };
     bool found = false;
     const QJsonObject runRaw = m_readRepo ? m_readRepo->latestRun(&found) : QJsonObject{};

@@ -218,3 +218,8 @@ Check the `clip` object of the authenticated `GET /api/v1/index/status`
 response for progress. Authenticated clients can query originals with
 `POST /api/v1/search/semantic`, passing `text`, `folder_path`, and optionally
 `recursive`, `filters`, `size`, and the previous response's `next` cursor.
+
+The `thumbnails.cached` index-status counter reports JPEG files currently on
+thumbnail-cache storage, including files written before the last container
+restart. morfPhoto refreshes the count in the background about every 30 seconds
+while thumbnail warming is available.

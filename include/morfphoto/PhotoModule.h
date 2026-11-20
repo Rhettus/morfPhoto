@@ -158,6 +158,7 @@ private:
 
     struct ThumbnailWarmBatch {
         int checked = 0;
+        qint64 cached = -1;
         bool more = false;
     };
 
@@ -208,6 +209,8 @@ private:
     std::shared_ptr<std::atomic_bool> m_thumbnailWarmStop;
     std::shared_ptr<std::atomic<qint64>> m_thumbnailWrites = std::make_shared<std::atomic<qint64>>(0);
     qint64 m_thumbnailChecked = 0;
+    qint64 m_thumbnailCached = -1;
+    qint64 m_thumbnailCountedAt = 0;
     bool m_thumbnailCaughtUp = false;
 
     bool           m_realtime = false;     // defaut : aucune surveillance de fond
