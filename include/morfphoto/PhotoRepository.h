@@ -96,6 +96,7 @@ public:
     void storeLibrary(int fileId, const QString& fingerprint, const LibraryFileLabels& labels,
                       const QVector<LibraryVersion>& versions);
     QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize);
+    QJsonObject librarySubfolders(const QString& folder);
     QJsonObject libraryFacets(const LibraryFilter& filter);
     QJsonObject libraryPhoto(int fileId, bool* found);
 

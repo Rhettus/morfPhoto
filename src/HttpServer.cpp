@@ -135,6 +135,8 @@ void HttpServer::onSocketReadyRead(QTcpSocket* sock) {
         const char* route = "other";
         if (path == "/healthz")
             route = "health";
+        else if (path == "/api/v1/library/subfolders")
+            route = "subfolders";
         else if (path == "/api/v1/library" || path.startsWith("/api/v1/library/"))
             route = "catalog";
         else if (path.startsWith("/api/v1/thumbnail"))

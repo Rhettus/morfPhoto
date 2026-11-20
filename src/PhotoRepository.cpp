@@ -20,6 +20,7 @@
 #include <QMap>
 #include <QSet>
 
+#include <algorithm>
 #include <utility>
 
 namespace morfphoto {
@@ -654,6 +655,36 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
         if (rows.contains(id))
             items.append(rows.value(id));
     return items;
+}
+
+QJsonObject PhotoRepository::librarySubfolders(const QString& folder) {
+    const QString prefix = folder == QLatin1String("/") ? folder : folder + QLatin1Char('/');
+    const QString upper = prefix.chopped(1) + QLatin1Char('0');
+    QSqlQuery q(db());
+    if (!run(q, QStringLiteral("SELECT DISTINCT directory FROM files INDEXED BY idx_files_dir_state "
+                               "WHERE state = 'present' AND directory >= ? AND directory < ?"),
+             {prefix, upper}))
+        return {};
+
+    QMap<QString, bool> children;
+    while (q.next()) {
+        const QString relative = q.value(0).toString().mid(prefix.size());
+        const auto parts = relative.split(QLatin1Char('/'));
+        if (relative.isEmpty() || std::any_of(parts.cbegin(), parts.cend(), [](const QString& part) {
+                return part.isEmpty() || part.startsWith(QLatin1Char('.'));
+            }))
+            continue;
+        bool& hasChildren = children[parts.first()];
+        hasChildren = hasChildren || parts.size() > 1;
+    }
+    if (q.lastError().isValid()) {
+        qWarning() << "morfPhoto subfolder query:" << q.lastError().nativeErrorCode() << q.lastError().text();
+        return {};
+    }
+    QJsonArray items;
+    for (auto it = children.cbegin(); it != children.cend(); ++it)
+        items.append(QJsonObject{{"path", prefix + it.key()}, {"has_children", it.value()}});
+    return {{"items", items}};
 }
 
 QJsonObject PhotoRepository::libraryList(const LibraryFilter& filter, int page, int pageSize) {

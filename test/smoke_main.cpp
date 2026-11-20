@@ -654,6 +654,18 @@ int main(int argc, char** argv) {
         Indexer lidx(&lrepo, nullptr, {lib});
         lidx.setLibraryEnabled(true);
         lidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        const QJsonArray libraryTree = lrepo.librarySubfolders(lib).value("items").toArray();
+        CHECK(libraryTree.size() == 1 &&
+              libraryTree.first().toObject().value("path").toString() == lib + "/2024" &&
+              libraryTree.first().toObject().value("has_children").toBool(),
+              "library subfolders: immediate child with deeper descendants");
+        const QJsonArray yearTree = lrepo.librarySubfolders(lib + "/2024").value("items").toArray();
+        CHECK(yearTree.size() == 1 &&
+              yearTree.first().toObject().value("path").toString() == lib + "/2024/sub" &&
+              !yearTree.first().toObject().value("has_children").toBool(),
+              "library subfolders: leaf and direct photos excluded");
+        CHECK(lrepo.librarySubfolders(lib + "/202").value("items").toArray().isEmpty(),
+              "library subfolders: reject sibling paths with similar prefixes");
         CHECK(lrepo.libraryList({}, 1, 50).value(QStringLiteral("total")).toInt() == 4,
               "bibliotheque: photos existantes relues + nouveau format");
 

@@ -131,6 +131,15 @@ PhotoApi::Result PhotoApi::handle(const QByteArray& method, const QString& path,
             return error(404, QStringLiteral("library_disabled"), QStringLiteral("activer xmp.enabled"));
         if (method != "GET")
             return error(405, QStringLiteral("method_not_allowed"));
+        if (seg.size() == 2 && seg[1] == QLatin1String("subfolders")) {
+            QString folder = query.queryItemValue(QStringLiteral("folder_path"), QUrl::FullyDecoded);
+            while (folder.size() > 1 && folder.endsWith(QLatin1Char('/')))
+                folder.chop(1);
+            if (!folder.startsWith(QLatin1Char('/')))
+                return error(400, QStringLiteral("invalid_folder_path"));
+            const QJsonObject result = m_module->librarySubfolders(folder);
+            return result.isEmpty() ? error(503, QStringLiteral("catalog_unavailable")) : ok(result);
+        }
         if (seg.size() == 2 && seg[1] != QLatin1String("facets")) {
             bool okId = false;
             const int id = seg[1].toInt(&okId);

@@ -727,6 +727,10 @@ QJsonObject PhotoModule::photoDataset() const { return m_readRepo ? m_readRepo->
 
 // --- Bibliothèque -----------------------------------------------------------
 
+QJsonObject PhotoModule::librarySubfolders(const QString& folder) const {
+    return m_readRepo ? m_readRepo->librarySubfolders(folder) : QJsonObject{};
+}
+
 QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int pageSize) const {
     return m_readRepo ? m_readRepo->libraryList(filter, page, pageSize) : QJsonObject{};
 }

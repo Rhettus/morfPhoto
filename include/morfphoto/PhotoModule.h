@@ -78,6 +78,7 @@ public:
     // --- Bibliothèque : EXIF + XMP réunis, servis depuis la base (xmp.enabled) ---
     bool        libraryEnabled() const { return m_library; }
     QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize) const;
+    QJsonObject librarySubfolders(const QString& folder) const;
     QJsonObject libraryFacets(const LibraryFilter& filter) const;
     QJsonObject libraryPhoto(int fileId, bool* found) const;
 
