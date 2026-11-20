@@ -26,6 +26,9 @@
 #include <QUrlQuery>
 #include <QFutureWatcher>
 #include <QPointer>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkProxy>
 #include <QtConcurrent>
 
 #include <utility>
@@ -164,6 +167,38 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
     if (path == "/api/v1/thumbnail" || path == "/api/v1/thumbnail/" ||
         path == "/api/v1/thumbnail/cached" || path == "/api/v1/thumbnail/cached/") {
         serveThumbnail(sock, method, queryString, path.contains("/cached"));
+        return;
+    }
+
+    if (path == "/api/v1/search/semantic") {
+        if (method != "POST") {
+            reply(sock, 405, reasonFor(405), "{\"error\":\"method_not_allowed\"}");
+            return;
+        }
+        if (qEnvironmentVariableIsEmpty("MORFPHOTO_CLIP_DIR")) {
+            reply(sock, 404, reasonFor(404), "{\"error\":\"semantic_search_disabled\"}");
+            return;
+        }
+        if (m_semanticRequests >= 2) {
+            reply(sock, 503, reasonFor(503), "{\"error\":\"semantic_search_busy\"}");
+            return;
+        }
+        ++m_semanticRequests;
+        connect(sock, &QObject::destroyed, this, [this] { --m_semanticRequests; });
+        disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
+        auto* manager = new QNetworkAccessManager(sock);
+        manager->setProxy(QNetworkProxy::NoProxy);
+        QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:8794/search")));
+        request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        request.setTransferTimeout(8000);
+        auto* result = manager->post(request, body);
+        connect(result, &QNetworkReply::finished, sock, [this, sock, result] {
+            const int status = result->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const int code = status ? status : 503;
+            const QByteArray payload = status ? result->readAll() :
+                QByteArrayLiteral("{\"error\":\"semantic_search_unavailable\"}");
+            reply(sock, code, reasonFor(code), payload);
+        });
         return;
     }
 

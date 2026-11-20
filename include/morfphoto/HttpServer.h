@@ -57,6 +57,7 @@ private:
     QElapsedTimer   m_uptime;
     QThreadPool     m_thumbnailPool;
     int             m_thumbnailRequests = 0;
+    int             m_semanticRequests = 0;
 };
 
 } // namespace morfphoto

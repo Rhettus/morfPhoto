@@ -1,0 +1,12 @@
+services:
+  morfphoto:
+    environment:
+      MORFPHOTO_CLIP_DIR: /clip
+      MORFPHOTO_CLIP_THREADS: ${MORFPHOTO_CLIP_THREADS:-1}
+      OPENBLAS_NUM_THREADS: "1"
+    volumes:
+      - type: bind
+        source: ${MORFPHOTO_CLIP_DIR:?Set MORFPHOTO_CLIP_DIR in .env}
+        target: /clip
+        bind:
+          create_host_path: false

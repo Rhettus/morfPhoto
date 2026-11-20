@@ -596,6 +596,17 @@ void PhotoModule::reportIndexActivity(qint64 startEpoch, qint64 filesSeen,
 QJsonObject PhotoModule::indexStatus() const {
     QJsonObject o = observableState();
     const bool indexing = o.value(QStringLiteral("state")).toString() == QStringLiteral("indexing");
+    const auto clipRoot = qEnvironmentVariable("MORFPHOTO_CLIP_DIR");
+    QJsonObject clipStatus{{"state", clipRoot.isEmpty() ? "disabled" : "starting"}};
+    if (!clipRoot.isEmpty()) {
+        QFile statusFile(QDir(clipRoot).filePath(QStringLiteral("status.json")));
+        if (statusFile.open(QIODevice::ReadOnly)) {
+            const auto status = QJsonDocument::fromJson(statusFile.read(4096));
+            if (status.isObject())
+                clipStatus = status.object();
+        }
+    }
+    o["clip"] = clipStatus;
     o["thumbnails"] = QJsonObject{
         {"state", !m_thumbnailTimer ? "disabled" : indexing ? "paused" :
                   m_thumbnailCaughtUp ? "idle" : "warming"},

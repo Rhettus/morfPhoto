@@ -195,3 +195,26 @@ A ready-made image with every dependency included is available for `linux/amd64`
 ## License
 
 GPL-3.0-only - © 2026 morfredus (Frédéric Biron).
+
+### Experimental semantic search on the NAS
+
+Add `docker-compose.clip.yml` to the Compose files used for the deployment.
+Set `MORFPHOTO_CLIP_DIR` in `.env` to a writable directory on NAS storage,
+for example `/storage/morfphoto/clip`. The directory must already exist and be
+writable by the configured PUID and PGID. Set `MORFPHOTO_CLIP_THREADS` to a
+number from 1 to 16 to change the CPU thread budget (default 1).
+
+Place the pinned Xenova CLIP assets in `$MORFPHOTO_CLIP_DIR/model` before
+recreating the container. Use revision
+`6b7c523703ae26e39be4b03774966f8571c7f523` of
+[clip-vit-base-patch32](https://huggingface.co/Xenova/clip-vit-base-patch32)
+and preserve the paths `tokenizer.json`, `onnx/text_model.onnx`, and
+`onnx/vision_model.onnx`. The worker verifies all three files at startup.
+The models and embedding database live on the same NAS mount.
+
+Keep the thumbnail override in your Compose command if it is already in use.
+The CLIP worker can use those JPEGs and fetches a preview when one is missing.
+Check the `clip` object of the authenticated `GET /api/v1/index/status`
+response for progress. Authenticated clients can query originals with
+`POST /api/v1/search/semantic`, passing `text`, `folder_path`, and optionally
+`recursive`, `filters`, `size`, and the previous response's `next` cursor.

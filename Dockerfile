@@ -17,6 +17,13 @@ RUN apt-get update \
         libqt6core6t64 libqt6network6 libqt6sql6 libqt6sql6-sqlite libqt6concurrent6 \
         libimage-exiftool-perl curl ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
+COPY docker/clip/requirements.txt /tmp/clip-requirements.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-venv \
+    && python3 -m venv /opt/morfphoto-clip \
+    && /opt/morfphoto-clip/bin/pip install --no-cache-dir -r /tmp/clip-requirements.txt \
+    && rm -rf /var/lib/apt/lists/* /tmp/clip-requirements.txt
+COPY docker/clip/*.py /opt/morfphoto-clip/
 COPY --from=build /build/service/morfphoto /usr/local/bin/morfphoto
 COPY docker/morfphoto.json /etc/morfsystem/morfphoto/morfphoto.json
 COPY docker/entrypoint.sh /usr/local/bin/morfphoto-entrypoint
@@ -30,5 +37,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
     CMD curl -fsS http://127.0.0.1:8793/healthz >/dev/null || exit 1
 
 # tini en PID 1 : le service ne gere pas SIGTERM, qu'un PID 1 ignorerait sinon.
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/morfphoto-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/morfphoto-entrypoint"]
 CMD ["/usr/local/bin/morfphoto", "--config", "/etc/morfsystem/morfphoto/morfphoto.json"]
