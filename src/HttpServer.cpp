@@ -14,6 +14,7 @@
 #include "morfphoto/PhotoModule.h"
 
 #include <QTcpServer>
+#include <QTimer>
 #include <QTcpSocket>
 #include <QHostAddress>
 #include <QHostInfo>
@@ -206,7 +207,15 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
     if (path.startsWith("/api/")) {
         IModule* mod = m_registry ? m_registry->firstOfType(QStringLiteral("photo")) : nullptr;
         PhotoApi api(qobject_cast<PhotoModule*>(mod));
+        QElapsedTimer timer;
+        timer.start();
         const PhotoApi::Result r = api.handle(method, QString::fromUtf8(path), queryString, body);
+        const qint64 elapsedMs = timer.elapsed();
+        if (method == "GET" &&
+            (path == "/api/v1/library" || path.startsWith("/api/v1/library/")) &&
+            elapsedMs >= 500) {
+            qWarning() << "morfPhoto slow library request:" << elapsedMs << "ms, HTTP" << r.code;
+        }
         reply(sock, r.code, reasonFor(r.code), r.body, r.contentType, method == "GET");
         return;
     }
@@ -322,14 +331,13 @@ void HttpServer::reply(QTcpSocket* sock, int code, const QByteArray& reason, con
     resp += extraHeaders;
     resp += "Connection: close\r\n\r\n";
     resp += body;
-    sock->write(resp);
-    // Vider le tampon d'écriture AVANT de fermer : sur une grande réponse (page HTML,
-    // /status volumineux), le corps déborde du tampon socket (~20 Ko constaté) et
-    // `disconnectFromHost` seul en tronque la fin côté client. On draine jusqu'à ce
-    // qu'il ne reste rien à écrire, avec un délai de garde pour ne jamais bloquer.
-    while (sock->bytesToWrite() > 0)
-        if (!sock->waitForBytesWritten(2000))
-            break;
+    disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
+    if (sock->write(resp) < 0) {
+        sock->abort();
+        return;
+    }
+    // Qt drains queued bytes before closing. Bound the drain for clients that stop reading.
+    QTimer::singleShot(10000, sock, [sock] { sock->abort(); });
     sock->disconnectFromHost();
 }
 

@@ -30,13 +30,15 @@ namespace {
 // et renvoie false en cas d'échec : une erreur SQL ne s'avale jamais en silence.
 bool run(QSqlQuery& q, const QString& sql, const QVariantList& binds = {}) {
     if (!q.prepare(sql)) {
-        qWarning() << "morfPhoto SQL prepare:" << q.lastError().text() << sql;
+        const auto error = q.lastError();
+        qWarning() << "morfPhoto SQL prepare:" << error.nativeErrorCode() << error.text() << sql;
         return false;
     }
     for (const QVariant& b : binds)
         q.addBindValue(b);
     if (!q.exec()) {
-        qWarning() << "morfPhoto SQL exec:" << q.lastError().text() << sql;
+        const auto error = q.lastError();
+        qWarning() << "morfPhoto SQL exec:" << error.nativeErrorCode() << error.text() << sql;
         return false;
     }
     return true;
