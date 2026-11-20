@@ -202,6 +202,7 @@ private:
 
     PhotoRepository* m_readRepo = nullptr;  // connexion du thread principal
     QTimer*          m_watchTimer = nullptr;
+    int              m_thumbnailWorkers = 4;
     QTimer*          m_thumbnailTimer = nullptr;
     QFutureWatcher<ThumbnailWarmBatch>* m_thumbnailWarmPass = nullptr;
     std::shared_ptr<std::atomic_bool> m_thumbnailWarmStop;

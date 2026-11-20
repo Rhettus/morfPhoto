@@ -95,7 +95,9 @@ existing index. Warming starts without a client request, yields to indexing,
 and stops adding previews to a full shard. A preview requested by a client
 may evict an older entry. There are 4,096 shards, each limited to 2 MiB.
 morfPhoto skips writes when the cache filesystem has less than 512 MiB
-available. Index status reports thumbnails checked and written since startup.
+available. Set `MORFPHOTO_THUMBNAIL_WORKERS` in `.env` to choose one through
+four background workers. The default is four. Index status reports the worker
+count and the number of thumbnails checked and written since startup.
 
 ## Update
 

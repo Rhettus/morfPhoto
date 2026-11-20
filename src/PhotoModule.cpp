@@ -35,6 +35,9 @@
 #include <QNetworkReply>
 #include <QLoggingCategory>
 
+#include <future>
+#include <vector>
+
 namespace morfphoto {
 
 namespace {
@@ -84,6 +87,10 @@ PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* 
         m_exifWorkers = envWorkers;
     else if (validWorkerCount(configuredWorkers))
         m_exifWorkers = configuredWorkers;
+    bool hasThumbnailWorkers = false;
+    const int thumbnailWorkers = qEnvironmentVariableIntValue("MORFPHOTO_THUMBNAIL_WORKERS", &hasThumbnailWorkers);
+    if (hasThumbnailWorkers && validWorkerCount(thumbnailWorkers))
+        m_thumbnailWorkers = thumbnailWorkers;
     m_library = params.value(QStringLiteral("xmp")).toObject().value(QStringLiteral("enabled")).toBool(false);
 }
 
@@ -267,7 +274,7 @@ void PhotoModule::warmThumbnails() {
         m_thumbnailTimer->start(result.more ? 250 : 10000);
     });
     auto future = QtConcurrent::run([dbPath = m_dbPath, stop = m_thumbnailWarmStop,
-                                    read = thumbnailReader(true, true),
+                                    read = thumbnailReader(true, true), workers = m_thumbnailWorkers,
                                     root = qEnvironmentVariable("MORFPHOTO_THUMBNAIL_CACHE_DIR")] {
         ThumbnailWarmBatch result;
         const QStorageInfo disk(root);
@@ -286,19 +293,31 @@ void PhotoModule::warmThumbnails() {
         }
         if (const qint64 lastId = repo.lastPhotoId(); lastId >= 0 && lastId < cursor)
             cursor = 0;
-        const auto candidates = repo.thumbnailCandidates(cursor, 8);
+        const auto candidates = repo.thumbnailCandidates(cursor, 8 * workers);
         repo.close();
-        for (const auto& candidate : candidates) {
-            if (stop->load())
-                break;
-            read(candidate.second);
-            cursor = candidate.first;
-            ++result.checked;
-        }
+        std::atomic<qsizetype> next{0};
+        const auto warm = [&] {
+            while (!stop->load()) {
+                const qsizetype index = next.fetch_add(1);
+                if (index >= candidates.size())
+                    return;
+                read(candidates.at(index).second);
+            }
+        };
+        // Un seul lecteur SQLite. Les travailleurs se partagent les chemins
+        // déjà chargés et terminent les lectures engagées avant le checkpoint.
+        std::vector<std::future<void>> readers;
+        const qsizetype lanes = qMin<qsizetype>(workers, candidates.size());
+        for (qsizetype lane = 1; lane < lanes; ++lane)
+            readers.push_back(std::async(std::launch::async | std::launch::deferred, warm));
+        warm();
+        for (auto& reader : readers)
+            reader.get();
+        result.checked = qMin(next.load(), candidates.size());
         result.more = !candidates.isEmpty();
         if (result.checked > 0) {
             QSaveFile output(checkpoint);
-            const QByteArray contents = QByteArray::number(cursor);
+            const QByteArray contents = QByteArray::number(candidates.at(result.checked - 1).first);
             if (!output.open(QIODevice::WriteOnly) || output.write(contents) != contents.size() ||
                 !output.commit())
                 result.more = false;
@@ -580,6 +599,7 @@ QJsonObject PhotoModule::indexStatus() const {
     o["thumbnails"] = QJsonObject{
         {"state", !m_thumbnailTimer ? "disabled" : indexing ? "paused" :
                   m_thumbnailCaughtUp ? "idle" : "warming"},
+        {"workers", m_thumbnailWorkers},
         {"checked", m_thumbnailChecked},
         {"generated", m_thumbnailWrites->load()},
     };
@@ -806,7 +826,7 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
             !QDir().mkpath(shard.absolutePath()))
             return jpeg;
         QLockFile lock(shard.filePath(QStringLiteral(".write.lock")));
-        if (!lock.tryLock())
+        if (!lock.tryLock(prewarm ? 100 : 0))
             return jpeg;
         const auto entries = shard.entryInfoList({QStringLiteral("*.jpg")}, QDir::Files,
                                                  QDir::Time | QDir::Reversed);

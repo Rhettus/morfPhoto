@@ -95,8 +95,10 @@ de l’index existant. Le préremplissage démarre sans requête d’un client, 
 la priorité à l’indexation et cesse d’ajouter des aperçus aux sous-répertoires
 pleins. Un aperçu demandé par un client peut évincer une ancienne entrée.
 Le cache comporte 4 096 sous-répertoires, chacun limité à 2 Mio. Sous 512 Mio
-d’espace disponible, morfPhoto suspend les écritures. L’état de l’index
-indique le nombre d’aperçus vérifiés et écrits depuis le démarrage.
+d’espace disponible, morfPhoto suspend les écritures. Régler
+`MORFPHOTO_THUMBNAIL_WORKERS` dans `.env` pour choisir de un à quatre
+travailleurs en arrière-plan (quatre par défaut). L’état de l’index indique
+leur nombre ainsi que les aperçus vérifiés et écrits depuis le démarrage.
 
 ## Mettre à jour
 

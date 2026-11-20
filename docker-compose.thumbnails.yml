@@ -2,6 +2,7 @@ services:
   morfphoto:
     environment:
       MORFPHOTO_THUMBNAIL_CACHE_DIR: /thumbnail-cache
+      MORFPHOTO_THUMBNAIL_WORKERS: ${MORFPHOTO_THUMBNAIL_WORKERS:-4}
     volumes:
       - type: bind
         source: ${MORFPHOTO_THUMBNAIL_DIR:?Set MORFPHOTO_THUMBNAIL_DIR in .env}
