@@ -303,26 +303,6 @@ PhotoApi::Result PhotoApi::handle(const QByteArray& method, const QString& path,
         return error(405, QStringLiteral("method_not_allowed"));
     }
 
-    // ---- /thumbnail : vignette JPEG d'un fichier (apercu, ex. pour PhotoHub) ----
-    // GET ?path=<chemin absolu> : renvoie une vignette image/jpeg (apercu embarque
-    // extrait par exiftool, JPEG comme RAW). morfPhoto reste souverain sur le disque :
-    // PhotoHub, client pur, ne lit jamais les fichiers -- il demande la vignette ici.
-    if (!seg.isEmpty() && seg[0] == QLatin1String("thumbnail")) {
-        if (seg.size() != 1)
-            return error(404, QStringLiteral("not_found"), path);
-        if (method != "GET")
-            return error(405, QStringLiteral("method_not_allowed"));
-        const QString file = query.queryItemValue(QStringLiteral("path"), QUrl::FullyDecoded);
-        if (file.isEmpty())
-            return error(400, QStringLiteral("bad_request"), QStringLiteral("`path` obligatoire"));
-        bool okThumb = false;
-        const QByteArray jpeg = m_module->thumbnail(file, &okThumb);
-        if (!okThumb)
-            return error(404, QStringLiteral("not_found"),
-                         QStringLiteral("aucune vignette disponible pour ce fichier"));
-        return {200, jpeg, QByteArrayLiteral("image/jpeg")};
-    }
-
     // ---- /roots : racines autorisees (lecture seule ; la config est souveraine) ----
     if (!seg.isEmpty() && seg[0] == QLatin1String("roots")) {
         if (method != "GET")

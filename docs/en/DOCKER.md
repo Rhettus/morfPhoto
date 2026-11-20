@@ -81,6 +81,20 @@ If you set an API key, add it to API requests:
 curl -H "Authorization: Bearer YOUR_KEY" http://127.0.0.1:8793/api/v1/photos/summary
 ```
 
+## Optional thumbnail cache
+
+Keep the preview cache on the photo storage disk by setting
+`MORFPHOTO_THUMBNAIL_DIR=/storage/morfphoto/thumbnail-cache` in `.env`.
+Create this directory with write access for the service's configured UID/GID.
+Copy `docker-compose.thumbnails.yml` to `docker-compose.override.yml` alongside
+the main Compose file, then recreate the container. The override bind-mounts
+the host directory at `/thumbnail-cache`. The index remains on `/data`.
+
+Embedded JPEG previews are cached on demand and extraction runs separately
+from indexing. The cache is split into 4,096 shards, each limited to 2 MiB.
+Older entries in a shard are evicted as it fills. morfPhoto skips cache writes
+when the cache filesystem has less than 512 MiB available.
+
 ## Update
 
 ```sh

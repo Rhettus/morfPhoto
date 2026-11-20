@@ -23,6 +23,10 @@
 #include <QJsonParseError>
 #include <QDateTime>
 #include <QUrl>
+#include <QUrlQuery>
+#include <QFutureWatcher>
+#include <QPointer>
+#include <QtConcurrent>
 
 #include <utility>
 
@@ -70,6 +74,7 @@ HttpServer::HttpServer(ServiceConfig config, ModuleRegistry* registry, QObject* 
       m_server(new QTcpServer(this)) {
     connect(m_server, &QTcpServer::newConnection, this, &HttpServer::onNewConnection);
     // L'environnement prime : un secret de conteneur n'a pas a vivre dans un fichier.
+    m_thumbnailPool.setMaxThreadCount(2);
     const QString envKey = qEnvironmentVariable("MORFPHOTO_API_KEY").trimmed();
     m_apiKey = (envKey.isEmpty() ? m_config.apiKey.trimmed() : envKey).toUtf8();
 }
@@ -156,6 +161,12 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
     QByteArray reason = "OK";
     QByteArray out;
 
+    if (path == "/api/v1/thumbnail" || path == "/api/v1/thumbnail/" ||
+        path == "/api/v1/thumbnail/cached" || path == "/api/v1/thumbnail/cached/") {
+        serveThumbnail(sock, method, queryString, path.contains("/cached"));
+        return;
+    }
+
     // ---- API metier /api/v1 : deleguee au domaine photo (PhotoApi) ----
     if (path.startsWith("/api/")) {
         IModule* mod = m_registry ? m_registry->firstOfType(QStringLiteral("photo")) : nullptr;
@@ -192,6 +203,44 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
 
     reply(sock, code, reason, out, QByteArrayLiteral("application/json; charset=utf-8"),
           method == "GET");
+}
+
+void HttpServer::serveThumbnail(QTcpSocket* sock, const QByteArray& method,
+                                const QString& queryString, bool requireCache) {
+    if (method != "GET") {
+        reply(sock, 405, reasonFor(405), "{\"error\":\"method_not_allowed\"}");
+        return;
+    }
+    const QString path = QUrlQuery(queryString).queryItemValue(QStringLiteral("path"), QUrl::FullyDecoded);
+    if (path.isEmpty()) {
+        reply(sock, 400, reasonFor(400), "{\"error\":\"missing_path\"}");
+        return;
+    }
+    IModule* mod = m_registry ? m_registry->firstOfType(QStringLiteral("photo")) : nullptr;
+    const auto* photos = qobject_cast<PhotoModule*>(mod);
+    if (!photos || m_thumbnailRequests >= 8) {
+        reply(sock, 503, reasonFor(503), "{\"error\":\"thumbnail_unavailable\"}");
+        return;
+    }
+
+    // Le travail ne retient ni le module ni la socket. Le thread HTTP seul
+    // installe et retire les demandes et publie les réponses.
+    disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
+    ++m_thumbnailRequests;
+    auto* watcher = new QFutureWatcher<QByteArray>(this);
+    connect(watcher, &QFutureWatcher<QByteArray>::finished, this,
+            [this, socket = QPointer<QTcpSocket>(sock), watcher] {
+        --m_thumbnailRequests;
+        const QByteArray jpeg = watcher->result();
+        watcher->deleteLater();
+        if (!socket)
+            return;
+        if (jpeg.isEmpty())
+            reply(socket, 404, reasonFor(404), "{\"error\":\"thumbnail_not_found\"}");
+        else
+            reply(socket, 200, reasonFor(200), jpeg, "image/jpeg", true);
+    });
+    watcher->setFuture(QtConcurrent::run(&m_thumbnailPool, photos->thumbnailReader(requireCache), path));
 }
 
 QByteArray HttpServer::buildStatusJson() const {

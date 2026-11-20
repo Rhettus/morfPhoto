@@ -24,6 +24,10 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QProcess>
+#include <QCryptographicHash>
+#include <QLockFile>
+#include <QSaveFile>
+#include <QStorageInfo>
 #include <QUrl>
 #include <QEventLoop>
 #include <QNetworkAccessManager>
@@ -637,44 +641,97 @@ bool PhotoModule::putContext(const QString& directory, const QString& context,
     return true;
 }
 
-QByteArray PhotoModule::thumbnail(const QString& path, bool* ok) const {
-    if (ok) *ok = false;
-    // Sonde bornée AVANT tout accès disque : isWithinRoots (canonicalFilePath) puis
-    // exists() bloqueraient ~180 s sur une source endormie et gèleraient ce worker.
-    // absolutePath() est purement lexical (aucun stat), donc sûr même mont figé.
-    if (!probeAccessible(QFileInfo(path).absolutePath(), m_probeTimeoutMs))
-        return {};
-    // Garde-fou : ne servir que des fichiers sous une racine autorisee, existants.
-    if (!isWithinRoots(path, m_roots))
-        return {};
-    const QFileInfo fi(path);
-    if (!fi.exists() || !fi.isFile())
-        return {};
-    if (!m_exiftoolReady)
-        return {};   // sans exiftool, pas d'extraction possible
+std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requireCache) const {
+    const QString cacheRoot = qEnvironmentVariable("MORFPHOTO_THUMBNAIL_CACHE_DIR");
+    return [roots = m_roots, binary = m_exiftoolBinary, ready = m_exiftoolReady,
+            probeMs = m_probeTimeoutMs, cacheRoot, requireCache](const QString& path) -> QByteArray {
+        constexpr qint64 kMaxJpegBytes = 1024 * 1024;
+        constexpr qint64 kShardBytes = 2 * 1024 * 1024;
+        constexpr qint64 kMinFreeBytes = 512 * 1024 * 1024;
+        if (!QDir::isAbsolutePath(path) || path.contains(QChar::Null))
+            return {};
+        const bool cacheEnabled = QDir::isAbsolutePath(cacheRoot) && QDir(cacheRoot).exists();
+        if (requireCache && !cacheEnabled)
+            return {};
+        const QFileInfo file(QDir::cleanPath(path));
+        const auto underRoot = std::any_of(roots.begin(), roots.end(), [&](const QString& root) {
+            const QString prefix = QDir::cleanPath(root);
+            return file.absoluteFilePath().startsWith(prefix.endsWith('/') ? prefix : prefix + '/');
+        });
+        if (!underRoot || !probeAccessible(file.absolutePath(), probeMs) ||
+            !isWithinRoots(file.absoluteFilePath(), roots) || !file.isFile())
+            return {};
 
-    // Apercu JPEG embarque : ThumbnailImage (petit, rapide, present sur JPEG comme RAW),
-    // repli PreviewImage (plus grand, surtout sur les RAW). Process one-off borne.
-    auto extract = [this](const QString& tag, const QString& p) -> QByteArray {
-        QProcess proc;
-        proc.start(m_exiftoolBinary, {QStringLiteral("-b"), tag, p});
-        if (!proc.waitForStarted(3000))
-            return {};
-        if (!proc.waitForFinished(8000)) {
-            proc.kill();
-            proc.waitForFinished(1000);
-            return {};
+        const qint64 size = file.size();
+        const auto modified = file.lastModified();
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        hash.addData(file.absoluteFilePath().toUtf8());
+        hash.addData(QByteArray::number(size).prepend('\0'));
+        hash.addData(QByteArray::number(modified.toMSecsSinceEpoch()).prepend('\0'));
+        const QByteArray key = hash.result().toHex();
+        const QDir shard(cacheRoot + '/' + QString::fromLatin1(key.left(2)) + '/' +
+                         QString::fromLatin1(key.mid(2, 1)));
+        const QString target = shard.filePath(QString::fromLatin1(key) + QStringLiteral(".jpg"));
+        QFile cached(target);
+        if (cacheEnabled && cached.open(QIODevice::ReadOnly)) {
+            const QByteArray jpeg = cached.read(kMaxJpegBytes + 1);
+            if (jpeg.size() <= kMaxJpegBytes && jpeg.startsWith("\xff\xd8"))
+                return jpeg;
         }
-        return proc.readAllStandardOutput();
-    };
+        if (!ready)
+            return {};
 
-    QByteArray jpeg = extract(QStringLiteral("-ThumbnailImage"), path);
-    if (jpeg.isEmpty())
-        jpeg = extract(QStringLiteral("-PreviewImage"), path);
-    if (jpeg.isEmpty())
-        return {};
-    if (ok) *ok = true;
-    return jpeg;
+        auto extract = [&](const QString& tag) -> QByteArray {
+            QProcess process;
+            process.start(binary, {QStringLiteral("-b"), tag, QStringLiteral("--"),
+                                   file.absoluteFilePath()});
+            if (!process.waitForStarted(requireCache ? 1000 : 3000) ||
+                !process.waitForFinished(requireCache ? 3000 : 8000)) {
+                process.kill();
+                process.waitForFinished(1000);
+                return {};
+            }
+            const QByteArray jpeg = process.readAllStandardOutput();
+            return jpeg.startsWith("\xff\xd8") && (!requireCache || jpeg.size() <= kMaxJpegBytes)
+                ? jpeg : QByteArray();
+        };
+        QByteArray jpeg = extract(QStringLiteral("-ThumbnailImage"));
+        if (jpeg.isEmpty())
+            jpeg = extract(QStringLiteral("-PreviewImage"));
+        if (jpeg.isEmpty())
+            return {};
+
+        const QFileInfo now(file.absoluteFilePath());
+        if (now.size() != size || now.lastModified() != modified)
+            return {};
+        if (!cacheEnabled || jpeg.size() > kMaxJpegBytes)
+            return jpeg;
+        const QStorageInfo disk(cacheRoot);
+        if (!disk.isValid() || disk.bytesAvailable() < kMinFreeBytes ||
+            !QDir().mkpath(shard.absolutePath()))
+            return jpeg;
+        QLockFile lock(shard.filePath(QStringLiteral(".write.lock")));
+        if (!lock.tryLock())
+            return jpeg;
+        const auto entries = shard.entryInfoList({QStringLiteral("*.jpg")}, QDir::Files,
+                                                 QDir::Time | QDir::Reversed);
+        qint64 bytes = jpeg.size();
+        for (const QFileInfo& entry : entries)
+            if (entry.absoluteFilePath() != target)
+                bytes += entry.size();
+        for (const QFileInfo& entry : entries) {
+            if (bytes <= kShardBytes)
+                break;
+            if (entry.absoluteFilePath() != target && QFile::remove(entry.absoluteFilePath()))
+                bytes -= entry.size();
+        }
+        if (bytes <= kShardBytes) {
+            QSaveFile output(target);
+            if (output.open(QIODevice::WriteOnly) && output.write(jpeg) == jpeg.size())
+                output.commit();
+        }
+        return jpeg;
+    };
 }
 
 bool PhotoModule::deleteContext(const QString& directory, QJsonObject* out, QString* error) {

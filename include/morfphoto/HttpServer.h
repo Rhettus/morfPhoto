@@ -8,6 +8,7 @@
 #include <QObject>
 #include <QElapsedTimer>
 #include <QByteArray>
+#include <QThreadPool>
 #include "morfphoto/ServiceConfig.h"
 
 class QTcpServer;
@@ -42,6 +43,8 @@ private:
     void onSocketReadyRead(QTcpSocket* sock);
     void handleRequest(QTcpSocket* sock, const QByteArray& method,
                        const QByteArray& path, const QByteArray& body);
+    void serveThumbnail(QTcpSocket* sock, const QByteArray& method,
+                        const QString& queryString, bool requireCache);
     QByteArray buildStatusJson() const;
     void reply(QTcpSocket* sock, int code, const QByteArray& reason, const QByteArray& body,
                const QByteArray& contentType = QByteArrayLiteral("application/json; charset=utf-8"),
@@ -52,6 +55,8 @@ private:
     ModuleRegistry* m_registry;
     QTcpServer*     m_server;
     QElapsedTimer   m_uptime;
+    QThreadPool     m_thumbnailPool;
+    int             m_thumbnailRequests = 0;
 };
 
 } // namespace morfphoto

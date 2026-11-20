@@ -81,6 +81,21 @@ Si vous avez défini une clé d'API, ajoutez-la aux requêtes :
 curl -H "Authorization: Bearer VOTRE_CLE" http://127.0.0.1:8793/api/v1/photos/summary
 ```
 
+## Cache facultatif des vignettes
+
+Pour stocker les vignettes sur le disque des photos, définir
+`MORFPHOTO_THUMBNAIL_DIR=/storage/morfphoto/thumbnail-cache` dans `.env`.
+Créer ce répertoire avec les droits d’écriture pour l’UID et le GID du service.
+Copier `docker-compose.thumbnails.yml` sous le nom `docker-compose.override.yml`
+à côté du fichier Compose principal, puis recréer le conteneur. Ce fichier
+monte le répertoire hôte sur `/thumbnail-cache`. L’index reste dans `/data`.
+
+Les aperçus JPEG intégrés sont mis en cache à la demande. Leur extraction
+s’exécute séparément de l’indexation. Le cache est réparti sur 4 096
+sous-répertoires, chacun limité à 2 Mio. Les entrées les plus anciennes d’un
+sous-répertoire sont évincées quand il se remplit. Sous 512 Mio d’espace
+disponible sur le disque du cache, morfPhoto suspend les écritures du cache.
+
 ## Mettre à jour
 
 ```sh

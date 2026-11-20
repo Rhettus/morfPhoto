@@ -5,6 +5,7 @@
  */
 
 #pragma once
+#include <functional>
 #include "morfphoto/IModule.h"
 #include "morfphoto/Indexer.h"
 #include "morfphoto/LibraryMetadata.h"
@@ -86,7 +87,7 @@ public:
     // Vignette JPEG d'un fichier (apercu embarque via exiftool, JPEG comme RAW). Sert
     // l'apercu des clients (PhotoHub). Valide que `path` est sous une racine autorisee et
     // pointe un fichier existant. *ok=false + retour vide si indisponible.
-    QByteArray  thumbnail(const QString& path, bool* ok) const;
+    std::function<QByteArray(const QString&)> thumbnailReader(bool requireCache) const;
     // Écriture (morfPhoto est l'UNIQUE écrivain de `.morfphoto.json`). `context` et
     // `subject` sont OBLIGATOIRES et doivent appartenir au vocabulaire gelé. Écrit le
     // fichier disque (atomique) puis met à jour la projection. false + *error si le

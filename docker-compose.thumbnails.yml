@@ -1,0 +1,10 @@
+services:
+  morfphoto:
+    environment:
+      MORFPHOTO_THUMBNAIL_CACHE_DIR: /thumbnail-cache
+    volumes:
+      - type: bind
+        source: ${MORFPHOTO_THUMBNAIL_DIR:?Set MORFPHOTO_THUMBNAIL_DIR in .env}
+        target: /thumbnail-cache
+        bind:
+          create_host_path: false
