@@ -39,6 +39,7 @@ namespace morfphoto {
 
 namespace {
 QString nowIso() { return QDateTime::currentDateTimeUtc().toString(Qt::ISODate); }
+constexpr qint64 kMinThumbnailFreeBytes = 512 * 1024 * 1024;
 
 // Retrouve le détail d'une sélection par son id dans une liste déjà chargée.
 QJsonObject findById(const QJsonArray& folders, int id) {
@@ -144,6 +145,12 @@ bool PhotoModule::start() {
         startWatcher();
 
     m_started = true;
+    if (!qEnvironmentVariableIsEmpty("MORFPHOTO_THUMBNAIL_CACHE_DIR")) {
+        m_thumbnailTimer = new QTimer(this);
+        m_thumbnailTimer->setSingleShot(true);
+        connect(m_thumbnailTimer, &QTimer::timeout, this, &PhotoModule::warmThumbnails);
+        m_thumbnailTimer->start(1000);
+    }
     return true;
 }
 
@@ -206,6 +213,17 @@ void PhotoModule::submitRealtime() {
 
 void PhotoModule::stop() {
     m_started = false;
+    if (m_thumbnailTimer) {
+        delete m_thumbnailTimer;
+        m_thumbnailTimer = nullptr;
+    }
+    if (m_thumbnailWarmPass) {
+        m_thumbnailWarmStop->store(true);
+        m_thumbnailWarmPass->waitForFinished();
+        delete m_thumbnailWarmPass;
+        m_thumbnailWarmPass = nullptr;
+        m_thumbnailWarmStop.reset();
+    }
     stopWatcher();
     if (m_watchTimer) {
         m_watchTimer->stop();
@@ -220,6 +238,74 @@ void PhotoModule::stop() {
         delete m_readRepo;
         m_readRepo = nullptr;
     }
+}
+
+void PhotoModule::warmThumbnails() {
+    if (!m_started || m_thumbnailWarmPass)
+        return;
+    if (!m_exiftoolReady) {
+        m_thumbnailTimer->start(10000);
+        return;
+    }
+    {
+        QMutexLocker lock(&m_stateMutex);
+        if (m_indexing) {
+            m_thumbnailTimer->start(1000);
+            return;
+        }
+    }
+
+    m_thumbnailWarmStop = std::make_shared<std::atomic_bool>(false);
+    m_thumbnailWarmPass = new QFutureWatcher<ThumbnailWarmBatch>(this);
+    connect(m_thumbnailWarmPass, &QFutureWatcher<ThumbnailWarmBatch>::finished, this, [this] {
+        const auto result = m_thumbnailWarmPass->result();
+        m_thumbnailWarmPass->deleteLater();
+        m_thumbnailWarmPass = nullptr;
+        m_thumbnailWarmStop.reset();
+        m_thumbnailChecked += result.checked;
+        m_thumbnailCaughtUp = !result.more;
+        m_thumbnailTimer->start(result.more ? 250 : 10000);
+    });
+    auto future = QtConcurrent::run([dbPath = m_dbPath, stop = m_thumbnailWarmStop,
+                                    read = thumbnailReader(true, true),
+                                    root = qEnvironmentVariable("MORFPHOTO_THUMBNAIL_CACHE_DIR")] {
+        ThumbnailWarmBatch result;
+        const QStorageInfo disk(root);
+        if (!QDir::isAbsolutePath(root) || !QDir(root).exists() ||
+            !disk.isValid() || disk.bytesAvailable() < kMinThumbnailFreeBytes)
+            return result;
+        PhotoRepository repo(QStringLiteral("morfphoto:thumbnail-warmer"));
+        if (!repo.open(dbPath))
+            return result;
+        const QString checkpoint = QDir(root).filePath(QStringLiteral(".warm-through"));
+        qint64 cursor = 0;
+        {
+            QFile input(checkpoint);
+            if (input.open(QIODevice::ReadOnly))
+                cursor = qMax(qint64(0), input.read(32).toLongLong());
+        }
+        if (const qint64 lastId = repo.lastPhotoId(); lastId >= 0 && lastId < cursor)
+            cursor = 0;
+        const auto candidates = repo.thumbnailCandidates(cursor, 8);
+        repo.close();
+        for (const auto& candidate : candidates) {
+            if (stop->load())
+                break;
+            read(candidate.second);
+            cursor = candidate.first;
+            ++result.checked;
+        }
+        result.more = !candidates.isEmpty();
+        if (result.checked > 0) {
+            QSaveFile output(checkpoint);
+            const QByteArray contents = QByteArray::number(cursor);
+            if (!output.open(QIODevice::WriteOnly) || output.write(contents) != contents.size() ||
+                !output.commit())
+                result.more = false;
+        }
+        return result;
+    });
+    m_thumbnailWarmPass->setFuture(future);
 }
 
 // --- Indexation -------------------------------------------------------------
@@ -251,6 +337,8 @@ QJsonObject PhotoModule::triggerIndex(IndexMode mode, const QVector<int>& folder
         m_progCurrentFolder.clear();
     }
 
+    if (m_thumbnailWarmStop)
+        m_thumbnailWarmStop->store(true);
     m_pass = QtConcurrent::run([this, mode, folderIds, trigger]() {
         doPass(mode, folderIds, trigger);
     });
@@ -488,6 +576,13 @@ void PhotoModule::reportIndexActivity(qint64 startEpoch, qint64 filesSeen,
 
 QJsonObject PhotoModule::indexStatus() const {
     QJsonObject o = observableState();
+    const bool indexing = o.value(QStringLiteral("state")).toString() == QStringLiteral("indexing");
+    o["thumbnails"] = QJsonObject{
+        {"state", !m_thumbnailTimer ? "disabled" : indexing ? "paused" :
+                  m_thumbnailCaughtUp ? "idle" : "warming"},
+        {"checked", m_thumbnailChecked},
+        {"generated", m_thumbnailWrites->load()},
+    };
     bool found = false;
     const QJsonObject runRaw = m_readRepo ? m_readRepo->latestRun(&found) : QJsonObject{};
     if (found) {
@@ -641,13 +736,13 @@ bool PhotoModule::putContext(const QString& directory, const QString& context,
     return true;
 }
 
-std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requireCache) const {
+std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requireCache, bool prewarm) const {
     const QString cacheRoot = qEnvironmentVariable("MORFPHOTO_THUMBNAIL_CACHE_DIR");
     return [roots = m_roots, binary = m_exiftoolBinary, ready = m_exiftoolReady,
-            probeMs = m_probeTimeoutMs, cacheRoot, requireCache](const QString& path) -> QByteArray {
+            probeMs = m_probeTimeoutMs, cacheRoot, requireCache, prewarm,
+            writes = m_thumbnailWrites](const QString& path) -> QByteArray {
         constexpr qint64 kMaxJpegBytes = 1024 * 1024;
         constexpr qint64 kShardBytes = 2 * 1024 * 1024;
-        constexpr qint64 kMinFreeBytes = 512 * 1024 * 1024;
         if (!QDir::isAbsolutePath(path) || path.contains(QChar::Null))
             return {};
         const bool cacheEnabled = QDir::isAbsolutePath(cacheRoot) && QDir(cacheRoot).exists();
@@ -707,7 +802,7 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
         if (!cacheEnabled || jpeg.size() > kMaxJpegBytes)
             return jpeg;
         const QStorageInfo disk(cacheRoot);
-        if (!disk.isValid() || disk.bytesAvailable() < kMinFreeBytes ||
+        if (!disk.isValid() || disk.bytesAvailable() < kMinThumbnailFreeBytes ||
             !QDir().mkpath(shard.absolutePath()))
             return jpeg;
         QLockFile lock(shard.filePath(QStringLiteral(".write.lock")));
@@ -719,6 +814,8 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
         for (const QFileInfo& entry : entries)
             if (entry.absoluteFilePath() != target)
                 bytes += entry.size();
+        if (prewarm && bytes > kShardBytes)
+            return jpeg;
         for (const QFileInfo& entry : entries) {
             if (bytes <= kShardBytes)
                 break;
@@ -727,8 +824,9 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
         }
         if (bytes <= kShardBytes) {
             QSaveFile output(target);
-            if (output.open(QIODevice::WriteOnly) && output.write(jpeg) == jpeg.size())
-                output.commit();
+            if (output.open(QIODevice::WriteOnly) && output.write(jpeg) == jpeg.size() &&
+                output.commit())
+                writes->fetch_add(1);
         }
         return jpeg;
     };

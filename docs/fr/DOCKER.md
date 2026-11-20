@@ -90,11 +90,13 @@ Copier `docker-compose.thumbnails.yml` sous le nom `docker-compose.override.yml`
 à côté du fichier Compose principal, puis recréer le conteneur. Ce fichier
 monte le répertoire hôte sur `/thumbnail-cache`. L’index reste dans `/data`.
 
-Les aperçus JPEG intégrés sont mis en cache à la demande. Leur extraction
-s’exécute séparément de l’indexation. Le cache est réparti sur 4 096
-sous-répertoires, chacun limité à 2 Mio. Les entrées les plus anciennes d’un
-sous-répertoire sont évincées quand il se remplit. Sous 512 Mio d’espace
-disponible sur le disque du cache, morfPhoto suspend les écritures du cache.
+Lorsque le cache est activé, morfPhoto le préremplit en arrière-plan à partir
+de l’index existant. Le préremplissage démarre sans requête d’un client, cède
+la priorité à l’indexation et cesse d’ajouter des aperçus aux sous-répertoires
+pleins. Un aperçu demandé par un client peut évincer une ancienne entrée.
+Le cache comporte 4 096 sous-répertoires, chacun limité à 2 Mio. Sous 512 Mio
+d’espace disponible, morfPhoto suspend les écritures. L’état de l’index
+indique le nombre d’aperçus vérifiés et écrits depuis le démarrage.
 
 ## Mettre à jour
 

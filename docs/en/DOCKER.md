@@ -90,10 +90,12 @@ Copy `docker-compose.thumbnails.yml` to `docker-compose.override.yml` alongside
 the main Compose file, then recreate the container. The override bind-mounts
 the host directory at `/thumbnail-cache`. The index remains on `/data`.
 
-Embedded JPEG previews are cached on demand and extraction runs separately
-from indexing. The cache is split into 4,096 shards, each limited to 2 MiB.
-Older entries in a shard are evicted as it fills. morfPhoto skips cache writes
-when the cache filesystem has less than 512 MiB available.
+When the cache is enabled, morfPhoto also warms it in the background from the
+existing index. Warming starts without a client request, yields to indexing,
+and stops adding previews to a full shard. A preview requested by a client
+may evict an older entry. There are 4,096 shards, each limited to 2 MiB.
+morfPhoto skips writes when the cache filesystem has less than 512 MiB
+available. Index status reports thumbnails checked and written since startup.
 
 ## Update
 

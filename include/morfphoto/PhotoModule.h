@@ -5,7 +5,9 @@
  */
 
 #pragma once
+#include <atomic>
 #include <functional>
+#include <memory>
 #include "morfphoto/IModule.h"
 #include "morfphoto/Indexer.h"
 #include "morfphoto/LibraryMetadata.h"
@@ -18,6 +20,7 @@
 #include <QVector>
 #include <QMutex>
 #include <QFuture>
+#include <QFutureWatcher>
 #include <QSet>
 
 class QThread;
@@ -87,7 +90,7 @@ public:
     // Vignette JPEG d'un fichier (apercu embarque via exiftool, JPEG comme RAW). Sert
     // l'apercu des clients (PhotoHub). Valide que `path` est sous une racine autorisee et
     // pointe un fichier existant. *ok=false + retour vide si indisponible.
-    std::function<QByteArray(const QString&)> thumbnailReader(bool requireCache) const;
+    std::function<QByteArray(const QString&)> thumbnailReader(bool requireCache, bool prewarm = false) const;
     // Écriture (morfPhoto est l'UNIQUE écrivain de `.morfphoto.json`). `context` et
     // `subject` sont OBLIGATOIRES et doivent appartenir au vocabulaire gelé. Écrit le
     // fichier disque (atomique) puis met à jour la projection. false + *error si le
@@ -151,6 +154,12 @@ private:
     void stopWatcher();
     void refreshWatcher();
     void submitRealtime();
+    void warmThumbnails();
+
+    struct ThumbnailWarmBatch {
+        int checked = 0;
+        bool more = false;
+    };
 
     void reconcileRoots();
     void doPass(IndexMode mode, QVector<int> folderIds, QString trigger); // thread du pool
@@ -193,6 +202,12 @@ private:
 
     PhotoRepository* m_readRepo = nullptr;  // connexion du thread principal
     QTimer*          m_watchTimer = nullptr;
+    QTimer*          m_thumbnailTimer = nullptr;
+    QFutureWatcher<ThumbnailWarmBatch>* m_thumbnailWarmPass = nullptr;
+    std::shared_ptr<std::atomic_bool> m_thumbnailWarmStop;
+    std::shared_ptr<std::atomic<qint64>> m_thumbnailWrites = std::make_shared<std::atomic<qint64>>(0);
+    qint64 m_thumbnailChecked = 0;
+    bool m_thumbnailCaughtUp = false;
 
     bool           m_realtime = false;     // defaut : aucune surveillance de fond
     int            m_debounceMs = 2000;

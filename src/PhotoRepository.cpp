@@ -1039,6 +1039,23 @@ QJsonArray PhotoRepository::years() {
     return arr;
 }
 
+QVector<QPair<qint64, QString>> PhotoRepository::thumbnailCandidates(qint64 afterId, int limit) {
+    QVector<QPair<qint64, QString>> candidates;
+    QSqlQuery q(db());
+    run(q, QStringLiteral("SELECT f.id, f.path FROM files f JOIN folders d ON d.id = f.folder_id "
+                          "WHERE f.id > ? AND f.state = 'present' AND d.enabled = 1 "
+                          "AND d.deleted_at IS NULL ORDER BY f.id LIMIT ?"), {afterId, limit});
+    while (q.next())
+        candidates.append({q.value(0).toLongLong(), q.value(1).toString()});
+    return candidates;
+}
+
+qint64 PhotoRepository::lastPhotoId() {
+    QSqlQuery q(db());
+    return q.exec(QStringLiteral("SELECT MAX(id) FROM files")) && q.next() ?
+           q.value(0).toLongLong() : -1;
+}
+
 QJsonObject PhotoRepository::photoDataset() {
     // Dictionnaires : chaque chaine repetee (boitier, objectif, type) n'est stockee
     // qu'une fois ; les colonnes ne portent que son index. Un QHash retient l'index

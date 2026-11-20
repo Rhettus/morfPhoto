@@ -122,6 +122,8 @@ public:
     QJsonArray  distinctFocals();
     QJsonArray  years();
     QJsonObject latestRun(bool* found = nullptr);
+    QVector<QPair<qint64, QString>> thumbnailCandidates(qint64 afterId, int limit);
+    qint64 lastPhotoId();
 
     // Export compact des colonnes analytiques de toutes les photos PRESENTES, pour
     // la couche d'analyse (morfAnalytics). Format colonnaire + dictionnaires pour
