@@ -11,6 +11,10 @@ from threading import Event, Lock, Thread
 from time import monotonic
 from urllib.error import URLError
 
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 from backfill import PhotoApi, pass_catalog
 from index import EmbeddingIndex
 from model import EMBEDDING_VERSION, TextModel
@@ -86,7 +90,8 @@ def main():
                 status = 200
             except (ValueError, KeyError, TypeError):
                 status, result = 400, {"error": "invalid_semantic_query"}
-            except (sqlite3.Error, URLError, TimeoutError):
+            except (sqlite3.Error, URLError, TimeoutError) as error:
+                print(f"CLIP search 503: {type(error).__name__}: {error}", flush=True)
                 status, result = 503, {"error": "semantic_search_unavailable"}
             finally:
                 with search_lock:

@@ -2,9 +2,13 @@
 """CPU inference for morfPhoto's pinned CLIP package."""
 
 import hashlib
+import os
+import platform
+import re
 import threading
 from collections import OrderedDict
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
@@ -44,17 +48,94 @@ def normalize(output):
     return vector / norm
 
 
-def session(root, tower, threads):
+def _session_options(threads):
     options = ort.SessionOptions()
     options.intra_op_num_threads = threads
     options.inter_op_num_threads = 1
     if threads > 1:
         options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    return options
+
+
+def _sanitize_cache_part(value):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(value))
+
+
+def session(root, tower, threads, model_path=None, cache_key=None):
+    root = Path(root)
+    src = Path(model_path) if model_path is not None else root / "onnx" / f"{tower}_model.onnx"
+    cache_dir = root / ".ort_cache"
+    key = _sanitize_cache_part(cache_key or "fp32")
+    arch = _sanitize_cache_part(platform.machine() or "unknown")
+    ort_ver = _sanitize_cache_part(getattr(ort, "__version__", "unknown"))
+    cache_file = cache_dir / f"{tower}_{key}_{arch}_{ort_ver}.ort.onnx"
+
+    if cache_file.is_file():
+        try:
+            cache_stat = cache_file.stat()
+            src_stat = src.stat()
+            if cache_stat.st_size > 0 and cache_stat.st_mtime_ns >= src_stat.st_mtime_ns:
+                cached_options = _session_options(threads)
+                cached_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+                return ort.InferenceSession(
+                    str(cache_file),
+                    sess_options=cached_options,
+                    providers=["CPUExecutionProvider"],
+                )
+        except Exception:
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
+
+    can_cache = False
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        can_cache = os.access(cache_dir, os.W_OK)
+    except OSError:
+        can_cache = False
+
+    if can_cache:
+        tmp_cache = cache_file.with_name(f"{cache_file.name}.{os.getpid()}.tmp")
+        options = _session_options(threads)
+        options.optimized_model_filepath = str(tmp_cache)
+        try:
+            sess = ort.InferenceSession(
+                str(src),
+                sess_options=options,
+                providers=["CPUExecutionProvider"],
+            )
+            try:
+                if tmp_cache.is_file() and tmp_cache.stat().st_size > 0:
+                    tmp_cache.replace(cache_file)
+                else:
+                    tmp_cache.unlink(missing_ok=True)
+            except OSError:
+                try:
+                    tmp_cache.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return sess
+        except Exception:
+            try:
+                tmp_cache.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     return ort.InferenceSession(
-        str(root / "onnx" / f"{tower}_model.onnx"),
-        sess_options=options,
+        str(src),
+        sess_options=_session_options(threads),
         providers=["CPUExecutionProvider"],
     )
+
+
+def preprocess_image(preview) -> np.ndarray:
+    with Image.open(BytesIO(preview)) as image:
+        image.draft("RGB", (224, 224))
+        rgb = ImageOps.exif_transpose(image).convert("RGB")
+        crop = ImageOps.fit(rgb, (224, 224), method=Image.Resampling.BICUBIC)
+    pixels = np.asarray(crop, dtype=np.float32) / np.float32(255)
+    return np.ascontiguousarray(((pixels - MEAN) / DEVIATION).transpose(2, 0, 1))
 
 
 class TextModel:
@@ -100,14 +181,33 @@ class TextModel:
 
 class VisionModel:
     def __init__(self, root, threads):
-        verify_assets(root, ("onnx/vision_model.onnx",))
-        self.vision_session = session(root, "vision", threads)
+        root = Path(root)
+        use_int8 = os.environ.get("MORFPHOTO_CLIP_VISION_INT8", "").strip().lower() in {"1", "true", "yes"}
+        int8_path = root / "onnx" / "vision_model_int8.onnx"
+        if use_int8 and int8_path.is_file():
+            expected_sha = os.environ.get("MORFPHOTO_CLIP_VISION_INT8_SHA256", "").strip().lower()
+            if expected_sha:
+                with int8_path.open("rb") as asset:
+                    digest = hashlib.file_digest(asset, "sha256").hexdigest()
+                if digest != expected_sha:
+                    raise ValueError("Invalid CLIP asset: onnx/vision_model_int8.onnx")
+            self.vision_session = session(root, "vision", threads, model_path=int8_path, cache_key="int8")
+            print("CLIP vision using INT8 model", flush=True)
+        else:
+            verify_assets(root, ("onnx/vision_model.onnx",))
+            self.vision_session = session(root, "vision", threads, cache_key="fp32")
+
+    def embed_tensors(self, tensors):
+        if not tensors:
+            raise ValueError("Expected non-empty sequence of image tensors")
+        batch = np.ascontiguousarray(np.stack(tensors, axis=0), dtype=np.float32)
+        outputs = self.vision_session.run(["image_embeds"], {"pixel_values": batch})[0]
+        return [normalize(row) for row in outputs]
+
+    def images(self, previews):
+        if not previews:
+            return []
+        return self.embed_tensors([preprocess_image(p) for p in previews])
 
     def image(self, preview):
-        with Image.open(BytesIO(preview)) as image:
-            image.draft("RGB", (224, 224))
-            rgb = ImageOps.exif_transpose(image).convert("RGB")
-            crop = ImageOps.fit(rgb, (224, 224), method=Image.Resampling.BICUBIC)
-        pixels = np.asarray(crop, dtype=np.float32) / np.float32(255)
-        tensor = np.ascontiguousarray(((pixels - MEAN) / DEVIATION).transpose(2, 0, 1)[None])
-        return normalize(self.vision_session.run(["image_embeds"], {"pixel_values": tensor})[0])
+        return self.images([preview])[0]

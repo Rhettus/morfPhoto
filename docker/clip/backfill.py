@@ -5,6 +5,7 @@ import gzip
 import http.client
 import inspect
 import json
+import os
 import sqlite3
 import threading
 from contextlib import closing
@@ -127,7 +128,16 @@ class PhotoApi:
             return body
 
 
-def pass_catalog(catalog, api, vision, index, report, searching, indexing_poll_interval=5.0):
+def _batch_size(override=None):
+    raw = os.environ.get("MORFPHOTO_CLIP_BATCH_SIZE", "8") if override is None else override
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 8
+    return max(1, min(32, value))
+
+
+def pass_catalog(catalog, api, vision, index, report, searching, indexing_poll_interval=5.0, batch_size=None):
     try:
         sig = inspect.signature(report)
         accepts_force = "force" in sig.parameters or any(
@@ -197,45 +207,109 @@ def pass_catalog(catalog, api, vision, index, report, searching, indexing_poll_i
 
     unflushed = 0
     first_warming = True
+
+    def record_success(photo_id, revision, vector):
+        nonlocal unflushed
+        index.store(photo_id, revision, vector, commit=False)
+        unflushed += 1
+        if unflushed >= 64:
+            index.flush()
+            unflushed = 0
+        progress["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+        progress["indexed"] += 1
+
+    def record_failure(photo_id, revision, error_msg):
+        nonlocal unflushed, first_warming
+        index.record_failure(photo_id, revision, error_msg, commit=False)
+        unflushed += 1
+        if unflushed >= 64:
+            index.flush()
+            unflushed = 0
+        progress["failed"] += 1
+        first_warming = False
+        emit("warming", {**progress, "phase": "photo_failed", "photo_id": photo_id,
+                          "last_error": error_msg}, force=True)
+        print(f"CLIP skipped photo {photo_id}: {error_msg}", flush=True)
+
+    def process_single(photo_id, path, size, mtime):
+        nonlocal first_warming
+        revision = fingerprint(path, size, mtime)
+
+        def report_phase(phase):
+            nonlocal first_warming
+            emit("warming", {**progress, "phase": phase, "photo_id": photo_id}, force=first_warming)
+            first_warming = False
+
+        try:
+            vector = vision.image(path, report_phase)
+        except PhotoFailure as error:
+            record_failure(photo_id, revision, str(error))
+            return
+
+        report_phase("save_embedding")
+        record_success(photo_id, revision, vector)
+        first_warming = False
+        emit("warming", {**progress, "phase": "backfill", "pause_reason": None}, force=False)
+
+    effective_batch_size = _batch_size(batch_size)
     try:
-        for photo_id, path, size, mtime in pending:
-            if reason := pause_reason():
-                index.flush()
-                emit("paused", {**progress, "phase": "backfill", "pause_reason": reason}, force=True)
-                return True
+        if effective_batch_size > 1 and hasattr(vision, "images"):
+            for start in range(0, len(pending), effective_batch_size):
+                if reason := pause_reason():
+                    index.flush()
+                    emit("paused", {**progress, "phase": "backfill", "pause_reason": reason}, force=True)
+                    return True
 
-            revision = fingerprint(path, size, mtime)
+                chunk = pending[start:start + effective_batch_size]
+                batch_paths = [path for _, path, _, _ in chunk]
+                first_photo_id = chunk[0][0]
 
-            def report_phase(phase):
-                nonlocal first_warming
-                emit("warming", {**progress, "phase": phase, "photo_id": photo_id}, force=first_warming)
-                first_warming = False
+                def report_batch_phase(phase):
+                    nonlocal first_warming
+                    emit("warming", {**progress, "phase": phase, "photo_id": first_photo_id},
+                         force=first_warming)
+                    first_warming = False
 
-            try:
-                vector = vision.image(path, report_phase)
-            except PhotoFailure as error:
-                index.record_failure(photo_id, revision, str(error), commit=False)
-                unflushed += 1
-                if unflushed >= 64:
+                try:
+                    outcomes = vision.images(batch_paths, report_batch_phase)
+                except PhotoStalled:
+                    for item in chunk:
+                        process_single(*item)
+                    continue
+
+                if len(outcomes) != len(chunk):
+                    raise RuntimeError(f"Expected {len(chunk)} vision outcomes, got {len(outcomes)}")
+
+                retry_error = None
+                has_success = False
+                for (photo_id, path, size, mtime), (kind, payload) in zip(chunk, outcomes):
+                    revision = fingerprint(path, size, mtime)
+                    if kind == "result":
+                        record_success(photo_id, revision, payload)
+                        has_success = True
+                    elif kind in ("failure", "stalled"):
+                        record_failure(photo_id, revision, str(payload))
+                    elif kind == "retry":
+                        if retry_error is None:
+                            retry_error = str(payload)
+                    else:
+                        raise RuntimeError(f"Unknown vision batch outcome: {kind}")
+
+                if retry_error is not None:
                     index.flush()
                     unflushed = 0
-                progress["failed"] += 1
-                first_warming = False
-                emit("warming", {**progress, "phase": "photo_failed", "photo_id": photo_id,
-                                  "last_error": str(error)}, force=True)
-                print(f"CLIP skipped photo {photo_id}: {error}", flush=True)
-                continue
+                    raise URLError(retry_error)
 
-            report_phase("save_embedding")
-            index.store(photo_id, revision, vector, commit=False)
-            unflushed += 1
-            if unflushed >= 64:
-                index.flush()
-                unflushed = 0
-            progress["last_progress_at"] = datetime.now(timezone.utc).isoformat()
-            progress["indexed"] += 1
-            first_warming = False
-            emit("warming", {**progress, "phase": "backfill", "pause_reason": None}, force=False)
+                if has_success:
+                    first_warming = False
+                    emit("warming", {**progress, "phase": "backfill", "pause_reason": None}, force=False)
+        else:
+            for item in pending:
+                if reason := pause_reason():
+                    index.flush()
+                    emit("paused", {**progress, "phase": "backfill", "pause_reason": reason}, force=True)
+                    return True
+                process_single(*item)
     finally:
         index.flush()
 

@@ -22,6 +22,7 @@
 #include <QSet>
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 namespace morfphoto {
@@ -201,6 +202,7 @@ QSqlDatabase PhotoRepository::db() const {
 }
 
 bool PhotoRepository::open(const QString& dbPath, bool readOnly) {
+    m_hasFilesFts = false;
     if (!readOnly) {
         // Créer le dossier de la base au besoin (première installation).
         const QFileInfo fi(dbPath);
@@ -222,11 +224,16 @@ bool PhotoRepository::open(const QString& dbPath, bool readOnly) {
         return false;
     }
     if (readOnly) {
-        QSqlQuery q(database);
-        q.exec(QStringLiteral("PRAGMA query_only = ON"));
-        q.exec(QStringLiteral("PRAGMA busy_timeout = 5000"));
-        q.exec(QStringLiteral("PRAGMA cache_size = -65536"));
-        q.exec(QStringLiteral("PRAGMA temp_store = MEMORY"));
+        {
+            QSqlQuery q(database);
+            q.exec(QStringLiteral("PRAGMA query_only = ON"));
+            q.exec(QStringLiteral("PRAGMA busy_timeout = 5000"));
+            q.exec(QStringLiteral("PRAGMA cache_size = -65536"));
+            q.exec(QStringLiteral("PRAGMA temp_store = MEMORY"));
+        }
+        QSqlQuery fq(database);
+        m_hasFilesFts = fq.exec(QStringLiteral(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files_fts'")) && fq.next();
         return true;
     }
     // Scoper les PRAGMA : une requête encore active bloquerait le commit des
@@ -244,11 +251,19 @@ bool PhotoRepository::open(const QString& dbPath, bool readOnly) {
         q.exec(QStringLiteral("PRAGMA temp_store = MEMORY"));
         q.exec(QStringLiteral("PRAGMA journal_size_limit = 67108864"));
     }
-    return applyMigrations();
+    if (!applyMigrations())
+        return false;
+    {
+        QSqlQuery fq(database);
+        m_hasFilesFts = fq.exec(QStringLiteral(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files_fts'")) && fq.next();
+    }
+    return true;
 }
 
 void PhotoRepository::close() {
     m_inTransaction = false;
+    m_hasFilesFts = false;
     if (QSqlDatabase::contains(m_connectionName)) {
         {
             QSqlDatabase database = QSqlDatabase::database(m_connectionName);
@@ -586,7 +601,7 @@ void addIn(QStringList& clauses, QVariantList& binds, const QString& column, con
 
 // Toutes les conditions portent sur la MEME version : une note sur une copie et un
 // mot-cle sur une autre ne font pas une photo qui repond aux deux.
-QString libraryWhere(const LibraryFilter& f, QVariantList& binds) {
+QString libraryWhere(const LibraryFilter& f, QVariantList& binds, bool hasFilesFts) {
     QStringList c = {QStringLiteral("f.state = 'present'")};
     if (f.minRating > 0) {
         c << QStringLiteral("v.rejected = 0 AND v.rating >= ?");
@@ -645,10 +660,97 @@ QString libraryWhere(const LibraryFilter& f, QVariantList& binds) {
         }
     }
     if (!f.filename.isEmpty()) {
-        c << QStringLiteral("instr(lower(f.filename), lower(?)) > 0");
-        binds << f.filename;
+        if (hasFilesFts && f.filename.size() >= 3) {
+            const QString ftsQuery = QLatin1Char('"')
+                + QString(f.filename).replace(QLatin1Char('"'), QStringLiteral("\"\""))
+                + QLatin1Char('"');
+            c << QStringLiteral(
+                "f.id IN (SELECT rowid FROM files_fts WHERE filename MATCH ?) "
+                "AND instr(lower(f.filename), lower(?)) > 0");
+            binds << ftsQuery << f.filename;
+        } else {
+            c << QStringLiteral("instr(lower(f.filename), lower(?)) > 0");
+            binds << f.filename;
+        }
     }
     return QStringLiteral(" WHERE ") + c.join(QStringLiteral(" AND "));
+}
+
+struct LibraryCursor {
+    bool hasTakenAt = false;
+    QString takenAt;
+    int fileId = 0;
+};
+
+// Encode un curseur keyset [takenAtOrNull, lastFileId] en Base64URL sans padding.
+QString encodeLibraryCursor(const QVariant& takenAt, int fileId) {
+    QJsonArray arr;
+    if (takenAt.isNull() || takenAt.toString().isEmpty())
+        arr.append(QJsonValue::Null);
+    else
+        arr.append(takenAt.toString());
+    arr.append(fileId);
+    const QByteArray json = QJsonDocument(arr).toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(
+        json.toBase64(QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+}
+
+// Décode et valide un curseur keyset Base64URL [takenAtOrNull, lastFileId].
+bool decodeLibraryCursor(const QString& cursor, LibraryCursor* out) {
+    if (cursor.isEmpty())
+        return false;
+    const QByteArray raw = cursor.toUtf8();
+    if (raw.size() % 4 == 1)
+        return false;
+    for (const char ch : raw) {
+        const bool okChar = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_';
+        if (!okChar)
+            return false;
+    }
+    QByteArray padded = raw;
+    while (padded.size() % 4 != 0)
+        padded.append('=');
+    const auto decoded = QByteArray::fromBase64Encoding(
+        padded, QByteArray::Base64UrlEncoding | QByteArray::AbortOnBase64DecodingErrors);
+    if (decoded.decodingStatus != QByteArray::Base64DecodingStatus::Ok)
+        return false;
+
+    QJsonParseError parseErr{};
+    const QJsonDocument doc = QJsonDocument::fromJson(decoded.decoded, &parseErr);
+    if (parseErr.error != QJsonParseError::NoError || !doc.isArray())
+        return false;
+    const QJsonArray arr = doc.array();
+    if (arr.size() != 2)
+        return false;
+
+    const QJsonValue v0 = arr.at(0);
+    const QJsonValue v1 = arr.at(1);
+    bool hasTakenAt = false;
+    QString takenAt;
+    if (v0.isNull()) {
+        hasTakenAt = false;
+    } else if (v0.isString()) {
+        takenAt = v0.toString();
+        if (takenAt.isEmpty())
+            return false;
+        hasTakenAt = true;
+    } else {
+        return false;
+    }
+
+    if (!v1.isDouble())
+        return false;
+    const double idD = v1.toDouble();
+    if (idD < 1.0 || idD > 2147483647.0 || std::floor(idD) != idD)
+        return false;
+
+    if (out) {
+        out->hasTakenAt = hasTakenAt;
+        out->takenAt = takenAt;
+        out->fileId = static_cast<int>(idD);
+    }
+    return true;
 }
 
 } // namespace
@@ -869,12 +971,23 @@ QJsonObject PhotoRepository::librarySubfolders(const QString& folder) {
     return {{"items", items}};
 }
 
-QJsonObject PhotoRepository::libraryList(const LibraryFilter& filter, int page, int pageSize) {
+QJsonObject PhotoRepository::libraryList(const LibraryFilter& filter, int page, int pageSize,
+                                         const QString& cursor, bool* cursorValid, bool skipTotal) {
+    LibraryCursor parsedCursor;
+    const bool useCursor = !cursor.isEmpty();
+    if (useCursor && !decodeLibraryCursor(cursor, &parsedCursor)) {
+        if (cursorValid)
+            *cursorValid = false;
+        return {};
+    }
+    if (cursorValid)
+        *cursorValid = true;
+
     QVariantList binds;
-    const QString tail = QLatin1String(kLibraryFrom) + libraryWhere(filter, binds);
+    const QString tail = QLatin1String(kLibraryFrom) + libraryWhere(filter, binds, m_hasFilesFts);
 
     int total = 0;
-    {
+    if (!skipTotal) {
         QSqlQuery q(db());
         run(q, QStringLiteral("SELECT COUNT(DISTINCT f.id)") + tail, binds);
         if (q.next())
@@ -884,25 +997,54 @@ QJsonObject PhotoRepository::libraryList(const LibraryFilter& filter, int page, 
     page = qBound(1, page, 1000000);
     pageSize = qMax(1, pageSize);
     QVariantList pageBinds = binds;
-    pageBinds << pageSize << static_cast<qint64>(page - 1) * pageSize;
+    QString sql = QStringLiteral("SELECT f.id, GROUP_CONCAT(v.version), MIN(v.taken_at)") +
+                  tail + QStringLiteral(" GROUP BY f.id");
+    if (useCursor) {
+        if (parsedCursor.hasTakenAt) {
+            sql += QStringLiteral(
+                " HAVING (MIN(v.taken_at) IS NULL OR MIN(v.taken_at) > ? "
+                "OR (MIN(v.taken_at) = ? AND f.id > ?))");
+            pageBinds << parsedCursor.takenAt << parsedCursor.takenAt << parsedCursor.fileId;
+        } else {
+            sql += QStringLiteral(" HAVING (MIN(v.taken_at) IS NULL AND f.id > ?)");
+            pageBinds << parsedCursor.fileId;
+        }
+        sql += QStringLiteral(" ORDER BY MIN(v.taken_at) IS NULL, MIN(v.taken_at), f.id LIMIT ?");
+        pageBinds << (pageSize + 1);
+    } else {
+        sql += QStringLiteral(" ORDER BY MIN(v.taken_at) IS NULL, MIN(v.taken_at), f.id LIMIT ? OFFSET ?");
+        pageBinds << (pageSize + 1) << static_cast<qint64>(page - 1) * pageSize;
+    }
+
     QVector<int> ids;
     QHash<int, QString> matched;
+    QVariant lastTakenAt;
+    bool hasMore = false;
     {
         QSqlQuery q(db());
-        run(q, QStringLiteral("SELECT f.id, GROUP_CONCAT(v.version)") + tail +
-                   QStringLiteral(" GROUP BY f.id ORDER BY MIN(v.taken_at) IS NULL, MIN(v.taken_at), f.id "
-                                  "LIMIT ? OFFSET ?"), pageBinds);
+        run(q, sql, pageBinds);
         while (q.next()) {
-            ids << q.value(0).toInt();
-            matched.insert(q.value(0).toInt(), q.value(1).toString());
+            if (ids.size() == pageSize) {
+                hasMore = true;
+                break;
+            }
+            const int id = q.value(0).toInt();
+            ids << id;
+            matched.insert(id, q.value(1).toString());
+            lastTakenAt = q.value(2);
         }
     }
 
     QJsonObject o;
-    o["items"]     = libraryItems(ids, matched, false);
-    o["total"]     = total;
-    o["page"]      = page;
-    o["page_size"] = pageSize;
+    o["items"]       = libraryItems(ids, matched, false);
+    if (!skipTotal)
+        o["total"]   = total;
+    o["page"]        = page;
+    o["page_size"]   = pageSize;
+    o["has_more"]    = hasMore;
+    o["next_cursor"] = (hasMore && !ids.isEmpty())
+        ? QJsonValue(encodeLibraryCursor(lastTakenAt, ids.last()))
+        : QJsonValue(QJsonValue::Null);
     return o;
 }
 
@@ -1008,7 +1150,7 @@ QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
                        "lf.iso_label, f.iso, lf.aperture_label, f.aperture, "
                        "lf.focal_label, f.focal_length, lf.shutter_label, f.shutter_speed_s, "
                        "substr(v.taken_at, 1, 7), v.rejected") +
-                       QLatin1String(kLibraryFrom) + libraryWhere(filter, binds),
+                       QLatin1String(kLibraryFrom) + libraryWhere(filter, binds, m_hasFilesFts),
                 binds)) {
             int rawCount = 0;
             QHash<QString, KindBucket> extBuckets;
@@ -1100,7 +1242,7 @@ QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
         auto counted = [this](const LibraryFilter& f, const QString& column, const QString& order,
                               bool keepEmpty = false) {
             QVariantList binds;
-            QString where = libraryWhere(f, binds);
+            QString where = libraryWhere(f, binds, m_hasFilesFts);
             where += QStringLiteral(" AND %1 IS NOT NULL").arg(column);
             if (!keepEmpty)
                 where += QStringLiteral(" AND %1 != ''").arg(column);
@@ -1121,7 +1263,7 @@ QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
             QVariantList binds;
             QSqlQuery q(db());
             run(q, QStringLiteral("SELECT lf.ext_label, lf.kind_label, COUNT(*)") +
-                       QLatin1String(kLibraryFrom) + libraryWhere(f, binds) +
+                       QLatin1String(kLibraryFrom) + libraryWhere(f, binds, m_hasFilesFts) +
                        QStringLiteral(" GROUP BY lf.ext_label, lf.kind_label "
                                       "ORDER BY lf.kind_label != 'RAW', lf.ext_label"),
                 binds);
@@ -1173,7 +1315,7 @@ QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
             QVariantList binds;
             QSqlQuery q(db());
             run(q, QStringLiteral("SELECT COUNT(*), COALESCE(SUM(v.rejected), 0)") + QLatin1String(kLibraryFrom) +
-                       libraryWhere(f, binds), binds);
+                       libraryWhere(f, binds, m_hasFilesFts), binds);
             if (q.next()) {
                 const int all = q.value(0).toInt();
                 const int rejected = q.value(1).toInt();
@@ -1190,7 +1332,7 @@ QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
         QSqlQuery q(db());
         run(q, QStringLiteral("SELECT v.id, k.keyword") + QLatin1String(kLibraryFrom) +
                    QStringLiteral(" JOIN library_keywords k ON k.version_id = v.id") +
-                   libraryWhere(f, binds) + QStringLiteral(" ORDER BY v.id"), binds);
+                   libraryWhere(f, binds, m_hasFilesFts) + QStringLiteral(" ORDER BY v.id"), binds);
         QMap<QString, int> counts;
         QSet<QString> levels;
         int current = -1;

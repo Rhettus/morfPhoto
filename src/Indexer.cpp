@@ -88,6 +88,10 @@ int Indexer::run(IndexMode mode, const QVector<int>& folderIds, const QString& t
 
     bool interrupted = false;
     for (const FolderRow& folder : folders) {
+        if (isCancelled()) {
+            interrupted = true;
+            break;
+        }
         m_pCurrentFolder = folder.path;
         reportProgress(counts.seen);            // dossier entamé
         if (reconcileFolder(folder, mode, runId, counts, unavailableRoots))
@@ -152,6 +156,10 @@ int Indexer::runScopes(IndexMode mode, const QVector<IndexScope>& scopes, const 
 
     bool interrupted = false;
     for (const IndexScope& scope : resolved) {
+        if (isCancelled()) {
+            interrupted = true;
+            break;
+        }
         const FolderRow& folder = activeById.value(scope.folderId);
         const QString cleanFolderPath = QDir::cleanPath(folder.path);
         const bool isFullFolder = (scope.path == cleanFolderPath && scope.recursive == folder.recursive);
@@ -278,6 +286,8 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
         scan = scanFolder(
             cleanScopePath, scopeRecursive,
             [this, &folder, lastProbe = std::chrono::steady_clock::now()]() mutable {
+                if (isCancelled())
+                    return false;
                 const auto now = std::chrono::steady_clock::now();
                 if (now - lastProbe < std::chrono::milliseconds(2000))
                     return true;
@@ -286,6 +296,9 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
             },
             m_library);
     }
+
+    if (isCancelled())
+        return true;
 
     // Défense en profondeur : filtrer une seule fois hors des racines globales.
     // Cache canonique par répertoire pour les fichiers réguliers ; les liens
@@ -337,6 +350,8 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
     constexpr qsizetype kChunkSize = 64;
     QVector<int> touchedIds;
     for (qsizetype chunkStart = 0; chunkStart < allowedFiles.size(); chunkStart += kChunkSize) {
+        if (isCancelled())
+            return true;
         const qsizetype chunkEnd = qMin(chunkStart + kChunkSize, allowedFiles.size());
         QVector<ChunkItem> chunk;
         chunk.reserve(chunkEnd - chunkStart);
@@ -397,6 +412,8 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
                     item.exifError = std::move(cached->second);
                     exifBatch.erase(cached);
                 } else {
+                    if (isCancelled())
+                        return true;
                     item.exif = m_extractor->extract(item.info->path, &item.exifError);
                 }
                 item.exifOk = item.exif.ok;
@@ -446,9 +463,13 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
                 m_repo->commitTransaction();
         }
     }
+    if (isCancelled())
+        return true;
     if (!touchedIds.isEmpty())
         m_repo->touchSeen(touchedIds, nowIso());
 
+    if (isCancelled())
+        return true;
     // Point crucial : le verdict de disparition n'est FIABLE que si la racine a été
     // parcourue entièrement ET qu'elle répond toujours à la fin. Un scan incomplet
     // (source perdue en cours) ne sert jamais de référence : les fichiers déjà vus

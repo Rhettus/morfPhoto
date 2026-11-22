@@ -16,6 +16,18 @@ project(morfPhoto VERSION "${MORFPHOTO_VERSION_FROM_FILE}" LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# --- Optimisation LTO/IPO en Release (si supportee par le compilateur) ----
+option(MORFPHOTO_ENABLE_IPO "Activer l'optimisation interprocedurale (LTO/IPO) en Release" ON)
+if(MORFPHOTO_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT MORFPHOTO_IPO_SUPPORTED OUTPUT MORFPHOTO_IPO_ERROR LANGUAGES CXX)
+    if(MORFPHOTO_IPO_SUPPORTED)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    else()
+        message(STATUS "morfPhoto: IPO/LTO indisponible (${MORFPHOTO_IPO_ERROR})")
+    endif()
+endif()
+
 # --- Qt : generation automatique du moc (classes QObject) -----------------
 set(CMAKE_AUTOMOC ON)
 

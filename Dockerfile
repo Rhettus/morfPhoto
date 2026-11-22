@@ -3,13 +3,14 @@
 
 FROM debian:trixie-slim AS build
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake ninja-build g++ qt6-base-dev \
+    && apt-get install -y --no-install-recommends cmake ninja-build g++ qt6-base-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 # Seule la cible du service : le helper setuid (montages SMB) n'a pas sa place ici.
 RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build /build --target morfphoto
+    && cmake --build /build --target morfphoto \
+    && strip /build/service/morfphoto
 
 FROM debian:trixie-slim
 RUN apt-get update \

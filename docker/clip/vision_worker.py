@@ -3,16 +3,44 @@
 
 import multiprocessing
 import os
+from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 from urllib.error import HTTPError, URLError
 
 from PIL import Image
 
 from backfill import PhotoApi, PhotoFailure, PhotoStalled
-from model import VisionModel
+from model import VisionModel, preprocess_image
 
 PHOTO_TIMEOUT = 60
 START_TIMEOUT = 120
+
+
+def _prefetch_workers():
+    raw = os.environ.get("MORFPHOTO_CLIP_PREFETCH_WORKERS", "4")
+    try:
+        workers = int(raw)
+    except (TypeError, ValueError):
+        workers = 4
+    return min(4, max(1, workers))
+
+
+def _classify_error(error, stage):
+    if isinstance(error, HTTPError):
+        status = error.code
+        error.close()
+        return ("failure" if status == 404 else "retry", f"HTTP {status}")
+    if isinstance(error, TimeoutError):
+        return ("stalled", "thumbnail request timed out")
+    if isinstance(error, URLError):
+        if isinstance(error.reason, TimeoutError):
+            return ("stalled", "thumbnail request timed out")
+        return ("retry", type(error).__name__)
+    if isinstance(error, (OSError, ValueError, Image.DecompressionBombError)):
+        return ("failure", type(error).__name__)
+    if stage == "preview":
+        raise error
+    return ("failure", type(error).__name__)
 
 
 def serve(connection, model_root, threads, key):
@@ -20,38 +48,65 @@ def serve(connection, model_root, threads, key):
         os.nice(10)
     except (AttributeError, OSError):
         pass
-    with connection:
+    with connection, ThreadPoolExecutor(max_workers=_prefetch_workers()) as executor:
         model = VisionModel(model_root, threads)
         api = PhotoApi(key)
         connection.send(("ready", None))
+
+        def prepare_item(path):
+            stage = "preview"
+            try:
+                preview = api.preview(path)
+                stage = "decode_inference"
+                return (True, preprocess_image(preview))
+            except Exception as error:
+                return (False, _classify_error(error, stage))
+
         while True:
             try:
-                path = connection.recv()
+                request = connection.recv()
             except EOFError:
                 return
+
+            if isinstance(request, tuple) and len(request) == 2 and request[0] == "batch":
+                paths = list(request[1])
+                prepared = list(executor.map(prepare_item, paths)) if paths else []
+                connection.send(("phase", "decode_inference"))
+                results = [None] * len(paths)
+                valid_indices = []
+                valid_tensors = []
+                for idx, (ok, payload) in enumerate(prepared):
+                    if ok:
+                        valid_indices.append(idx)
+                        valid_tensors.append(payload)
+                    else:
+                        results[idx] = payload
+                if valid_tensors:
+                    try:
+                        vectors = model.embed_tensors(valid_tensors)
+                    except Exception:
+                        for idx, tensor in zip(valid_indices, valid_tensors):
+                            try:
+                                vector = model.embed_tensors([tensor])[0]
+                            except Exception as error:
+                                results[idx] = ("failure", type(error).__name__)
+                            else:
+                                results[idx] = ("result", vector)
+                    else:
+                        for idx, vector in zip(valid_indices, vectors):
+                            results[idx] = ("result", vector)
+                connection.send(("batch_result", results))
+                continue
+
+            path = request
             stage = "preview"
             try:
                 preview = api.preview(path)
                 stage = "decode_inference"
                 connection.send(("phase", stage))
                 vector = model.image(preview)
-            except HTTPError as error:
-                status = error.code
-                error.close()
-                connection.send(("failure" if status == 404 else "retry", f"HTTP {status}"))
-            except TimeoutError:
-                connection.send(("stalled", "thumbnail request timed out"))
-            except URLError as error:
-                if isinstance(error.reason, TimeoutError):
-                    connection.send(("stalled", "thumbnail request timed out"))
-                else:
-                    connection.send(("retry", type(error).__name__))
-            except (OSError, ValueError, Image.DecompressionBombError) as error:
-                connection.send(("failure", type(error).__name__))
             except Exception as error:
-                if stage == "preview":
-                    raise
-                connection.send(("failure", type(error).__name__))
+                connection.send(_classify_error(error, stage))
             else:
                 connection.send(("result", vector))
 
@@ -119,6 +174,29 @@ class VisionWorker:
                     raise URLError(value)
             self.close()
             raise PhotoStalled("photo deadline exceeded")
+        except (EOFError, BrokenPipeError) as error:
+            self.close()
+            raise PhotoStalled("vision process exited") from error
+
+    def images(self, paths, on_phase):
+        paths = list(paths)
+        if not paths:
+            return []
+        if self.connection is None:
+            on_phase("vision_startup")
+            self.start()
+        deadline = monotonic() + max(PHOTO_TIMEOUT, 30 * len(paths))
+        try:
+            on_phase("preview")
+            self.connection.send(("batch", paths))
+            while self.connection.poll(max(0, deadline - monotonic())):
+                message, value = self.connection.recv()
+                if message == "phase":
+                    on_phase(value)
+                elif message == "batch_result":
+                    return value
+            self.close()
+            raise PhotoStalled("batch deadline exceeded")
         except (EOFError, BrokenPipeError) as error:
             self.close()
             raise PhotoStalled("vision process exited") from error

@@ -60,8 +60,34 @@ if [ ! -e "$MARKER" ]; then
     register_photos &
 fi
 
+run_clip_worker() {
+    backoff=2
+    while :; do
+        start_ts="$(date +%s)"
+        rc=0
+        /opt/morfphoto-clip/bin/python /opt/morfphoto-clip/worker.py || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            return 0
+        fi
+        end_ts="$(date +%s)"
+        if [ $((end_ts - start_ts)) -ge 60 ]; then
+            backoff=2
+        fi
+        echo "morfphoto-entrypoint: CLIP worker exited with code $rc, restarting in ${backoff}s" >&2
+        sleep "$backoff"
+        backoff=$((backoff * 2))
+        if [ "$backoff" -gt 30 ]; then
+            backoff=30
+        fi
+    done
+}
+
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+
 if [ -n "${MORFPHOTO_CLIP_DIR:-}" ]; then
-    /opt/morfphoto-clip/bin/python /opt/morfphoto-clip/worker.py &
+    run_clip_worker &
 fi
 
 exec "$@"

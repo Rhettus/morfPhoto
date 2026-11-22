@@ -49,6 +49,9 @@ public:
     // Remplace les selections surveillees. A appeler dans le thread du watcher.
     void setTargets(const QVector<WatchTarget>& targets);
 
+    // Repertoires ignores (caches `.` ou metadonnees NAS/OS).
+    static bool isIgnoredDirectoryName(const QString& name);
+
     // Interrompt un parcours en cours. Appelable depuis n'importe quel thread.
     void requestStop() { m_stop = true; }
 

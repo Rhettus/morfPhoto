@@ -79,7 +79,10 @@ public:
 
     // --- Bibliothèque : EXIF + XMP réunis, servis depuis la base (xmp.enabled) ---
     bool        libraryEnabled() const { return m_library; }
-    QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize) const;
+    QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize,
+                            const QString& cursor = QString(),
+                            bool* cursorValid = nullptr,
+                            bool skipTotal = false) const;
     QJsonObject librarySubfolders(const QString& folder) const;
     QJsonObject libraryFacets(const LibraryFilter& filter) const;
     QJsonObject libraryPhoto(int fileId, bool* found) const;
@@ -174,7 +177,8 @@ private:
     QJsonObject cachedLibraryQuery(PhotoRepository* repo, const QString& key,
                                    const std::function<QJsonObject()>& compute) const;
     void reconcileRoots();
-    void doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes, QString trigger); // thread du pool
+    void doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes,
+                QString trigger, std::shared_ptr<std::atomic_bool> cancel); // thread du pool
     QString matchingRoot(const QString& path) const;
     QJsonObject observableState() const;
     // Declare une indexation TERMINEE a morfAnalytics (historique), best-effort et
@@ -258,6 +262,7 @@ private:
     QString        m_lastError;
     int            m_passCounter = 0;
     QFuture<void>  m_pass;
+    std::shared_ptr<std::atomic_bool> m_passCancel;
 
     // Progression de la passe en cours, alimentée par le callback de l'Indexer
     // (thread de passe) et lue par observableState() (thread HTTP) : sous m_stateMutex.

@@ -181,7 +181,15 @@ PhotoApi::Result PhotoApi::handle(const QByteArray& method, const QString& path,
         const int pageSize = positiveIntParam(query, QStringLiteral("page_size"), kDefaultPageSize);
         if (page < 0 || pageSize < 0)
             return error(400, QStringLiteral("bad_request"), QStringLiteral("page/page_size invalide"));
-        return ok(m_module->libraryList(filter, page, qMin(pageSize, kMaxPageSize)));
+        const QString cursor = query.queryItemValue(QStringLiteral("cursor"), QUrl::FullyDecoded).trimmed();
+        const QString skipTotalParam = query.queryItemValue(QStringLiteral("skip_total"));
+        const bool skipTotal = skipTotalParam == QLatin1String("true") || skipTotalParam == QLatin1String("1");
+        bool cursorValid = true;
+        const QJsonObject res = m_module->libraryList(filter, page, qMin(pageSize, kMaxPageSize),
+                                                    cursor, &cursorValid, skipTotal);
+        if (!cursorValid)
+            return error(400, QStringLiteral("bad_request"), QStringLiteral("cursor invalide"));
+        return ok(res);
     }
 
     // ---- /photos... ----

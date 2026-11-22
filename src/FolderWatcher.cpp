@@ -10,7 +10,6 @@
 #include "morfphoto/PhotoScanner.h"
 
 #include <QDir>
-#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QMutexLocker>
@@ -61,8 +60,35 @@ bool isRelevantFile(const QString& name) {
     return fileTypeFor(extension) != QLatin1String("other") || extension == QLatin1String(".xmp")
         || isExtendedImageExtension(extension);
 }
+
+bool isCoveredByTargets(const QString& dir, const QVector<WatchTarget>& targets) {
+    for (const WatchTarget& target : targets) {
+        if (dir == target.path)
+            return true;
+        if (target.recursive && isSubpathOf(dir, target.path))
+            return true;
+    }
+    return false;
+}
 #endif
 } // namespace
+
+bool FolderWatcher::isIgnoredDirectoryName(const QString& name) {
+    if (name.startsWith(QLatin1Char('.')))
+        return true;
+    static const QSet<QString> kExactIgnored = {
+        QStringLiteral("@eaDir"),
+        QStringLiteral("@Recycle"),
+        QStringLiteral("@tmp"),
+        QStringLiteral("#recycle"),
+        QStringLiteral("#snapshot"),
+        QStringLiteral("lost+found"),
+    };
+    if (kExactIgnored.contains(name))
+        return true;
+    return name.compare(QStringLiteral("$RECYCLE.BIN"), Qt::CaseInsensitive) == 0
+        || name.compare(QStringLiteral("System Volume Information"), Qt::CaseInsensitive) == 0;
+}
 
 FolderWatcher::FolderWatcher(int debounceMs, int probeTimeoutMs, QObject* parent)
     : QObject(parent),
@@ -127,21 +153,88 @@ void FolderWatcher::setTargets(const QVector<WatchTarget>& targets) {
         connect(m_notifier, &QSocketNotifier::activated, this, &FolderWatcher::onReadable);
     }
 
-    for (auto it = m_wdToPath.constBegin(); it != m_wdToPath.constEnd(); ++it)
-        inotify_rm_watch(m_fd, it.key());
-    m_wdToPath.clear();
-    m_pathToWd.clear();
-    m_rootIds.clear();
-    m_skipped.clear();
-    m_limitReached = false;
-
-    m_targets = targets;
-    for (WatchTarget& target : m_targets)
+    QVector<WatchTarget> cleaned = targets;
+    for (WatchTarget& target : cleaned)
         target.path = QDir::cleanPath(target.path);
-    for (const WatchTarget& target : std::as_const(m_targets))
-        armTarget(target);
 
-    m_rearm->start();
+    using TargetKey = QPair<QString, bool>;
+    QSet<TargetKey> oldKeys;
+    oldKeys.reserve(m_targets.size());
+    for (const WatchTarget& t : std::as_const(m_targets))
+        oldKeys.insert(qMakePair(t.path, t.recursive));
+
+    QSet<TargetKey> newKeys;
+    newKeys.reserve(cleaned.size());
+    for (const WatchTarget& t : std::as_const(cleaned))
+        newKeys.insert(qMakePair(t.path, t.recursive));
+
+    if (oldKeys == newKeys && !m_limitReached) {
+        m_targets = std::move(cleaned);
+        if (!m_rearm->isActive())
+            m_rearm->start();
+        publishStatus();
+        return;
+    }
+
+    QHash<QString, bool> oldByPath;
+    for (const WatchTarget& t : std::as_const(m_targets))
+        oldByPath[t.path] = oldByPath.value(t.path, false) || t.recursive;
+
+    QHash<QString, bool> newByPath;
+    for (const WatchTarget& t : std::as_const(cleaned))
+        newByPath[t.path] = newByPath.value(t.path, false) || t.recursive;
+
+    bool hasRemovalsOrDowngrades = false;
+    for (auto it = oldByPath.constBegin(); it != oldByPath.constEnd(); ++it) {
+        const auto newIt = newByPath.constFind(it.key());
+        if (newIt == newByPath.constEnd() || (it.value() && !newIt.value())) {
+            hasRemovalsOrDowngrades = true;
+            break;
+        }
+    }
+
+    const bool hadLimitReached = m_limitReached;
+    m_targets = std::move(cleaned);
+
+    if (hasRemovalsOrDowngrades) {
+        bool removedAnyWatch = false;
+        const QStringList known = m_pathToWd.keys();
+        for (const QString& dir : known) {
+            if (!isCoveredByTargets(dir, m_targets)) {
+                const int wd = m_pathToWd.take(dir);
+                m_wdToPath.remove(wd);
+                inotify_rm_watch(m_fd, wd);
+                removedAnyWatch = true;
+            }
+        }
+        for (auto it = m_rootIds.begin(); it != m_rootIds.end();) {
+            if (!newByPath.contains(it.key()))
+                it = m_rootIds.erase(it);
+            else
+                ++it;
+        }
+        for (auto it = m_skipped.begin(); it != m_skipped.end();) {
+            if (!newByPath.contains(*it))
+                it = m_skipped.erase(it);
+            else
+                ++it;
+        }
+        if (removedAnyWatch)
+            m_limitReached = false;
+    }
+
+    for (const WatchTarget& target : std::as_const(m_targets)) {
+        const bool wasKnown = oldByPath.contains(target.path);
+        const bool wasRecursive = oldByPath.value(target.path, false);
+        const bool isUpgraded = wasKnown && !wasRecursive && target.recursive;
+        const bool isMissed = !m_pathToWd.contains(target.path) && !m_skipped.contains(target.path);
+        const bool retryPartialAfterLimit = hadLimitReached && !m_limitReached && target.recursive;
+        if (!wasKnown || isUpgraded || isMissed || retryPartialAfterLimit)
+            armTarget(target);
+    }
+
+    if (!m_rearm->isActive())
+        m_rearm->start();
     publishStatus();
 }
 
@@ -179,6 +272,8 @@ void FolderWatcher::rearm() {
 }
 
 bool FolderWatcher::addWatch(const QString& path) {
+    if (m_pathToWd.contains(path))
+        return true;
     if (m_limitReached)
         return false;
     const int wd = inotify_add_watch(m_fd, QFile::encodeName(path).constData(), kWatchMask);
@@ -195,10 +290,21 @@ bool FolderWatcher::addWatch(const QString& path) {
 void FolderWatcher::addTree(const QString& path, bool recursive) {
     if (!addWatch(path) || !recursive)
         return;
-    QDirIterator it(path, QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::NoSymLinks,
-                    QDirIterator::Subdirectories);
-    while (it.hasNext() && !m_stop && !m_limitReached)
-        addWatch(it.next());
+    QStringList stack{path};
+    while (!stack.isEmpty() && !m_stop && !m_limitReached) {
+        const QString cur = stack.takeLast();
+        const QFileInfoList entries = QDir(cur).entryInfoList(
+            QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
+        for (const QFileInfo& entry : entries) {
+            if (m_stop || m_limitReached)
+                return;
+            if (isIgnoredDirectoryName(entry.fileName()))
+                continue;
+            const QString child = entry.filePath();
+            if (addWatch(child))
+                stack.push_back(child);
+        }
+    }
 }
 
 void FolderWatcher::removeTree(const QString& path) {
@@ -261,8 +367,10 @@ void FolderWatcher::handleEvent(int wd, quint32 mask, const QString& name) {
     }
 
     if (mask & IN_ISDIR) {
+        if (name.isEmpty() || isIgnoredDirectoryName(name))
+            return;
         const QVector<int> folders = foldersFor(directory, /*recursiveOnly=*/true);
-        if (folders.isEmpty() || name.isEmpty())
+        if (folders.isEmpty())
             return;
         const QString path = directory == QLatin1String("/")
             ? (QLatin1Char('/') + name)

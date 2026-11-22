@@ -60,7 +60,7 @@ def _parse_date(filters, key):
     return val
 
 
-def _build_where(folder, recursive, filters):
+def _build_where(folder, recursive, filters, has_files_fts=False):
     clauses = ["f.state = 'present'", "v.edited = 0"]
     binds = []
 
@@ -153,8 +153,16 @@ def _build_where(folder, recursive, filters):
     if filename is not None and filename != "":
         if not isinstance(filename, str):
             raise ValueError("Invalid filename filter")
-        clauses.append("instr(lower(f.filename), lower(?)) > 0")
-        binds.append(filename)
+        if has_files_fts and len(filename) >= 3:
+            fts_query = '"' + filename.replace('"', '""') + '"'
+            clauses.append(
+                "f.id IN (SELECT rowid FROM files_fts WHERE filename MATCH ?) "
+                "AND instr(lower(f.filename), lower(?)) > 0"
+            )
+            binds.extend((fts_query, filename))
+        else:
+            clauses.append("instr(lower(f.filename), lower(?)) > 0")
+            binds.append(filename)
 
     return " AND ".join(clauses), binds
 
@@ -181,6 +189,7 @@ class SemanticSearch:
                 pass
             self._local.conn = None
             self._local.inode = None
+            self._local.has_files_fts = False
 
     def _get_db(self):
         try:
@@ -200,17 +209,24 @@ class SemanticSearch:
                 pass
             self._local.conn = None
             self._local.inode = None
+            self._local.has_files_fts = False
         conn = sqlite3.connect(self.catalog.as_uri() + "?mode=ro", uri=True)
         try:
             conn.execute("PRAGMA busy_timeout = 5000")
             conn.execute("PRAGMA query_only = ON")
             conn.execute("PRAGMA cache_size = -32768")
             conn.execute("PRAGMA temp_store = MEMORY")
+            has_files_fts = bool(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'"
+                ).fetchone()
+            )
         except Exception:
             conn.close()
             raise
         self._local.conn = conn
         self._local.inode = inode
+        self._local.has_files_fts = has_files_fts
         return conn, inode, db_stat
 
     def _load_candidates(self, sql, binds, track_hit=False):
@@ -260,7 +276,12 @@ class SemanticSearch:
         if not isinstance(filters, dict) or filters.keys() - allowed:
             raise ValueError("Unsupported semantic search filter")
 
-        where_sql, binds = _build_where(folder, recursive, filters)
+        has_files_fts = False
+        filename = filters.get("filename")
+        if isinstance(filename, str) and len(filename) >= 3:
+            self._get_db()
+            has_files_fts = getattr(self._local, "has_files_fts", False)
+        where_sql, binds = _build_where(folder, recursive, filters, has_files_fts)
         needs_lf = any(_parse_str_list(filters, key) for key in _LIBRARY_FILE_FILTERS)
 
         params = {**filters, "folder_path": folder,

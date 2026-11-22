@@ -732,6 +732,15 @@ void PhotoModule::stop() {
         m_watchTimer = nullptr;
     }
     // Attendre la fin d'une passe éventuellement en cours avant de fermer la base.
+    {
+        std::shared_ptr<std::atomic_bool> cancel;
+        {
+            QMutexLocker lock(&m_stateMutex);
+            cancel = m_passCancel;
+        }
+        if (cancel)
+            cancel->store(true, std::memory_order_release);
+    }
     if (m_pass.isRunning())
         m_pass.waitForFinished();
     if (m_readRepo) {
@@ -865,6 +874,7 @@ QJsonObject PhotoModule::triggerIndexScopes(IndexMode mode, const QVector<IndexS
 
 QJsonObject PhotoModule::startPass(IndexMode mode, const QVector<int>& folderIds,
                                    const QVector<IndexScope>& scopes, const QString& trigger) {
+    std::shared_ptr<std::atomic_bool> cancel;
     {
         QMutexLocker lock(&m_stateMutex);
         if (m_indexing) {
@@ -875,6 +885,8 @@ QJsonObject PhotoModule::startPass(IndexMode mode, const QVector<int>& folderIds
             o["started_at"] = m_startedAt;
             return o;
         }
+        cancel = std::make_shared<std::atomic_bool>(false);
+        m_passCancel = cancel;
         m_indexing  = true;
         m_startedAt = nowIso();
         m_startedAtEpoch = QDateTime::currentSecsSinceEpoch();
@@ -892,8 +904,8 @@ QJsonObject PhotoModule::startPass(IndexMode mode, const QVector<int>& folderIds
 
     if (m_thumbnailWarmStop)
         m_thumbnailWarmStop->store(true);
-    m_pass = QtConcurrent::run([this, mode, folderIds, scopes, trigger]() {
-        doPass(mode, folderIds, scopes, trigger);
+    m_pass = QtConcurrent::run([this, mode, folderIds, scopes, trigger, cancel]() {
+        doPass(mode, folderIds, scopes, trigger, cancel);
     });
 
     QJsonObject o;
@@ -902,7 +914,8 @@ QJsonObject PhotoModule::startPass(IndexMode mode, const QVector<int>& folderIds
     return o;
 }
 
-void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes, QString trigger) {
+void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes,
+                         QString trigger, std::shared_ptr<std::atomic_bool> cancel) {
     int pass;
     QStringList roots;
     {
@@ -923,6 +936,7 @@ void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexSc
             Indexer indexer(&repo, &extractor, roots, m_probeTimeoutMs);
             indexer.setLibraryEnabled(m_library);
             indexer.setExifWorkers(m_exifWorkers);
+            indexer.setCancelToken(cancel);
             // Relais de progression : l'Indexer rappelle depuis CE thread ; on recopie
             // sous verrou dans les membres lus par observableState() (thread HTTP).
             indexer.setProgressCallback([this](const IndexProgress& p) {
@@ -952,12 +966,14 @@ void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexSc
     {
         QMutexLocker lock(&m_stateMutex);
         m_indexing = false;
+        m_passCancel.reset();
         m_lastError = error;
         m_lastFoldersTotal = m_progFoldersTotal;
         startEpoch   = m_startedAtEpoch;
         filesSeen    = m_progFilesSeen;
         foldersTotal = m_progFoldersTotal;
     }
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
 
     // Passe terminee : la declarer a morfAnalytics comme activite HISTORIQUE
     // (contrat `activity/1` §6). Best-effort, hors verrou, jamais bloquant : une
@@ -1269,9 +1285,15 @@ QJsonObject PhotoModule::librarySubfolders(const QString& folder) const {
                               [&]() { return repo->librarySubfolders(folder); });
 }
 
-QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int pageSize) const {
+QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int pageSize,
+                                     const QString& cursor, bool* cursorValid,
+                                     bool skipTotal) const {
     PhotoRepository* repo = readRepo();
-    return repo ? repo->libraryList(filter, page, pageSize) : QJsonObject{};
+    if (!repo) {
+        if (cursorValid) *cursorValid = true;
+        return QJsonObject{};
+    }
+    return repo->libraryList(filter, page, pageSize, cursor, cursorValid, skipTotal);
 }
 
 QJsonObject PhotoModule::libraryFacets(const LibraryFilter& filter) const {

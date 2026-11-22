@@ -105,7 +105,10 @@ public:
     ExifData libraryBase(int fileId);                        // ce que l'image elle-même contient
     void storeLibrary(int fileId, const QString& fingerprint, const LibraryFileLabels& labels,
                       const QVector<LibraryVersion>& versions);
-    QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize);
+    QJsonObject libraryList(const LibraryFilter& filter, int page, int pageSize,
+                            const QString& cursor = QString(),
+                            bool* cursorValid = nullptr,
+                            bool skipTotal = false);
     QJsonObject librarySubfolders(const QString& folder);
     QJsonObject libraryFacets(const LibraryFilter& filter);
     QJsonObject libraryPhoto(int fileId, bool* found);
@@ -162,6 +165,7 @@ private:
     QString m_connectionName;
     QString m_openError;
     bool m_inTransaction = false;
+    bool m_hasFilesFts = false;
 };
 
 } // namespace morfphoto

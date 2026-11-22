@@ -23,7 +23,7 @@
 // -----------------------------------------------------------------------------
 namespace morfphoto {
 
-inline constexpr int kSchemaVersion = 8;
+inline constexpr int kSchemaVersion = 9;
 
 // Instructions de la migration 001 (création initiale). La colonne calculée
 // `taken_year` permet de regrouper par année sans reparser la date à chaque fois.
@@ -276,6 +276,34 @@ inline QStringList schemaV8Statements() {
     };
 }
 
+// Migration 009 : index plein texte FTS5 trigram sur `files(filename)` pour
+// accélérer les recherches par sous-chaîne de nom de fichier, synchronisé par triggers.
+inline QStringList schemaV9Statements() {
+    return {
+        QStringLiteral(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5("
+            "  filename,"
+            "  content='files',"
+            "  content_rowid='id',"
+            "  tokenize='trigram'"
+            ")"),
+        QStringLiteral(
+            "CREATE TRIGGER IF NOT EXISTS files_fts_ai AFTER INSERT ON files BEGIN "
+            "  INSERT INTO files_fts(rowid, filename) VALUES (new.id, new.filename); "
+            "END"),
+        QStringLiteral(
+            "CREATE TRIGGER IF NOT EXISTS files_fts_ad AFTER DELETE ON files BEGIN "
+            "  INSERT INTO files_fts(files_fts, rowid, filename) VALUES ('delete', old.id, old.filename); "
+            "END"),
+        QStringLiteral(
+            "CREATE TRIGGER IF NOT EXISTS files_fts_au AFTER UPDATE OF filename ON files BEGIN "
+            "  INSERT INTO files_fts(files_fts, rowid, filename) VALUES ('delete', old.id, old.filename); "
+            "  INSERT INTO files_fts(rowid, filename) VALUES (new.id, new.filename); "
+            "END"),
+        QStringLiteral("INSERT INTO files_fts(files_fts) VALUES('rebuild')"),
+    };
+}
+
 // Instructions à exécuter pour atteindre une version de schéma donnée. Le dépôt
 // applique dans l'ordre chaque version manquante (voir applyMigrations).
 inline QStringList migrationStatements(int version) {
@@ -288,6 +316,7 @@ inline QStringList migrationStatements(int version) {
     case 6:  return schemaV6Statements();
     case 7:  return schemaV7Statements();
     case 8:  return schemaV8Statements();
+    case 9:  return schemaV9Statements();
     default: return {};
     }
 }

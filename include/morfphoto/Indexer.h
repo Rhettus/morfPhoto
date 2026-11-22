@@ -13,7 +13,9 @@
 #include <QJsonObject>
 #include <QMutex>
 
+#include <atomic>
 #include <functional>
+#include <memory>
 
 #include "morfphoto/PhotoTypes.h"
 
@@ -93,6 +95,9 @@ public:
     using ProgressFn = std::function<void(const IndexProgress&)>;
     void setProgressCallback(ProgressFn cb) { m_progress = std::move(cb); }
 
+    void setCancelToken(std::shared_ptr<std::atomic_bool> token) { m_cancel = std::move(token); }
+    bool isCancelled() const { return m_cancel && m_cancel->load(std::memory_order_acquire); }
+
 private:
     // Réconcilie une sélection. `unavailableRoots` : cache des racines déjà sondées
     // indisponibles pendant CETTE passe (ne pas re-sonder, ne pas s'acharner sur la
@@ -145,6 +150,7 @@ private:
     qint64     m_pFilesDiscovered = 0;
     bool       m_pFilesTotalFinal = false;
     QString    m_pCurrentFolder;
+    std::shared_ptr<std::atomic_bool> m_cancel;
 };
 
 } // namespace morfphoto

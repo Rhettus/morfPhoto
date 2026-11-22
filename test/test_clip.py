@@ -178,19 +178,39 @@ SCHEMA_V8 = [
     "CREATE INDEX IF NOT EXISTS idx_library_ext ON library_files(ext_label)",
     "CREATE INDEX IF NOT EXISTS idx_library_kind ON library_files(kind_label)",
 ]
+SCHEMA_V9 = [
+    """CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+      filename,
+      content='files',
+      content_rowid='id',
+      tokenize='trigram'
+    )""",
+    """CREATE TRIGGER IF NOT EXISTS files_fts_ai AFTER INSERT ON files BEGIN
+      INSERT INTO files_fts(rowid, filename) VALUES (new.id, new.filename);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS files_fts_ad AFTER DELETE ON files BEGIN
+      INSERT INTO files_fts(files_fts, rowid, filename) VALUES ('delete', old.id, old.filename);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS files_fts_au AFTER UPDATE OF filename ON files BEGIN
+      INSERT INTO files_fts(files_fts, rowid, filename) VALUES ('delete', old.id, old.filename);
+      INSERT INTO files_fts(rowid, filename) VALUES (new.id, new.filename);
+    END""",
+    "INSERT INTO files_fts(files_fts) VALUES('rebuild')",
+]
 
 
-def create_catalog_db(path: Path):
+def create_catalog_db(path: Path, version: int = 9):
     with closing(sqlite3.connect(path)) as db:
         db.execute("PRAGMA foreign_keys = ON")
         db.execute("PRAGMA journal_mode = WAL")
-        for stmts in (
+        migrations = (
             SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4,
-            SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-        ):
+            SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+        )
+        for stmts in migrations[:version]:
             for s in stmts:
                 db.execute(s)
-        db.execute("PRAGMA user_version = 8")
+        db.execute(f"PRAGMA user_version = {version}")
         db.commit()
 
 
@@ -788,6 +808,48 @@ class TestSemanticSearch(unittest.TestCase):
         res = self.searcher.search({"text": "test", "folder_path": "/", "recursive": True, "size": 3})
         self.assertEqual([item["photo"]["id"] for item in res["items"]], [1, 3])
 
+    def test_fts5_filename_search_and_legacy_fallback(self):
+        # v9 catalog has files_fts -> detected on connection and used for >=3 char substrings
+        ids_fts, _ = self._ids("/", True, {"filename": "B.AR"})
+        self.assertEqual(ids_fts, [2])
+        self.assertTrue(getattr(self.searcher._local, "has_files_fts", False))
+
+        # < 3 char filename filter still works via instr fallback
+        ids_short, _ = self._ids("/", True, {"filename": "a."})
+        self.assertEqual(ids_short, [1])
+
+        # Embedded double quote does not break FTS5 MATCH syntax
+        with closing(sqlite3.connect(self.catalog)) as db:
+            db.execute("UPDATE files SET filename = 'odd\"name.jpg' WHERE id = 8")
+            db.commit()
+        ids_quote, _ = self._ids("/", True, {"filename": 'odd"na'})
+        self.assertEqual(ids_quote, [8])
+
+        # Legacy v8 catalog without files_fts falls back cleanly to instr()
+        v8_catalog = self.dir / "photos_v8.db"
+        create_catalog_db(v8_catalog, version=8)
+        with closing(sqlite3.connect(v8_catalog)) as db:
+            db.execute("INSERT INTO folders (id, path, root_path, enabled, added_at) VALUES (1, '/photos', '/photos', 1, '2026-01-01')")
+            db.execute(
+                "INSERT INTO files (id, folder_id, path, directory, filename, size, mtime, state, "
+                "first_seen_at, last_seen_at, last_indexed_at) "
+                "VALUES (1, 1, '/photos/legacy_sunset.jpg', '/photos', 'legacy_sunset.jpg', 100, 1000, 'present', "
+                "'2026-01-01', '2026-01-01', '2026-01-01')"
+            )
+            db.execute(
+                "INSERT INTO library_versions (id, file_id, version, is_copy, rating, rejected, labels, edited) "
+                "VALUES (1, 1, 0, 0, 0, 0, 0, 0)"
+            )
+            db.commit()
+        v8_idx = EmbeddingIndex(self.dir / "emb_v8.db", "rev1:v1")
+        self.addCleanup(v8_idx.close)
+        v8_idx.store(1, fingerprint("/photos/legacy_sunset.jpg", 100, 1000), basis_vec(0))
+        v8_searcher = SemanticSearch(FakeApi(v8_catalog), self.model, v8_idx, v8_catalog)
+        self.addCleanup(v8_searcher.close)
+        res = v8_searcher.search({"text": "test", "folder_path": "/photos", "recursive": False, "filters": {"filename": "sunset"}})
+        self.assertEqual([item["photo"]["id"] for item in res["items"]], [1])
+        self.assertFalse(getattr(v8_searcher._local, "has_files_fts", True))
+
 
 class TestBackfill(unittest.TestCase):
     def setUp(self):
@@ -973,6 +1035,91 @@ class TestBackfill(unittest.TestCase):
         self.assertFalse(self.idx.current(2, fingerprint("/photos/p2.jpg", 102, 1002)))
         self.assertEqual(events4[-1][1]["indexed"], 3)
         self.assertEqual(events4[-1][1]["eligible"], 3)
+
+    def test_batched_vision_mixed_outcomes_retry_and_stall_fallback(self):
+        from urllib.error import URLError
+
+        for i in range(1, 7):
+            self._add_file(i, f"b{i}.jpg", 100 + i, 1000 + i)
+
+        class FakeBatchVision:
+            def __init__(self, batch_handler, single_handler=None):
+                self.batch_calls = []
+                self.single_calls = []
+                self.batch_handler = batch_handler
+                self.single_handler = single_handler
+
+            def images(self, paths, report_phase):
+                self.batch_calls.append(list(paths))
+                report_phase("preview")
+                report_phase("decode_inference")
+                return self.batch_handler(paths, report_phase)
+
+            def image(self, path, report_phase):
+                self.single_calls.append(path)
+                report_phase("preview")
+                report_phase("decode_inference")
+                if self.single_handler is not None:
+                    return self.single_handler(path, report_phase)
+                return unit_vec(len(self.single_calls) + 50)
+
+        # 1) Mixed batch: successes + failure, then retry error raises URLError after storing prior successes
+        def mixed_handler(paths, _phase):
+            out = []
+            for idx, p in enumerate(paths):
+                if p.endswith("b2.jpg"):
+                    out.append(("failure", "HTTP 404"))
+                elif p.endswith("b5.jpg"):
+                    out.append(("retry", "HTTP 503"))
+                else:
+                    out.append(("result", unit_vec(idx + 10)))
+            return out
+
+        vision = FakeBatchVision(mixed_handler)
+        events = []
+        with self.assertRaises(URLError):
+            pass_catalog(
+                self.catalog, self.api, vision, self.idx,
+                lambda s, p: events.append((s, dict(p))),
+                self.searching, batch_size=3,
+            )
+        self.assertEqual(len(vision.batch_calls), 2)
+        self.assertEqual(vision.batch_calls[0], ["/photos/b1.jpg", "/photos/b2.jpg", "/photos/b3.jpg"])
+        self.assertEqual(vision.batch_calls[1], ["/photos/b4.jpg", "/photos/b5.jpg", "/photos/b6.jpg"])
+        # b1, b3, b4, b6 stored; b2 recorded failed; b5 left pending (not failed!) for retry
+        self.assertTrue(self.idx.current(1, fingerprint("/photos/b1.jpg", 101, 1001)))
+        self.assertTrue(self.idx.is_failed(2, ("/photos/b2.jpg", 102, 1002)))
+        self.assertTrue(self.idx.current(3, fingerprint("/photos/b3.jpg", 103, 1003)))
+        self.assertTrue(self.idx.current(4, fingerprint("/photos/b4.jpg", 104, 1004)))
+        self.assertFalse(self.idx.is_failed(5, ("/photos/b5.jpg", 105, 1005)))
+        self.assertTrue(self.idx.current(6, fingerprint("/photos/b6.jpg", 106, 1006)))
+
+        # 2) Whole-batch stall falls back to per-photo vision.image(), isolating the stalling photo
+        self._add_file(7, "b7.jpg", 107, 1007)
+        self._add_file(8, "b8.jpg", 108, 1008)
+
+        def stall_batch(_paths, _phase):
+            raise PhotoStalled("batch deadline exceeded")
+
+        def single_fallback(path, _phase):
+            if path.endswith("b7.jpg"):
+                raise PhotoStalled("photo deadline exceeded")
+            return unit_vec(88)
+
+        vision2 = FakeBatchVision(stall_batch, single_fallback)
+        events2 = []
+        worked = pass_catalog(
+            self.catalog, self.api, vision2, self.idx,
+            lambda s, p: events2.append((s, dict(p))),
+            self.searching, batch_size=3,
+        )
+        self.assertTrue(worked)
+        self.assertEqual(vision2.batch_calls, [["/photos/b5.jpg", "/photos/b7.jpg", "/photos/b8.jpg"]])
+        self.assertEqual(vision2.single_calls, ["/photos/b5.jpg", "/photos/b7.jpg", "/photos/b8.jpg"])
+        self.assertTrue(self.idx.current(5, fingerprint("/photos/b5.jpg", 105, 1005)))
+        self.assertTrue(self.idx.is_failed(7, ("/photos/b7.jpg", 107, 1007)))
+        self.assertTrue(self.idx.current(8, fingerprint("/photos/b8.jpg", 108, 1008)))
+        self.assertEqual(events2[-1][0], "idle")
 
 
 class TestPhotoApiKeepAliveGzip(unittest.TestCase):

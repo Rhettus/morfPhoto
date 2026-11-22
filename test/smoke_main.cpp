@@ -1190,6 +1190,181 @@ int main(int argc, char** argv) {
             server.stop();
             reg.stopAll();
         }
+
+        // 14) Optimisations Phase 3 : Schema v9 FTS5 filename search, pagination
+        //     keyset (cursor + skip_total), FolderWatcher skip NAS/hidden + diff
+        //     incremental, et annulation cooperative de l'Indexer.
+        {
+            const QString p3Root = base + QStringLiteral("/phase3_root");
+            QDir().mkpath(p3Root + QStringLiteral("/2026/sub"));
+            QDir().mkpath(p3Root + QStringLiteral("/.git/objects"));
+            QDir().mkpath(p3Root + QStringLiteral("/@eaDir/thumbs"));
+            QDir().mkpath(p3Root + QStringLiteral("/#recycle/old"));
+            const QString p3Root2 = base + QStringLiteral("/phase3_root2");
+            QDir().mkpath(p3Root2 + QStringLiteral("/dirA"));
+
+            // FolderWatcher : repertoires ignores et diff incremental
+            CHECK(FolderWatcher::isIgnoredDirectoryName(QStringLiteral(".git")),
+                  "phase3: .git ignore par FolderWatcher");
+            CHECK(FolderWatcher::isIgnoredDirectoryName(QStringLiteral(".snapshots")),
+                  "phase3: .snapshots ignore par FolderWatcher");
+            CHECK(FolderWatcher::isIgnoredDirectoryName(QStringLiteral("@eaDir")),
+                  "phase3: @eaDir ignore par FolderWatcher");
+            CHECK(FolderWatcher::isIgnoredDirectoryName(QStringLiteral("#recycle")),
+                  "phase3: #recycle ignore par FolderWatcher");
+            CHECK(FolderWatcher::isIgnoredDirectoryName(QStringLiteral("$RECYCLE.BIN")),
+                  "phase3: $RECYCLE.BIN ignore par FolderWatcher");
+            CHECK(FolderWatcher::isIgnoredDirectoryName(QStringLiteral("System Volume Information")),
+                  "phase3: System Volume Information ignore par FolderWatcher");
+            CHECK(!FolderWatcher::isIgnoredDirectoryName(QStringLiteral("2026")),
+                  "phase3: 2026 non ignore par FolderWatcher");
+
+#ifdef Q_OS_LINUX
+            {
+                FolderWatcher watcher(50, 2000);
+                watcher.setTargets({{1, p3Root, true}});
+                // Attendu : p3Root, p3Root/2026, p3Root/2026/sub (3 watches ; .git/@eaDir/#recycle ignores)
+                CHECK(watcher.statusJson().value(QStringLiteral("watches")).toInt() == 3,
+                      "phase3: FolderWatcher ignore .git/@eaDir/#recycle (3 watches)");
+                // Meme cible -> diff no-op conserve les 3 watches
+                watcher.setTargets({{1, p3Root, true}});
+                CHECK(watcher.statusJson().value(QStringLiteral("watches")).toInt() == 3,
+                      "phase3: FolderWatcher setTargets identique conserve 3 watches");
+                // Ajout 2e cible -> +2 watches (p3Root2 + dirA = 5)
+                watcher.setTargets({{1, p3Root, true}, {2, p3Root2, true}});
+                CHECK(watcher.statusJson().value(QStringLiteral("watches")).toInt() == 5,
+                      "phase3: FolderWatcher ajout incremental -> 5 watches");
+                // Retrait 1re cible -> ne reste que p3Root2 + dirA (2 watches)
+                watcher.setTargets({{2, p3Root2, true}});
+                CHECK(watcher.statusJson().value(QStringLiteral("watches")).toInt() == 2,
+                      "phase3: FolderWatcher retrait incremental -> 2 watches");
+            }
+#endif
+
+            // Schema v9 FTS5 + pagination keyset (avec doublons taken_at et NULL taken_at)
+            const QString p3Db = base + QStringLiteral("/phase3.db");
+            PhotoRepository p3Repo(QStringLiteral("smoke-phase3"));
+            CHECK(p3Repo.open(p3Db), "phase3: ouverture base v9 (FTS5)");
+            const int fId = p3Repo.addFolder(p3Root, p3Root, QVariant(), true, false, QVariant(), nowIso());
+
+            struct SeedSpec { QString name; QVariant takenAt; };
+            const QVector<SeedSpec> specs = {
+                {QStringLiteral("IMG_2026_Sunset.jpg"), QStringLiteral("2026-05-01T10:00:00")},
+                {QStringLiteral("IMG_2026_Sunrise.jpg"), QStringLiteral("2026-05-01T10:00:00")}, // meme taken_at
+                {QStringLiteral("Portrait_Studio.ARW"), QStringLiteral("2026-05-02T12:00:00")},
+                {QStringLiteral("ab.jpg"),              QStringLiteral("2026-05-03T12:00:00")},
+                {QStringLiteral("quote\"test.jpg"),     QStringLiteral("2026-05-04T12:00:00")},
+                {QStringLiteral("nodate_one.jpg"),      QVariant()}, // NULL taken_at
+                {QStringLiteral("nodate_two.jpg"),      QVariant()}, // NULL taken_at
+            };
+            p3Repo.beginTransaction();
+            for (int i = 0; i < specs.size(); ++i) {
+                FileInfo fi;
+                fi.path = p3Root + QLatin1Char('/') + specs[i].name;
+                fi.directory = p3Root;
+                fi.filename = specs[i].name;
+                fi.extension = QStringLiteral(".jpg");
+                fi.fileType = QStringLiteral("jpeg");
+                fi.size = 500 + i;
+                fi.mtime = 1700001000 + i;
+                ExifData ex;
+                ex.ok = true;
+                ex.takenAt = specs[i].takenAt;
+                ex.cameraModel = QStringLiteral("CamP3");
+                const int id = p3Repo.insertFile(fId, fi, ex, true, nowIso());
+                LibraryFileLabels lbl = fileLabels(fi.filename, ex);
+                QVector<LibraryVersion> vers = {mergeVersion(0, QString(), nullptr, ex)};
+                p3Repo.storeLibrary(id, QStringLiteral("fp3"), lbl, vers);
+            }
+            p3Repo.commitTransaction();
+
+            // FTS5 trigram (>= 3 chars), fallback (< 3 chars), quote escaping
+            {
+                LibraryFilter fSun;
+                fSun.filename = QStringLiteral("sunset");
+                const QJsonObject rSun = p3Repo.libraryList(fSun, 1, 50);
+                CHECK(rSun.value(QStringLiteral("total")).toInt() == 1
+                      && rSun.value(QStringLiteral("items")).toArray().first().toObject()
+                             .value(QStringLiteral("filename")).toString() == QLatin1String("IMG_2026_Sunset.jpg"),
+                      "phase3: FTS5 trigram filename='sunset' trouve 1 match exact");
+
+                LibraryFilter fShort;
+                fShort.filename = QStringLiteral("ab");
+                const QJsonObject rShort = p3Repo.libraryList(fShort, 1, 50);
+                CHECK(rShort.value(QStringLiteral("total")).toInt() == 1,
+                      "phase3: filename < 3 chars ('ab') bascule sur instr et trouve 1 match");
+
+                LibraryFilter fQuote;
+                fQuote.filename = QStringLiteral("quote\"t");
+                const QJsonObject rQuote = p3Repo.libraryList(fQuote, 1, 50);
+                CHECK(rQuote.value(QStringLiteral("total")).toInt() == 1,
+                      "phase3: FTS5 echappe correctement les guillemets doubles");
+
+                const QJsonObject facetsSun = p3Repo.libraryFacets(fSun);
+                CHECK(facetsSun.value(QStringLiteral("rejected")).toObject()
+                          .value(QStringLiteral("all")).toInt() == 1,
+                      "phase3: libraryFacets utilise FTS5 filename filter");
+            }
+
+            // Pagination keyset complete (pageSize = 2) vs pagination offset
+            {
+                LibraryFilter allFilter;
+                const QJsonObject fullPage = p3Repo.libraryList(allFilter, 1, 50);
+                QVector<int> expectedIds;
+                for (const QJsonValue& v : fullPage.value(QStringLiteral("items")).toArray())
+                    expectedIds.append(v.toObject().value(QStringLiteral("id")).toInt());
+                CHECK(expectedIds.size() == 7, "phase3: 7 photos dans libraryList complet");
+
+                QVector<int> cursorIds;
+                QString cursor;
+                int rounds = 0;
+                while (rounds < 20) {
+                    ++rounds;
+                    bool valid = false;
+                    const QJsonObject pageObj = p3Repo.libraryList(
+                        allFilter, 1, 2, cursor, &valid, /*skipTotal=*/!cursor.isEmpty());
+                    CHECK(valid, "phase3: curseur valide accepte");
+                    if (!cursor.isEmpty())
+                        CHECK(!pageObj.contains(QStringLiteral("total")),
+                              "phase3: skipTotal=true omet le champ total");
+                    for (const QJsonValue& v : pageObj.value(QStringLiteral("items")).toArray())
+                        cursorIds.append(v.toObject().value(QStringLiteral("id")).toInt());
+                    const bool hasMore = pageObj.value(QStringLiteral("has_more")).toBool();
+                    const QJsonValue nextVal = pageObj.value(QStringLiteral("next_cursor"));
+                    if (!hasMore) {
+                        CHECK(nextVal.isNull(), "phase3: derniere page a next_cursor null");
+                        break;
+                    }
+                    cursor = nextVal.toString();
+                    CHECK(!cursor.isEmpty(), "phase3: page intermediaire a next_cursor non vide");
+                }
+                CHECK(cursorIds == expectedIds,
+                      "phase3: pagination keyset parcourt exactement les 7 photos (doublons + NULL taken_at)");
+
+                bool badValid = true;
+                p3Repo.libraryList(allFilter, 1, 2, QStringLiteral("!!!not-valid!!!"), &badValid);
+                CHECK(!badValid, "phase3: curseur invalide rejete (cursorValid=false)");
+            }
+
+            // Annulation cooperative de l'Indexer
+            {
+                writeBytes(p3Root + QStringLiteral("/2026/c1.jpg"), 120);
+                writeBytes(p3Root + QStringLiteral("/2026/c2.jpg"), 130);
+                Indexer cancelIdx(&p3Repo, nullptr, {p3Root}, 2000);
+                auto token = std::make_shared<std::atomic_bool>(true);
+                cancelIdx.setCancelToken(token);
+                const int cancelRun = cancelIdx.run(IndexMode::Incremental, {fId}, QStringLiteral("api"));
+                CHECK(cancelRun > 0, "phase3: Indexer annule cree un run proprement");
+                const QJsonObject lr = p3Repo.latestRun();
+                CHECK(lr.value(QStringLiteral("state")).toString() == QLatin1String("interrupted"),
+                      "phase3: passe annulee cloturee en state='interrupted'");
+                CHECK(lr.value(QStringLiteral("files_missing")).toInt() == 0
+                      && lr.value(QStringLiteral("files_unavailable")).toInt() == 0,
+                      "phase3: annulation ne marque aucun fichier disparu ni indisponible");
+            }
+
+            p3Repo.close();
+        }
     }
     QDir(base).removeRecursively();
 
