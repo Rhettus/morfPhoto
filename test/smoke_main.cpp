@@ -733,6 +733,23 @@ int main(int argc, char** argv) {
         LibraryFilter lowered; lowered.filename = QStringLiteral("b.jpg"); lowered.minRating = 2;
         CHECK(total(lowered) == 0, "sidecar modifie -> nouvelle note prise en compte");
 
+        const QJsonArray allItems = lrepo.libraryList({}, 1, 50).value(QStringLiteral("items")).toArray();
+        const int id1 = allItems.at(0).toObject().value(QStringLiteral("id")).toInt();
+        const int id2 = allItems.at(1).toObject().value(QStringLiteral("id")).toInt();
+        const QJsonArray batchRaw = lrepo.libraryPhotos({id2, id1, 999999}, true);
+        CHECK(batchRaw.size() == 2
+              && batchRaw.at(0).toObject().value(QStringLiteral("id")).toInt() == id2
+              && batchRaw.at(1).toObject().value(QStringLiteral("id")).toInt() == id1,
+              "libraryPhotos: ordre d'entree preserve et id inconnu ignore");
+        CHECK(batchRaw.at(0).toObject().contains(QStringLiteral("raw_exif"))
+              && batchRaw.at(1).toObject().contains(QStringLiteral("raw_exif")),
+              "libraryPhotos: raw_exif inclus si withRaw=true");
+        const QJsonArray batchNoRaw = lrepo.libraryPhotos({id2, id1}, false);
+        CHECK(batchNoRaw.size() == 2
+              && !batchNoRaw.at(0).toObject().contains(QStringLiteral("raw_exif"))
+              && !batchNoRaw.at(1).toObject().contains(QStringLiteral("raw_exif")),
+              "libraryPhotos: raw_exif omis si withRaw=false");
+
         lrepo.purgeFolder(libFolder);
         CHECK(lrepo.libraryList({}, 1, 50).value(QStringLiteral("total")).toInt() == 0,
               "purge: donnees XMP effacees avec le fichier");

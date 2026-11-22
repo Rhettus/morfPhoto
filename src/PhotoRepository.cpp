@@ -814,6 +814,10 @@ QJsonObject PhotoRepository::libraryPhoto(int fileId, bool* found) {
     return items.isEmpty() ? QJsonObject() : items.first().toObject();
 }
 
+QJsonArray PhotoRepository::libraryPhotos(const QVector<int>& fileIds, bool withRaw) {
+    return libraryItems(fileIds, {}, withRaw);
+}
+
 QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
     // Chaque liste ignore son propre choix : choisir un boitier ne masque pas les autres.
     auto counted = [this](const LibraryFilter& f, const QString& column, const QString& order,

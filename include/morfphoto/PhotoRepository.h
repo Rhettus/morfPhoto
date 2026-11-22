@@ -102,6 +102,7 @@ public:
     QJsonObject librarySubfolders(const QString& folder);
     QJsonObject libraryFacets(const LibraryFilter& filter);
     QJsonObject libraryPhoto(int fileId, bool* found);
+    QJsonArray libraryPhotos(const QVector<int>& fileIds, bool withRaw);
 
     // --- Passes d'indexation ---
     int  startRun(const QString& mode, const QString& trigger, const QString& startedAt);

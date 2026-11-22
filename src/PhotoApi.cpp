@@ -151,6 +151,26 @@ PhotoApi::Result PhotoApi::handle(const QByteArray& method, const QString& path,
         }
         if (seg.size() > 2)
             return error(404, QStringLiteral("not_found"), path);
+        if (seg.size() == 1 && query.hasQueryItem(QStringLiteral("ids"))) {
+            const QString rawIds = query.queryItemValue(QStringLiteral("ids"), QUrl::FullyDecoded).trimmed();
+            if (rawIds.isEmpty())
+                return items(QJsonArray{});
+            const QStringList parts = rawIds.split(QLatin1Char(','));
+            if (parts.size() > kMaxPageSize)
+                return error(400, QStringLiteral("bad_request"), QStringLiteral("ids invalide"));
+            QVector<int> ids;
+            ids.reserve(parts.size());
+            for (const QString& part : parts) {
+                bool okId = false;
+                const int id = part.trimmed().toInt(&okId);
+                if (!okId || id < 1)
+                    return error(400, QStringLiteral("bad_request"), QStringLiteral("ids invalide"));
+                ids.append(id);
+            }
+            const QString rawParam = query.queryItemValue(QStringLiteral("raw"));
+            const bool withRaw = rawParam == QLatin1String("true") || rawParam == QLatin1String("1");
+            return items(m_module->libraryPhotos(ids, withRaw));
+        }
         LibraryFilter filter;
         QString detail;
         if (!parseLibraryFilter(query, &filter, &detail))

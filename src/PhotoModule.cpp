@@ -765,6 +765,10 @@ QJsonObject PhotoModule::libraryPhoto(int fileId, bool* found) const {
     return m_readRepo->libraryPhoto(fileId, found);
 }
 
+QJsonArray PhotoModule::libraryPhotos(const QVector<int>& fileIds, bool withRaw) const {
+    return m_readRepo ? m_readRepo->libraryPhotos(fileIds, withRaw) : QJsonArray{};
+}
+
 // --- Contexte photographique (morfphoto-context/2) --------------------------
 
 QJsonArray PhotoModule::listContexts(const QString& status) const {

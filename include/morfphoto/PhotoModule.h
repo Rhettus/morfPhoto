@@ -81,6 +81,7 @@ public:
     QJsonObject librarySubfolders(const QString& folder) const;
     QJsonObject libraryFacets(const LibraryFilter& filter) const;
     QJsonObject libraryPhoto(int fileId, bool* found) const;
+    QJsonArray libraryPhotos(const QVector<int>& fileIds, bool withRaw) const;
 
     // --- Contexte photographique par répertoire (morfphoto-context/2) ---
     // Lectures : la liste des répertoires + leur contexte (écran de qualification

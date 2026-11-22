@@ -4,17 +4,25 @@
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Event, Thread
-from datetime import datetime, timezone
 from urllib.error import URLError
 
 from backfill import PhotoApi, pass_catalog
 from index import EmbeddingIndex
-from model import TextModel, EMBEDDING_VERSION
+from model import EMBEDDING_VERSION, TextModel
 from search import SemanticSearch
 from vision_worker import VisionWorker
+
+
+def _stat_tuple(path):
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except FileNotFoundError:
+        return None
 
 
 def main():
@@ -23,6 +31,7 @@ def main():
     if not 1 <= threads <= 16:
         raise ValueError("MORFPHOTO_CLIP_THREADS must be between 1 and 16")
     catalog = Path(os.environ.get("STATE_DIRECTORY", "/data")) / "photos.db"
+    catalog_wal = Path(str(catalog) + "-wal")
     key = os.environ.get("MORFPHOTO_API_KEY")
     api = PhotoApi(key)
     status = {}
@@ -43,7 +52,7 @@ def main():
     except Exception as error:
         report("error", {"last_error": type(error).__name__})
         raise
-    search = SemanticSearch(api, model, index)
+    search = SemanticSearch(api, model, index, catalog)
     searching = Event()
 
     class Handler(BaseHTTPRequestHandler):
@@ -75,18 +84,38 @@ def main():
         import time
 
         vision = VisionWorker(root / "model", threads, key)
-        quarantined = {}
+        last_catalog_stat = None
+        idle_clean = False
+        idle_ticks = 0
         while True:
-            try:
-                pass_catalog(catalog, api, vision, index, report, searching, quarantined)
-            except (URLError, TimeoutError, sqlite3.OperationalError) as error:
-                report("retrying", {"last_error": type(error).__name__})
-                print(f"CLIP backfill will retry: {error}", flush=True)
-            except Exception as error:
-                report("error", {"last_error": type(error).__name__})
-                vision.close()
-                raise
-            time.sleep(30)
+            current_stat = (_stat_tuple(catalog), _stat_tuple(catalog_wal))
+            if idle_clean and current_stat == last_catalog_stat:
+                idle_ticks += 1
+                if idle_ticks >= 6:
+                    vision.close()
+            else:
+                try:
+                    worked = pass_catalog(catalog, api, vision, index, report, searching)
+                except (URLError, TimeoutError, sqlite3.OperationalError) as error:
+                    idle_clean = False
+                    idle_ticks = 0
+                    report("retrying", {"last_error": type(error).__name__})
+                    print(f"CLIP backfill will retry: {error}", flush=True)
+                except Exception as error:
+                    report("error", {"last_error": type(error).__name__})
+                    vision.close()
+                    raise
+                else:
+                    if worked:
+                        idle_clean = False
+                        idle_ticks = 0
+                    else:
+                        last_catalog_stat = current_stat
+                        idle_clean = True
+                        idle_ticks += 1
+                        if idle_ticks >= 6:
+                            vision.close()
+            time.sleep(10)
 
     with HTTPServer(("127.0.0.1", 8794), Handler) as server:
         print("CLIP worker ready", flush=True)
