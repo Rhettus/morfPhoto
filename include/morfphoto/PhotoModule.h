@@ -77,6 +77,7 @@ public:
     QJsonArray  focals() const;
     QJsonArray  years() const;
     QJsonObject indexStatus() const;
+    QString     catalogRevision() const;
     // Export compact des photos presentes pour la couche d'analyse (morfAnalytics).
     QJsonObject photoDataset() const;
 
@@ -295,6 +296,12 @@ private:
     mutable std::list<LibraryPageCacheEntry> m_libraryPageCache;
     mutable QString                          m_prefetchInFlightKey;
     mutable QThreadPool                      m_prefetchPool;
+
+    // Cache de la revision persistante du catalogue (invalidee par writeEpoch/dataVersion).
+    mutable QMutex  m_catalogRevMutex;
+    mutable quint64 m_catalogRevEpoch = 0;
+    mutable qint64  m_catalogRevDataVer = -1;
+    mutable QString m_catalogRevValue;
 
     mutable QMutex m_stateMutex;         // protège le drapeau et l'état observable
     bool           m_indexing = false;

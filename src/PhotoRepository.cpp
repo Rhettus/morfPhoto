@@ -12,6 +12,7 @@
 #include <QSqlRecord>
 #include <QJsonDocument>
 #include <QJsonValue>
+#include <QCryptographicHash>
 #include <QVariant>
 #include <QDate>
 #include <QDateTime>
@@ -284,6 +285,35 @@ qint64 PhotoRepository::dataVersion() {
     if (!run(q, QStringLiteral("PRAGMA data_version")) || !q.next())
         return 0;
     return q.value(0).toLongLong();
+}
+
+QString PhotoRepository::catalogRevision() {
+    QSqlQuery q(db());
+    if (!run(q, QStringLiteral(
+             "SELECT "
+             "  (SELECT COUNT(*) FROM files),"
+             "  (SELECT COALESCE(MAX(id), 0) FROM files),"
+             "  (SELECT COUNT(*) FROM files WHERE state = 'present'),"
+             "  (SELECT COUNT(*) FROM library_versions),"
+             "  (SELECT COALESCE(MAX(id), 0) FROM library_versions),"
+             "  (SELECT COUNT(*) FROM folders WHERE deleted_at IS NULL),"
+             "  (SELECT COALESCE(SUM(enabled), 0) FROM folders WHERE deleted_at IS NULL),"
+             "  (SELECT COALESCE(MAX(id), 0) FROM index_runs),"
+             "  (SELECT COALESCE(MAX(finished_at), '') FROM index_runs),"
+             "  (SELECT COUNT(*) FROM folder_contexts),"
+             "  (SELECT COALESCE(MAX(indexed_at), '') FROM folder_contexts)"))
+        || !q.next())
+        return {};
+
+    QByteArray sig;
+    sig.reserve(160);
+    for (int i = 0; i < 11; ++i) {
+        if (i > 0)
+            sig.append('|');
+        sig.append(q.value(i).toString().toUtf8());
+    }
+    return QString::fromLatin1(
+        QCryptographicHash::hash(sig, QCryptographicHash::Sha256).toHex().left(16));
 }
 
 bool PhotoRepository::beginTransaction() {

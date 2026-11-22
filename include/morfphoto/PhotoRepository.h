@@ -47,6 +47,7 @@ public:
     void close();
     bool isOpen() const;
     qint64 dataVersion();
+    QString catalogRevision();
     QString openError() const { return m_openError; }  // detail si open() a echoue
 
     // --- Transactions par lot (indexation) ---

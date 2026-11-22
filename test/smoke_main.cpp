@@ -1137,14 +1137,46 @@ int main(int argc, char** argv) {
                   && r1.toLower().contains("connection: keep-alive"),
                   "phase2: Keep-Alive actif sur requete 1 (/healthz)");
 
-            // Requete 2 sur LA MEME socket : /api/v1/library (offload thread pool + gzip)
+            // Requete 2 sur LA MEME socket : /api/v1/library (offload thread pool + gzip + ETag)
             client.write("GET /api/v1/library?page_size=50 HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\n\r\n");
             client.flush();
             QByteArray r2;
             const bool gotR2 = readHttpResponse(client, r2);
+            QByteArray catEtag;
+            QByteArray catRev;
+            if (gotR2) {
+                for (const QByteArray& line : r2.left(r2.indexOf("\r\n\r\n")).split('\n')) {
+                    const QByteArray l = line.trimmed();
+                    if (l.toLower().startsWith("etag:"))
+                        catEtag = l.mid(l.indexOf(':') + 1).trimmed();
+                    else if (l.toLower().startsWith("x-catalog-revision:"))
+                        catRev = l.mid(l.indexOf(':') + 1).trimmed();
+                }
+            }
             CHECK(gotR2 && r2.startsWith("HTTP/1.1 200 OK")
-                  && r2.toLower().contains("content-encoding: gzip"),
-                  "phase2: requete 2 sur meme socket (/api/v1/library) servie en gzip");
+                  && r2.toLower().contains("content-encoding: gzip")
+                  && !catEtag.isEmpty() && !catRev.isEmpty(),
+                  "phase2: requete 2 sur meme socket (/api/v1/library) servie en gzip avec ETag/X-Catalog-Revision");
+
+            // Requete 2b : /api/v1/index/status expose le meme catalog_revision
+            client.write("GET /api/v1/index/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            client.flush();
+            QByteArray r2Status;
+            const bool gotR2Status = readHttpResponse(client, r2Status);
+            const QJsonObject idxStatusObj = gotR2Status
+                ? QJsonDocument::fromJson(r2Status.mid(r2Status.indexOf("\r\n\r\n") + 4)).object()
+                : QJsonObject();
+            CHECK(gotR2Status && r2Status.startsWith("HTTP/1.1 200 OK")
+                  && idxStatusObj.value(QStringLiteral("catalog_revision")).toString().toLatin1() == catRev,
+                  "phase3: /api/v1/index/status expose le meme catalog_revision que /api/v1/library");
+
+            // Requete 2c : /api/v1/library avec If-None-Match renvoie 304 Not Modified (0 octet)
+            client.write("GET /api/v1/library?page_size=50 HTTP/1.1\r\nHost: 127.0.0.1\r\nIf-None-Match: " + catEtag + "\r\n\r\n");
+            client.flush();
+            QByteArray r2NotMod;
+            const bool gotR2NotMod = readHttpResponse(client, r2NotMod);
+            CHECK(gotR2NotMod && r2NotMod.startsWith("HTTP/1.1 304 Not Modified"),
+                  "phase3: /api/v1/library avec If-None-Match renvoie 304 Not Modified");
 
             // Requete 3 sur LA MEME socket : /api/v1/library/facets (single-pass + cache)
             client.write("GET /api/v1/library/facets HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");

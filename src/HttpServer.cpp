@@ -339,22 +339,44 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
         if (isOffloadableRead && photos != nullptr) {
             QElapsedTimer timer;
             timer.start();
-            auto* watcher = new QFutureWatcher<PhotoApi::Result>(this);
-            connect(watcher, &QFutureWatcher<PhotoApi::Result>::finished, this,
+            struct ApiReadResult {
+                PhotoApi::Result api;
+                QByteArray extraHeaders;
+            };
+            const QByteArray ifNoneMatch = isLibraryPath
+                ? sock->property("ifNoneMatch").toByteArray()
+                : QByteArray();
+            auto* watcher = new QFutureWatcher<ApiReadResult>(this);
+            connect(watcher, &QFutureWatcher<ApiReadResult>::finished, this,
                     [this, sp = QPointer<QTcpSocket>(sock), watcher, timer, isLibraryPath] {
-                const PhotoApi::Result r = watcher->result();
+                const ApiReadResult r = watcher->result();
                 watcher->deleteLater();
                 const qint64 elapsedMs = timer.elapsed();
                 if (isLibraryPath && elapsedMs >= 500) {
-                    qWarning() << "morfPhoto slow library request:" << elapsedMs << "ms, HTTP" << r.code;
+                    qWarning() << "morfPhoto slow library request:" << elapsedMs << "ms, HTTP" << r.api.code;
                 }
                 if (!sp || sp->state() == QAbstractSocket::UnconnectedState)
                     return;
-                reply(sp, r.code, reasonFor(r.code), r.body, r.contentType, true);
+                reply(sp, r.api.code, reasonFor(r.api.code), r.api.body,
+                      r.api.contentType, true, r.extraHeaders);
             });
             watcher->setFuture(QtConcurrent::run(&m_apiReadPool,
-                [photos, method, pathStr, queryString, body] {
-                    return PhotoApi(photos).handle(method, pathStr, queryString, body);
+                [photos, method, pathStr, queryString, body, isLibraryPath, ifNoneMatch]() -> ApiReadResult {
+                    QByteArray extraHeaders;
+                    if (isLibraryPath && photos->libraryEnabled()) {
+                        const QByteArray rev = photos->catalogRevision().toLatin1();
+                        if (!rev.isEmpty()) {
+                            const QByteArray etag = "\"cat-" + rev + "\"";
+                            extraHeaders = "Cache-Control: private, no-cache\r\nETag: " + etag
+                                + "\r\nX-Catalog-Revision: " + rev + "\r\n";
+                            if (etagMatches(ifNoneMatch, etag)) {
+                                return {{304, QByteArray(), QByteArrayLiteral("application/json; charset=utf-8")},
+                                        extraHeaders};
+                            }
+                        }
+                    }
+                    PhotoApi::Result res = PhotoApi(photos).handle(method, pathStr, queryString, body);
+                    return {std::move(res), res.code == 200 ? extraHeaders : QByteArray()};
                 }));
             return;
         }
@@ -528,7 +550,7 @@ void HttpServer::reply(QTcpSocket* sock, int code, const QByteArray& reason, con
     header += "Content-Length: " + QByteArray::number(payload.size()) + "\r\n";
     // CORS ouvert en lecture seule uniquement : jamais sur une ecriture (CSRF).
     if (allowCors)
-        header += "Access-Control-Allow-Origin: *\r\n";
+        header += "Access-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: ETag, X-Catalog-Revision\r\n";
     header += extraHeaders;
     header += gzipHeaders;
     if (keepAlive)

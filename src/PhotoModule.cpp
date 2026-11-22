@@ -1188,7 +1188,29 @@ QJsonObject PhotoModule::indexStatus() const {
     } else {
         o["last_run"] = QJsonValue(QJsonValue::Null);
     }
+    o["catalog_revision"] = catalogRevision();
     return o;
+}
+
+QString PhotoModule::catalogRevision() const {
+    PhotoRepository* repo = readRepo();
+    if (!repo)
+        return {};
+    const quint64 epoch = m_writeEpoch.load(std::memory_order_acquire);
+    const qint64 dataVer = repo->dataVersion();
+    {
+        QMutexLocker lock(&m_catalogRevMutex);
+        if (m_catalogRevEpoch == epoch && m_catalogRevDataVer == dataVer && !m_catalogRevValue.isEmpty())
+            return m_catalogRevValue;
+    }
+    const QString rev = repo->catalogRevision();
+    {
+        QMutexLocker lock(&m_catalogRevMutex);
+        m_catalogRevEpoch = epoch;
+        m_catalogRevDataVer = dataVer;
+        m_catalogRevValue = rev;
+    }
+    return rev;
 }
 
 // --- Lectures ---------------------------------------------------------------
