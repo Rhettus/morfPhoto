@@ -61,7 +61,7 @@ if [ ! -e "$MARKER" ]; then
 fi
 
 if [ -n "${MORFPHOTO_CLIP_DIR:-}" ]; then
-    nice -n 10 /opt/morfphoto-clip/bin/python /opt/morfphoto-clip/worker.py &
+    /opt/morfphoto-clip/bin/python /opt/morfphoto-clip/worker.py &
 fi
 
 exec "$@"

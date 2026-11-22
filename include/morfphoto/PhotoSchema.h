@@ -23,7 +23,7 @@
 // -----------------------------------------------------------------------------
 namespace morfphoto {
 
-inline constexpr int kSchemaVersion = 7;
+inline constexpr int kSchemaVersion = 8;
 
 // Instructions de la migration 001 (création initiale). La colonne calculée
 // `taken_year` permet de regrouper par année sans reparser la date à chaque fois.
@@ -263,6 +263,19 @@ inline QStringList schemaV7Statements() {
     };
 }
 
+// Migration 008 : index composites et de filtrage pour accélérer les lectures et
+// les recherches de portée lors de l'indexation et des requêtes bibliothèque.
+inline QStringList schemaV8Statements() {
+    return {
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_files_folder_dir ON files(folder_id, directory)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_files_state_taken ON files(state, taken_at, id)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_library_ver_lookup ON library_versions(version, edited, file_id)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_library_rejected_rating ON library_versions(rejected, rating)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_library_ext ON library_files(ext_label)"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_library_kind ON library_files(kind_label)"),
+    };
+}
+
 // Instructions à exécuter pour atteindre une version de schéma donnée. Le dépôt
 // applique dans l'ordre chaque version manquante (voir applyMigrations).
 inline QStringList migrationStatements(int version) {
@@ -274,6 +287,7 @@ inline QStringList migrationStatements(int version) {
     case 5:  return schemaV5Statements();
     case 6:  return schemaV6Statements();
     case 7:  return schemaV7Statements();
+    case 8:  return schemaV8Statements();
     default: return {};
     }
 }

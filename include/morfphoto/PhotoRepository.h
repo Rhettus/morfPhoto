@@ -40,6 +40,11 @@ public:
     bool isOpen() const;
     QString openError() const { return m_openError; }  // detail si open() a echoue
 
+    // --- Transactions par lot (indexation) ---
+    bool beginTransaction();
+    bool commitTransaction();
+    void rollbackTransaction();
+
     // --- Dossiers (sélections) ---
     int  addFolder(const QString& path, const QString& rootPath, const QVariant& label,
                    bool recursive, bool removable, const QVariant& volumeLabel,
@@ -154,6 +159,7 @@ private:
 
     QString m_connectionName;
     QString m_openError;
+    bool m_inTransaction = false;
 };
 
 } // namespace morfphoto

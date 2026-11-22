@@ -951,6 +951,62 @@ int main(int argc, char** argv) {
                 ++nPresent;
         CHECK(nPresent == 550, "batch: touchSeen sur 550 IDs (>500)");
 
+        // 12) Optimisations Phase 1 : schema v8, transactions, symlinks hors racine,
+        //     touchSeen no-op sur present, filtres de dates sargables.
+        {
+            const QJsonArray batchTx = srepo.listFoldersDetail();
+            Q_UNUSED(batchTx);
+            CHECK(srepo.beginTransaction(), "tx: beginTransaction ouvre une transaction");
+            CHECK(!srepo.beginTransaction(), "tx: double beginTransaction retourne false");
+            FileInfo txFi;
+            txFi.path = batchDir + QStringLiteral("/tx_rollback.jpg");
+            txFi.directory = batchDir;
+            txFi.filename = QStringLiteral("tx_rollback.jpg");
+            txFi.extension = QStringLiteral(".jpg");
+            txFi.fileType = QStringLiteral("jpeg");
+            txFi.size = 42;
+            txFi.mtime = 1700000042;
+            srepo.insertFile(batchFolder, txFi, emptyExif, false, ts0);
+            srepo.rollbackTransaction();
+            CHECK(!srepo.existingFilesInFolder(batchFolder).contains(txFi.path),
+                  "tx: rollbackTransaction annule insertFile");
+
+            // Fichier inchange deja 'present' ne reecrit pas last_seen_at.
+            const QString untouchedPath = subA + QStringLiteral("/a1.jpg");
+            const int untouchedId = srepo.existingFilesInFolder(folderId).value(untouchedPath).id;
+            const QString seenBefore = srepo.getPhoto(untouchedId, nullptr).value(QStringLiteral("last_seen_at")).toString();
+            sidx.runScopes(IndexMode::Incremental, {{folderId, subA, false}}, QStringLiteral("inotify"));
+            const QString seenAfter = srepo.getPhoto(untouchedId, nullptr).value(QStringLiteral("last_seen_at")).toString();
+            CHECK(seenBefore == seenAfter,
+                  "phase1: fichier present inchange ne reecrit pas last_seen_at");
+
+            // Un fichier marque 'missing' qui reapparait est bien ravive en 'present'.
+            srepo.markMissing({untouchedId}, QStringLiteral("2026-01-01T00:00:00Z"));
+            CHECK(srepo.existingFilesInFolder(folderId).value(untouchedPath).state == QLatin1String("missing"),
+                  "phase1: fichier marque missing avant reapparition");
+            sidx.runScopes(IndexMode::Incremental, {{folderId, subA, false}}, QStringLiteral("inotify"));
+            CHECK(srepo.existingFilesInFolder(folderId).value(untouchedPath).state == QLatin1String("present"),
+                  "phase1: fichier missing reapparu ravive en present");
+
+#ifdef Q_OS_UNIX
+            // Lien symbolique pointant hors des racines est rejete meme avec le cache par dossier.
+            const QString outsideDir = base + QStringLiteral("/outside_root");
+            QDir().mkpath(outsideDir);
+            const QString outsideFile = outsideDir + QStringLiteral("/secret.jpg");
+            {
+                QFile f(outsideFile);
+                if (f.open(QIODevice::WriteOnly))
+                    f.write("out");
+            }
+            const QString escapeLink = subA + QStringLiteral("/escape.jpg");
+            QFile::link(outsideFile, escapeLink);
+            sidx.runScopes(IndexMode::Incremental, {{folderId, subA, false}}, QStringLiteral("inotify"));
+            CHECK(!srepo.existingFilesInFolder(folderId).contains(escapeLink),
+                  "phase1: symlink pointant hors racine rejete par Indexer");
+            QFile::remove(escapeLink);
+#endif
+        }
+
         srepo.close();
     }
     QDir(base).removeRecursively();

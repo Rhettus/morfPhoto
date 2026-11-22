@@ -105,9 +105,8 @@ private:
                         RunCounts& counts, QSet<QString>& unavailableRoots);
     void initProgress(int foldersTotal, qint64 initialFilesTotal);
     void finishPass(int runId, bool interrupted, const RunCounts& counts);
-    bool extract(int runId, const QString& path, RunCounts& counts, ExifData& out,
-                 QHash<QString, QPair<ExifData, QString>>& batch);
-    void applyLibrary(int fileId, const FileInfo& info, int runId, RunCounts& counts);
+    void applyLibrary(int fileId, const FileInfo& info, const ExifData* knownExif,
+                      int runId, RunCounts& counts);
 
     // Découverte du CONTEXTE (morfphoto-context/2) pour les répertoires scannés d'une
     // sélection. Appelée UNIQUEMENT après un scan complet et racine disponible (jamais
@@ -123,6 +122,7 @@ private:
     PhotoRepository* m_repo;
     ExifExtractor*   m_extractor;
     QStringList      m_roots;
+    QStringList      m_normalizedRoots;
     int              m_probeTimeoutMs;
     bool             m_library = false;
     int              m_exifWorkers = 1;

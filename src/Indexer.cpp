@@ -18,6 +18,7 @@
 #include <QFile>
 #include <QMutexLocker>
 
+#include <chrono>
 #include <utility>
 
 namespace morfphoto {
@@ -35,6 +36,7 @@ constexpr qint64 kMaxSidecarBytes = 64 * 1024 * 1024;
 Indexer::Indexer(PhotoRepository* repo, ExifExtractor* extractor, QStringList roots,
                  int probeTimeoutMs)
     : m_repo(repo), m_extractor(extractor), m_roots(std::move(roots)),
+      m_normalizedRoots(normalizeRoots(m_roots)),
       m_probeTimeoutMs(probeTimeoutMs) {}
 
 int Indexer::run(IndexMode mode, const QVector<int>& folderIds, const QString& trigger) {
@@ -275,15 +277,36 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
     } else {
         scan = scanFolder(
             cleanScopePath, scopeRecursive,
-            [this, &folder]() { return probeAccessible(folder.rootPath, m_probeTimeoutMs); },
+            [this, &folder, lastProbe = std::chrono::steady_clock::now()]() mutable {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - lastProbe < std::chrono::milliseconds(2000))
+                    return true;
+                lastProbe = now;
+                return probeAccessible(folder.rootPath, m_probeTimeoutMs);
+            },
             m_library);
     }
 
     // Défense en profondeur : filtrer une seule fois hors des racines globales.
+    // Cache canonique par répertoire pour les fichiers réguliers ; les liens
+    // symboliques sont vérifiés individuellement.
     QVector<const FileInfo*> allowedFiles;
     allowedFiles.reserve(scan.files.size());
+    QHash<QString, bool> dirAllowed;
     for (const FileInfo& info : scan.files) {
-        if (isWithinRoots(info.path, m_roots))
+        bool allowed = false;
+        if (info.isSymLink) {
+            allowed = isPathWithinNormalizedRoots(normalizePath(info.path), m_normalizedRoots);
+        } else {
+            auto dirIt = dirAllowed.constFind(info.directory);
+            if (dirIt == dirAllowed.constEnd()) {
+                allowed = isPathWithinNormalizedRoots(normalizePath(info.directory), m_normalizedRoots);
+                dirAllowed.insert(info.directory, allowed);
+            } else {
+                allowed = dirIt.value();
+            }
+        }
+        if (allowed)
             allowedFiles.push_back(&info);
     }
 
@@ -294,72 +317,137 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
         m_pFilesTotal = m_pFilesDiscovered;
     reportProgress(counts.seen);
 
-    constexpr qsizetype kExifBatchSize = 64;
-    QHash<QString, QPair<ExifData, QString>> exifBatch;
+    enum class ChunkAction {
+        Insert,
+        Update,
+        SidecarOnly,
+        TouchOnly
+    };
+    struct ChunkItem {
+        const FileInfo* info = nullptr;
+        ChunkAction     action = ChunkAction::TouchOnly;
+        int             knownId = 0;
+        QString         knownState;
+        bool            needsExif = false;
+        ExifData        exif;
+        bool            exifOk = false;
+        QString         exifError;
+    };
+
+    constexpr qsizetype kChunkSize = 64;
     QVector<int> touchedIds;
-    for (qsizetype i = 0; i < allowedFiles.size(); ++i) {
-        if (m_exifWorkers > 1 && m_extractor && i % kExifBatchSize == 0) {
-            QStringList paths;
-            const qsizetype end = qMin(i + kExifBatchSize, allowedFiles.size());
-            for (qsizetype j = i; j < end; ++j) {
-                const FileInfo& candidate = *allowedFiles.at(j);
-                const auto previous = known.constFind(candidate.path);
-                const bool needsExif = previous == known.constEnd() || mode == IndexMode::Full ||
-                    previous->size != candidate.size || previous->mtime != candidate.mtime ||
-                    (m_library && !fingerprints.contains(previous->id));
-                if (needsExif)
-                    paths.append(candidate.path);
+    for (qsizetype chunkStart = 0; chunkStart < allowedFiles.size(); chunkStart += kChunkSize) {
+        const qsizetype chunkEnd = qMin(chunkStart + kChunkSize, allowedFiles.size());
+        QVector<ChunkItem> chunk;
+        chunk.reserve(chunkEnd - chunkStart);
+        QStringList batchPaths;
+        bool hasDbWork = false;
+
+        for (qsizetype i = chunkStart; i < chunkEnd; ++i) {
+            const FileInfo& info = *allowedFiles.at(i);
+            ChunkItem item;
+            item.info = &info;
+
+            const auto it = known.constFind(info.path);
+            if (it == known.constEnd()) {
+                item.action = ChunkAction::Insert;
+                item.needsExif = true;
+            } else if (mode == IndexMode::Full || it->size != info.size || it->mtime != info.mtime) {
+                item.action = ChunkAction::Update;
+                item.knownId = it->id;
+                item.knownState = it->state;
+                item.needsExif = true;
+            } else {
+                item.knownId = it->id;
+                item.knownState = it->state;
+                if (m_library) {
+                    const auto fp = fingerprints.constFind(it->id);
+                    if (fp == fingerprints.constEnd()) {
+                        // Indexee avant l'activation : il manque les champs demandes a ExifTool.
+                        item.action = ChunkAction::Update;
+                        item.needsExif = true;
+                    } else if (*fp != info.sidecarFingerprint) {
+                        // Seul le sidecar a change : inutile de relire l'image.
+                        item.action = ChunkAction::SidecarOnly;
+                    }
+                }
             }
-            exifBatch = m_extractor->extractBatch(paths, m_exifWorkers);
+
+            if (item.action != ChunkAction::TouchOnly)
+                hasDbWork = true;
+            if (item.needsExif && m_extractor && m_exifWorkers > 1)
+                batchPaths.append(info.path);
+            chunk.push_back(std::move(item));
         }
-        const FileInfo& info = *allowedFiles.at(i);
-        ++counts.seen;
-        seen.insert(info.path);
-        dirs.insert(info.directory);
 
-        // Un gros dossier ne doit pas figer la barre : rafraîchir assez souvent
-        // pour qu'un corpus déséquilibré (10 / 5000 / 20) avance au fichier.
-        if (counts.seen % 25 == 0)
-            reportProgress(counts.seen);
+        // Extraire l'EXIF AVANT d'ouvrir la transaction SQLite (jamais de verrou
+        // d'ecriture tenu pendant qu'ExifTool tourne).
+        QHash<QString, QPair<ExifData, QString>> exifBatch;
+        if (m_extractor && m_exifWorkers > 1 && !batchPaths.isEmpty())
+            exifBatch = m_extractor->extractBatch(batchPaths, m_exifWorkers);
 
-        auto it = known.find(info.path);
-        if (it == known.end()) {
-            ExifData exif;
-            const bool ok = extract(runId, info.path, counts, exif, exifBatch);
-            const int fileId = m_repo->insertFile(folder.id, info, exif, ok, nowIso());
-            if (m_library && fileId > 0)
-                applyLibrary(fileId, info, runId, counts);
-            ++counts.created;
-        } else if (mode == IndexMode::Full || it->size != info.size || it->mtime != info.mtime) {
-            ExifData exif;
-            const bool ok = extract(runId, info.path, counts, exif, exifBatch);
-            m_repo->updateFile(it->id, info, exif, ok, nowIso());
-            if (m_library)
-                applyLibrary(it->id, info, runId, counts);
-            ++counts.updated;
-        } else {
-            bool updatedFile = false;
-            if (m_library) {
-                const auto fp = fingerprints.constFind(it->id);
-                if (fp == fingerprints.constEnd()) {
-                    // Indexee avant l'activation : il manque les champs demandes a ExifTool.
-                    ExifData exif;
-                    const bool ok = extract(runId, info.path, counts, exif, exifBatch);
-                    m_repo->updateFile(it->id, info, exif, ok, nowIso());
-                    applyLibrary(it->id, info, runId, counts);
-                    ++counts.updated;
-                    updatedFile = true;
-                } else if (*fp != info.sidecarFingerprint) {
-                    // Seul le sidecar a change : inutile de relire l'image.
-                    applyLibrary(it->id, info, runId, counts);
+        for (ChunkItem& item : chunk) {
+            ++counts.seen;
+            seen.insert(item.info->path);
+            dirs.insert(item.info->directory);
+
+            if (item.needsExif && m_extractor) {
+                if (auto cached = exifBatch.find(item.info->path); cached != exifBatch.end()) {
+                    item.exif = std::move(cached->first);
+                    item.exifError = std::move(cached->second);
+                    exifBatch.erase(cached);
+                } else {
+                    item.exif = m_extractor->extract(item.info->path, &item.exifError);
+                }
+                item.exifOk = item.exif.ok;
+            }
+
+            if (item.action != ChunkAction::Insert && item.action != ChunkAction::Update
+                && item.knownState != QLatin1String("present")) {
+                touchedIds.push_back(item.knownId);
+            }
+
+            // Un gros dossier ne doit pas figer la barre : rafraîchir assez souvent
+            // pour qu'un corpus déséquilibré (10 / 5000 / 20) avance au fichier.
+            if (counts.seen % 25 == 0)
+                reportProgress(counts.seen);
+        }
+
+        if (hasDbWork) {
+            const QString ts = nowIso();
+            const bool inTx = m_repo->beginTransaction();
+            for (const ChunkItem& item : chunk) {
+                const FileInfo& info = *item.info;
+                if (item.action == ChunkAction::Insert || item.action == ChunkAction::Update) {
+                    if (m_extractor && !item.exifOk) {
+                        // Une erreur d'extraction est journalisée et la passe continue.
+                        m_repo->logError(runId, info.path, QStringLiteral("exif"),
+                                         item.exifError, ts);
+                        ++counts.errors;
+                    }
+                    if (item.action == ChunkAction::Insert) {
+                        const int fileId = m_repo->insertFile(folder.id, info, item.exif,
+                                                              item.exifOk, ts);
+                        if (m_library && fileId > 0)
+                            applyLibrary(fileId, info, &item.exif, runId, counts);
+                        ++counts.created;
+                    } else {
+                        m_repo->updateFile(item.knownId, info, item.exif, item.exifOk, ts);
+                        if (m_library)
+                            applyLibrary(item.knownId, info, &item.exif, runId, counts);
+                        ++counts.updated;
+                    }
+                } else if (item.action == ChunkAction::SidecarOnly) {
+                    applyLibrary(item.knownId, info, nullptr, runId, counts);
                     ++counts.updated;
                 }
             }
-            if (!updatedFile)
-                touchedIds.push_back(it->id);
+            if (inTx)
+                m_repo->commitTransaction();
         }
     }
-    m_repo->touchSeen(touchedIds, nowIso());
+    if (!touchedIds.isEmpty())
+        m_repo->touchSeen(touchedIds, nowIso());
 
     // Point crucial : le verdict de disparition n'est FIABLE que si la racine a été
     // parcourue entièrement ET qu'elle répond toujours à la fin. Un scan incomplet
@@ -412,8 +500,10 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
     return false;
 }
 
-void Indexer::applyLibrary(int fileId, const FileInfo& info, int runId, RunCounts& counts) {
-    const ExifData base = m_repo->libraryBase(fileId);
+void Indexer::applyLibrary(int fileId, const FileInfo& info, const ExifData* knownExif,
+                           int runId, RunCounts& counts) {
+    ExifData loadedBase;
+    const ExifData& base = knownExif ? *knownExif : (loadedBase = m_repo->libraryBase(fileId));
     QVector<LibraryVersion> versions;
     for (const SidecarRef& ref : info.sidecars) {
         // `photo_01` et `photo_001` designent la meme version : garder la premiere.
@@ -443,6 +533,12 @@ void Indexer::applyLibrary(int fileId, const FileInfo& info, int runId, RunCount
 }
 
 void Indexer::refreshContexts(const QSet<QString>& directories, int runId, RunCounts& counts) {
+    bool inTx = false;
+    auto ensureTx = [&]() {
+        if (!inTx)
+            inTx = m_repo->beginTransaction();
+    };
+
     for (const QString& dir : directories) {
         const QString path = QDir(dir).filePath(ContextFile::fileName());
         const QFileInfo fi(path);
@@ -451,6 +547,7 @@ void Indexer::refreshContexts(const QSet<QString>& directories, int runId, RunCo
             // `.morfphoto.json` retiré depuis la dernière fois : effacer la projection.
             // (S'il n'a jamais existé, il n'y a pas de ligne : rien à faire.)
             if (m_ctxMtimes.contains(dir)) {
+                ensureTx();
                 m_repo->deleteContextRow(dir);
                 m_ctxMtimes.remove(dir);
             }
@@ -463,6 +560,7 @@ void Indexer::refreshContexts(const QSet<QString>& directories, int runId, RunCo
 
         QFile f(path);
         if (!f.open(QIODevice::ReadOnly)) {
+            ensureTx();
             m_repo->logError(runId, path, QStringLiteral("context"),
                              QStringLiteral("lecture impossible: %1").arg(f.errorString()),
                              nowIso());
@@ -475,6 +573,7 @@ void Indexer::refreshContexts(const QSet<QString>& directories, int runId, RunCo
         FolderContext fc = ContextFile::parse(bytes);
         fc.directory   = dir;
         fc.sourceMtime = mtime;
+        ensureTx();
         m_repo->upsertContext(fc);
         m_ctxMtimes[dir] = mtime;
 
@@ -490,27 +589,9 @@ void Indexer::refreshContexts(const QSet<QString>& directories, int runId, RunCo
                              nowIso());
         }
     }
-}
 
-bool Indexer::extract(int runId, const QString& path, RunCounts& counts, ExifData& out,
-                      QHash<QString, QPair<ExifData, QString>>& batch) {
-    if (!m_extractor)
-        return false;
-    QString error;
-    if (auto cached = batch.find(path); cached != batch.end()) {
-        out = std::move(cached->first);
-        error = std::move(cached->second);
-        batch.erase(cached);
-    } else {
-        out = m_extractor->extract(path, &error);
-    }
-    if (!out.ok) {
-        // Une erreur d'extraction est journalisée et la passe continue.
-        m_repo->logError(runId, path, QStringLiteral("exif"), error, nowIso());
-        ++counts.errors;
-        return false;
-    }
-    return true;
+    if (inTx)
+        m_repo->commitTransaction();
 }
 
 void Indexer::reportProgress(qint64 filesSeen) const {

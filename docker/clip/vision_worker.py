@@ -2,6 +2,7 @@
 """Run backfill preview and vision inference in a restartable process."""
 
 import multiprocessing
+import os
 from time import monotonic
 from urllib.error import HTTPError, URLError
 
@@ -15,6 +16,10 @@ START_TIMEOUT = 120
 
 
 def serve(connection, model_root, threads, key):
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
     with connection:
         model = VisionModel(model_root, threads)
         api = PhotoApi(key)

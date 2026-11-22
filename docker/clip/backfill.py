@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Build semantic vectors from the saved catalog and existing thumbnail API."""
 
+import inspect
 import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -65,9 +67,25 @@ class PhotoApi:
             return body
 
 
-def pass_catalog(catalog, api, vision, index, report, searching):
+def pass_catalog(catalog, api, vision, index, report, searching, indexing_poll_interval=5.0):
+    try:
+        sig = inspect.signature(report)
+        accepts_force = "force" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (TypeError, ValueError):
+        accepts_force = False
+
+    def emit(state, payload, force=True):
+        if accepts_force:
+            report(state, payload, force=force)
+        else:
+            report(state, payload)
+
     with closing(sqlite3.connect(catalog.as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("PRAGMA busy_timeout = 5000")
+        db.execute("PRAGMA cache_size = -32768")
+        db.execute("PRAGMA temp_store = MEMORY")
         rows = db.execute("""
             SELECT f.id, f.path, f.size, f.mtime
             FROM files f JOIN folders d ON d.id = f.folder_id
@@ -79,29 +97,19 @@ def pass_catalog(catalog, api, vision, index, report, searching):
         }
 
     eligible = len(rows)
-    indexed_count = 0
-    failed_count = 0
-    pending = []
-    for photo_id, path, size, mtime in rows:
-        rev = (path, size, mtime)
-        if index.has_revision(photo_id, rev):
-            indexed_count += 1
-        elif index.is_failed(photo_id, rev):
-            failed_count += 1
-        else:
-            pending.append((photo_id, path, size, mtime))
+    indexed_count, failed_count, pending = index.diff_catalog(rows)
 
     index.prune(non_missing_ids)
 
     if not pending:
-        report("idle", {
+        emit("idle", {
             "eligible": eligible,
             "indexed": indexed_count,
             "failed": failed_count,
             "photo_id": None,
             "pause_reason": None,
             "phase": "waiting",
-        })
+        }, force=True)
         return False
 
     progress = {
@@ -112,38 +120,64 @@ def pass_catalog(catalog, api, vision, index, report, searching):
         "pause_reason": None,
     }
 
+    last_indexing_check = None
+    last_indexing_result = False
+
     def pause_reason():
+        nonlocal last_indexing_check, last_indexing_result
         if searching.is_set():
             return "semantic_search"
-        if api.indexing():
+        now = monotonic()
+        if last_indexing_check is None or (now - last_indexing_check) >= indexing_poll_interval:
+            last_indexing_result = api.indexing()
+            last_indexing_check = now
+        if last_indexing_result:
             return "photo_indexing"
         return None
 
-    for photo_id, path, size, mtime in pending:
-        if reason := pause_reason():
-            report("paused", {**progress, "phase": "backfill", "pause_reason": reason})
-            return True
+    unflushed = 0
+    first_warming = True
+    try:
+        for photo_id, path, size, mtime in pending:
+            if reason := pause_reason():
+                index.flush()
+                emit("paused", {**progress, "phase": "backfill", "pause_reason": reason}, force=True)
+                return True
 
-        revision = fingerprint(path, size, mtime)
+            revision = fingerprint(path, size, mtime)
 
-        def report_phase(phase):
-            report("warming", {**progress, "phase": phase, "photo_id": photo_id})
+            def report_phase(phase):
+                nonlocal first_warming
+                emit("warming", {**progress, "phase": phase, "photo_id": photo_id}, force=first_warming)
+                first_warming = False
 
-        try:
-            vector = vision.image(path, report_phase)
-        except PhotoFailure as error:
-            index.record_failure(photo_id, revision, str(error))
-            progress["failed"] += 1
-            report("warming", {**progress, "phase": "photo_failed", "photo_id": photo_id,
-                               "last_error": str(error)})
-            print(f"CLIP skipped photo {photo_id}: {error}", flush=True)
-            continue
+            try:
+                vector = vision.image(path, report_phase)
+            except PhotoFailure as error:
+                index.record_failure(photo_id, revision, str(error), commit=False)
+                unflushed += 1
+                if unflushed >= 64:
+                    index.flush()
+                    unflushed = 0
+                progress["failed"] += 1
+                first_warming = False
+                emit("warming", {**progress, "phase": "photo_failed", "photo_id": photo_id,
+                                  "last_error": str(error)}, force=True)
+                print(f"CLIP skipped photo {photo_id}: {error}", flush=True)
+                continue
 
-        report_phase("save_embedding")
-        index.store(photo_id, revision, vector)
-        progress["last_progress_at"] = datetime.now(timezone.utc).isoformat()
-        progress["indexed"] += 1
-        report("warming", {**progress, "phase": "backfill", "pause_reason": None})
+            report_phase("save_embedding")
+            index.store(photo_id, revision, vector, commit=False)
+            unflushed += 1
+            if unflushed >= 64:
+                index.flush()
+                unflushed = 0
+            progress["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+            progress["indexed"] += 1
+            first_warming = False
+            emit("warming", {**progress, "phase": "backfill", "pause_reason": None}, force=False)
+    finally:
+        index.flush()
 
-    report("idle", {**progress, "photo_id": None, "phase": "waiting", "pause_reason": None})
+    emit("idle", {**progress, "photo_id": None, "phase": "waiting", "pause_reason": None}, force=True)
     return True

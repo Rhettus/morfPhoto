@@ -43,6 +43,7 @@ struct FileInfo {
     QString fileType;      // raw|jpeg|tiff|heic|png|webp|other
     qint64  size  = 0;
     qint64  mtime = 0;     // epoch entier, tel que le système de fichiers
+    bool    isSymLink = false;
     // Renseignés seulement quand la bibliothèque (xmp.enabled) est activée.
     QVector<SidecarRef> sidecars;
     QString sidecarFingerprint;

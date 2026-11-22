@@ -47,16 +47,44 @@ bool isImageExtension(const QString& ext) {
     return rawExtensions().contains(ext) || !explicitType(ext).isEmpty();
 }
 
-// Normalise un chemin en absolu : canonique si le chemin existe (résout liens et
-// `..`), sinon nettoyage lexical (résout `..` textuellement). Suffisant pour le
-// contrôle de périmètre.
+} // namespace
+
 QString normalizePath(const QString& path) {
+    if (path.isEmpty())
+        return {};
     const QFileInfo fi(path);
     const QString canonical = fi.canonicalFilePath();
     return canonical.isEmpty() ? QDir::cleanPath(fi.absoluteFilePath()) : canonical;
 }
 
-} // namespace
+QStringList normalizeRoots(const QStringList& roots) {
+    QStringList out;
+    out.reserve(roots.size());
+    for (const QString& root : roots) {
+        const QString base = normalizePath(root);
+        if (!base.isEmpty())
+            out.push_back(base);
+    }
+    return out;
+}
+
+bool isPathWithinNormalizedRoots(const QString& normalizedPath,
+                                 const QStringList& normalizedRoots) {
+    if (normalizedPath.isEmpty())
+        return false;
+    for (const QString& base : normalizedRoots) {
+        if (base.isEmpty())
+            continue;
+        if (base == QLatin1String("/")) {
+            if (normalizedPath.startsWith(QLatin1Char('/')))
+                return true;
+            continue;
+        }
+        if (normalizedPath == base || normalizedPath.startsWith(base + QLatin1Char('/')))
+            return true;
+    }
+    return false;
+}
 
 QString fileTypeFor(const QString& extension) {
     const QString ext = extension.toLower();
@@ -77,15 +105,7 @@ QString fileTypeFor(const QString& extension) {
 }
 
 bool isWithinRoots(const QString& candidate, const QStringList& roots) {
-    const QString target = normalizePath(candidate);
-    for (const QString& root : roots) {
-        const QString base = normalizePath(root);
-        if (base.isEmpty())
-            continue;
-        if (target == base || target.startsWith(base + QLatin1Char('/')))
-            return true;
-    }
-    return false;
+    return isPathWithinNormalizedRoots(normalizePath(candidate), normalizeRoots(roots));
 }
 
 bool probeAccessible(const QString& path, int timeoutMs) {
@@ -150,6 +170,7 @@ ScanResult scanFolder(const QString& folder, bool recursive,
         info.fileType  = fileTypeFor(ext);
         info.size      = fi.size();
         info.mtime     = fi.lastModified().toSecsSinceEpoch();
+        info.isSymLink = fi.isSymLink();
         res.files.push_back(info);
     }
     if (library)

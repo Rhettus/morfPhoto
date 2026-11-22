@@ -2,6 +2,8 @@
 """CPU inference for morfPhoto's pinned CLIP package."""
 
 import hashlib
+import threading
+from collections import OrderedDict
 from io import BytesIO
 
 import numpy as np
@@ -16,6 +18,8 @@ ASSETS = {
     "onnx/vision_model.onnx": "fd6e1402a588279d1723c7534d4bcba5bc0b14b47dfab0e46f8c47b8270d7d40",
     "tokenizer.json": "bc1f77d20440541dd073ebae6f6c401087c7d34e",
 }
+MEAN = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+DEVIATION = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
 
 def verify_assets(root, names):
@@ -44,6 +48,8 @@ def session(root, tower, threads):
     options = ort.SessionOptions()
     options.intra_op_num_threads = threads
     options.inter_op_num_threads = 1
+    if threads > 1:
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
     return ort.InferenceSession(
         str(root / "onnx" / f"{tower}_model.onnx"),
         sess_options=options,
@@ -61,17 +67,35 @@ class TextModel:
         if probe.ids[:7] != [49406, 320, 1125, 539, 320, 2368, 49407]:
             raise ValueError("Incompatible CLIP tokenizer")
         self.text_session = session(root, "text", threads)
+        self._input_names = tuple(item.name for item in self.text_session.get_inputs())
+        self._cache_lock = threading.Lock()
+        self._cache = OrderedDict()
 
     def text(self, query):
         if not query.strip() or len(query.encode("utf-8")) > 65536:
             raise ValueError("Invalid CLIP query")
+        with self._cache_lock:
+            cached = self._cache.get(query)
+            if cached is not None:
+                self._cache.move_to_end(query)
+                return cached
         tokens = self.tokenizer.encode(query)
         inputs = {
             "input_ids": np.asarray([tokens.ids], dtype=np.int64),
             "attention_mask": np.asarray([tokens.attention_mask], dtype=np.int64),
         }
-        feed = {item.name: inputs[item.name] for item in self.text_session.get_inputs()}
-        return normalize(self.text_session.run(["text_embeds"], feed)[0])
+        feed = {name: inputs[name] for name in self._input_names}
+        vec = normalize(self.text_session.run(["text_embeds"], feed)[0])
+        vec.flags.writeable = False
+        with self._cache_lock:
+            existing = self._cache.get(query)
+            if existing is not None:
+                self._cache.move_to_end(query)
+                return existing
+            self._cache[query] = vec
+            if len(self._cache) > 256:
+                self._cache.popitem(last=False)
+        return vec
 
 
 class VisionModel:
@@ -81,10 +105,9 @@ class VisionModel:
 
     def image(self, preview):
         with Image.open(BytesIO(preview)) as image:
+            image.draft("RGB", (224, 224))
             rgb = ImageOps.exif_transpose(image).convert("RGB")
             crop = ImageOps.fit(rgb, (224, 224), method=Image.Resampling.BICUBIC)
         pixels = np.asarray(crop, dtype=np.float32) / np.float32(255)
-        mean = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-        deviation = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
-        tensor = np.ascontiguousarray(((pixels - mean) / deviation).transpose(2, 0, 1)[None])
+        tensor = np.ascontiguousarray(((pixels - MEAN) / DEVIATION).transpose(2, 0, 1)[None])
         return normalize(self.vision_session.run(["image_embeds"], {"pixel_values": tensor})[0])

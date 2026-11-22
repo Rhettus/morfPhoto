@@ -42,6 +42,17 @@ struct ScanResult {
 // Classification DÉTERMINISTE (ne dépend que de l'extension), pas une analyse.
 QString fileTypeFor(const QString& extension);
 
+// Normalise un chemin en absolu : canonique si le chemin existe (résout liens et
+// `..`), sinon nettoyage lexical (résout `..` textuellement).
+QString normalizePath(const QString& path);
+
+// Normalise une liste de racines autorisées (en ignorant les entrées vides).
+QStringList normalizeRoots(const QStringList& roots);
+
+// Vrai si un chemin déjà normalisé est situé sous une des racines normalisées.
+bool isPathWithinNormalizedRoots(const QString& normalizedPath,
+                                 const QStringList& normalizedRoots);
+
 // Vrai si `candidate` est situé sous une des racines autorisées. Empêche
 // PhotoHub (ou une requête forgée) de faire indexer un chemin arbitraire.
 // Vérifie l'ascendance sur chemins normalisés : un `..` ne peut pas s'échapper.

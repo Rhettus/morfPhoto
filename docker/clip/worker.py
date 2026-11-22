@@ -5,9 +5,10 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
+from time import monotonic
 from urllib.error import URLError
 
 from backfill import PhotoApi, pass_catalog
@@ -35,14 +36,23 @@ def main():
     key = os.environ.get("MORFPHOTO_API_KEY")
     api = PhotoApi(key)
     status = {}
+    report_lock = Lock()
+    last_report_time = 0.0
 
-    def report(state, progress):
-        now = datetime.now(timezone.utc).isoformat()
-        status.update(progress)
-        status.update(state=state, updated_at=now)
-        pending = root / ".status.tmp"
-        pending.write_text(json.dumps(status, ensure_ascii=False))
-        pending.replace(root / "status.json")
+    def report(state, progress, force=True):
+        nonlocal last_report_time
+        with report_lock:
+            prev_state = status.get("state")
+            status.update(progress)
+            now_mono = monotonic()
+            if not force and state == prev_state and (now_mono - last_report_time) < 1.0:
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            status.update(state=state, updated_at=now)
+            pending = root / ".status.tmp"
+            pending.write_text(json.dumps(status, ensure_ascii=False))
+            pending.replace(root / "status.json")
+            last_report_time = now_mono
 
     print("CLIP worker loading model", flush=True)
     report("starting", {"phase": "model_load"})
@@ -54,13 +64,19 @@ def main():
         raise
     search = SemanticSearch(api, model, index, catalog)
     searching = Event()
+    search_lock = Lock()
+    active_searches = 0
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            nonlocal active_searches
             if self.path != "/search":
                 self.send_error(404)
                 return
-            searching.set()
+            with search_lock:
+                active_searches += 1
+                if active_searches == 1:
+                    searching.set()
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 131072:
@@ -72,7 +88,10 @@ def main():
             except (sqlite3.Error, URLError, TimeoutError):
                 status, result = 503, {"error": "semantic_search_unavailable"}
             finally:
-                searching.clear()
+                with search_lock:
+                    active_searches -= 1
+                    if active_searches == 0:
+                        searching.clear()
             body = json.dumps(result).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -117,10 +136,13 @@ def main():
                             vision.close()
             time.sleep(10)
 
-    with HTTPServer(("127.0.0.1", 8794), Handler) as server:
-        print("CLIP worker ready", flush=True)
-        Thread(target=backfill, daemon=True).start()
-        server.serve_forever()
+    try:
+        with ThreadingHTTPServer(("127.0.0.1", 8794), Handler) as server:
+            print("CLIP worker ready", flush=True)
+            Thread(target=backfill, daemon=True).start()
+            server.serve_forever()
+    finally:
+        index.close()
 
 
 if __name__ == "__main__":

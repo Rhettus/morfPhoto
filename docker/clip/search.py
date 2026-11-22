@@ -4,8 +4,20 @@
 import hashlib
 import json
 import sqlite3
-from contextlib import closing
-from datetime import datetime
+import threading
+from collections import OrderedDict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+_LIBRARY_FILE_FILTERS = ("kind", "camera", "body", "iso", "aperture", "focal", "shutter")
+
+
+def _stat_tuple(path):
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except FileNotFoundError:
+        return None
 
 
 def _parse_bounded_int(filters, key, maximum):
@@ -113,13 +125,14 @@ def _build_where(folder, recursive, filters):
 
     taken_from = _parse_date(filters, "taken_from")
     if taken_from:
-        clauses.append("substr(v.taken_at, 1, 10) >= ?")
+        clauses.append("v.taken_at >= ?")
         binds.append(taken_from)
 
     taken_to = _parse_date(filters, "taken_to")
     if taken_to:
-        clauses.append("substr(v.taken_at, 1, 10) <= ?")
-        binds.append(taken_to)
+        next_day = (datetime.strptime(taken_to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        clauses.append("v.taken_at < ?")
+        binds.append(next_day)
 
     norm_folder = folder
     while len(norm_folder) > 1 and norm_folder.endswith("/"):
@@ -145,11 +158,84 @@ def _build_where(folder, recursive, filters):
 
 
 class SemanticSearch:
+    _MAX_CACHE_ENTRIES = 4
+
     def __init__(self, api, model, index, catalog):
         self.api = api
         self.model = model
         self.index = index
         self.catalog = catalog
+        self._catalog_wal = Path(str(catalog) + "-wal")
+        self._local = threading.local()
+        self._cache_lock = threading.Lock()
+        self._candidate_cache = OrderedDict()
+
+    def close(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._local.conn = None
+            self._local.inode = None
+
+    def _get_db(self):
+        try:
+            st = self.catalog.stat()
+        except FileNotFoundError as exc:
+            raise sqlite3.OperationalError(f"Catalog database not found: {self.catalog}") from exc
+        inode = st.st_ino
+        db_stat = (st.st_mtime_ns, st.st_size, inode)
+        conn = getattr(self._local, "conn", None)
+        conn_inode = getattr(self._local, "inode", None)
+        if conn is not None and conn_inode == inode:
+            return conn, inode, db_stat
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._local.conn = None
+            self._local.inode = None
+        conn = sqlite3.connect(self.catalog.as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA cache_size = -32768")
+            conn.execute("PRAGMA temp_store = MEMORY")
+        except Exception:
+            conn.close()
+            raise
+        self._local.conn = conn
+        self._local.inode = inode
+        return conn, inode, db_stat
+
+    def _load_candidates(self, sql, binds):
+        db, inode, db_stat = self._get_db()
+        wal_stat = _stat_tuple(self._catalog_wal)
+        db.execute("BEGIN")
+        try:
+            data_version = db.execute("PRAGMA data_version").fetchone()[0]
+            cache_key = (inode, data_version, db_stat, wal_stat, sql, tuple(binds))
+            with self._cache_lock:
+                candidates = self._candidate_cache.get(cache_key)
+                if candidates is not None:
+                    self._candidate_cache.move_to_end(cache_key)
+                    return candidates
+            rows = db.execute(sql, binds).fetchall()
+            candidates = {row[0]: (row[1], row[2], row[3]) for row in rows}
+            with self._cache_lock:
+                self._candidate_cache[cache_key] = candidates
+                self._candidate_cache.move_to_end(cache_key)
+                while len(self._candidate_cache) > self._MAX_CACHE_ENTRIES:
+                    self._candidate_cache.popitem(last=False)
+            return candidates
+        finally:
+            try:
+                db.rollback()
+            except sqlite3.Error:
+                pass
 
     def search(self, request):
         text = request["text"]
@@ -170,6 +256,7 @@ class SemanticSearch:
             raise ValueError("Unsupported semantic search filter")
 
         where_sql, binds = _build_where(folder, recursive, filters)
+        needs_lf = any(_parse_str_list(filters, key) for key in _LIBRARY_FILE_FILTERS)
 
         params = {**filters, "folder_path": folder,
                   "recursive": "true" if recursive else "false",
@@ -186,18 +273,15 @@ class SemanticSearch:
 
         query = self.model.text(text)
 
+        lf_join = "JOIN library_files lf ON lf.file_id = f.id " if needs_lf else ""
         sql = (
             "SELECT f.id, f.path, f.size, f.mtime "
             "FROM files f "
-            "JOIN library_files lf ON lf.file_id = f.id "
-            "JOIN library_versions v ON v.file_id = f.id AND v.version = 0 "
+            + lf_join
+            + "JOIN library_versions v ON v.file_id = f.id AND v.version = 0 "
             "WHERE " + where_sql
         )
-        with closing(sqlite3.connect(self.catalog.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("PRAGMA busy_timeout = 5000")
-            rows = db.execute(sql, binds).fetchall()
-
-        candidates = {row[0]: (row[1], row[2], row[3]) for row in rows}
+        candidates = self._load_candidates(sql, binds)
         ranked, indexed = self.index.rank(query, candidates, limit, after)
 
         items = []
