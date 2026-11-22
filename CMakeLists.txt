@@ -23,6 +23,7 @@ set(CMAKE_AUTOMOC ON)
 # Sql : base SQLite locale du domaine photo (source de verite des metadonnees).
 # Concurrent : chaque passe d'indexation tourne sur un thread du pool.
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Sql Concurrent)
+find_package(ZLIB QUIET)
 
 # --- Enregistrement des compilations (best-effort) ------------------------
 # Chronometre le vrai travail des compilateurs et signale la duree a
@@ -91,6 +92,11 @@ target_link_libraries(morfPhoto
     PUBLIC  Qt6::Core Qt6::Network Qt6::Sql Qt6::Concurrent
     PRIVATE Qt6::Gui morfBeacon::morfBeacon)
 
+if(ZLIB_FOUND)
+    target_link_libraries(morfPhoto PRIVATE ZLIB::ZLIB)
+    target_compile_definitions(morfPhoto PRIVATE MORFPHOTO_HAS_ZLIB=1)
+endif()
+
 # Numero de version accessible depuis le code.
 target_compile_definitions(morfPhoto PUBLIC MORFPHOTO_VERSION="${PROJECT_VERSION}")
 
@@ -119,6 +125,6 @@ option(MORFPHOTO_BUILD_SMOKE "Compiler le test de fumee du domaine photo" OFF)
 if(MORFPHOTO_BUILD_SMOKE)
     enable_testing()
     add_executable(morfphoto_smoke test/smoke_main.cpp)
-    target_link_libraries(morfphoto_smoke PRIVATE morfPhoto::morfPhoto Qt6::Gui)
+    target_link_libraries(morfphoto_smoke PRIVATE morfPhoto::morfPhoto Qt6::Gui morfBeacon::morfBeacon)
     add_test(NAME smoke COMMAND morfphoto_smoke)
 endif()

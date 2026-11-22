@@ -13,6 +13,7 @@
 
 class QTcpServer;
 class QTcpSocket;
+class QNetworkAccessManager;
 
 namespace morfphoto {
 
@@ -50,16 +51,18 @@ private:
                const QByteArray& contentType = QByteArrayLiteral("application/json; charset=utf-8"),
                bool allowCors = false, const QByteArray& extraHeaders = {});
 
-    ServiceConfig   m_config;
-    QByteArray      m_apiKey;
-    ModuleRegistry* m_registry;
-    QTcpServer*     m_server;
-    QElapsedTimer   m_uptime;
-    QThreadPool     m_thumbnailPool;
-    int             m_thumbnailRequests = 0;
-    QThreadPool     m_cachedThumbnailPool;
-    int             m_cachedThumbnailRequests = 0;
-    int             m_semanticRequests = 0;
+    ServiceConfig          m_config;
+    QByteArray             m_apiKey;
+    ModuleRegistry*        m_registry;
+    QTcpServer*            m_server;
+    QNetworkAccessManager* m_proxyManager = nullptr;
+    QElapsedTimer          m_uptime;
+    QThreadPool            m_apiReadPool;
+    QThreadPool            m_thumbnailPool;
+    int                    m_thumbnailRequests = 0;
+    QThreadPool            m_cachedThumbnailPool;
+    int                    m_cachedThumbnailRequests = 0;
+    int                    m_semanticRequests = 0;
 };
 
 } // namespace morfphoto

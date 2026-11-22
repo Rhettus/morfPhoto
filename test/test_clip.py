@@ -975,5 +975,76 @@ class TestBackfill(unittest.TestCase):
         self.assertEqual(events4[-1][1]["eligible"], 3)
 
 
+class TestPhotoApiKeepAliveGzip(unittest.TestCase):
+    def test_keepalive_gzip_and_retry(self):
+        import gzip
+        import http.client
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+        from backfill import PhotoApi
+
+        payload = json.dumps({"items": [{"id": i} for i in range(100)]}).encode()
+        gz_payload = gzip.compress(payload)
+        calls = []
+
+        class FakeResp:
+            def __init__(self, status, body, headers=None, will_close=False):
+                self.status = status
+                self.reason = "OK" if status == 200 else "Not Found"
+                self._body = body
+                self.headers = headers or {}
+                self.will_close = will_close
+
+            def read(self, n=-1):
+                return self._body if n < 0 else self._body[:n]
+
+            def getheader(self, name, default=None):
+                for k, v in self.headers.items():
+                    if k.lower() == name.lower():
+                        return v
+                return default
+
+        conns = []
+
+        class FakeConn:
+            def __init__(self, host, port, timeout=30):
+                self.closed = False
+                self.reqs = 0
+                conns.append(self)
+
+            def request(self, method, path, headers=None):
+                calls.append((method, path, dict(headers or {})))
+                self.reqs += 1
+                if len(calls) == 2:
+                    raise http.client.RemoteDisconnected("stale")
+
+            def getresponse(self):
+                if len(calls) == 1:
+                    return FakeResp(200, gz_payload, {"Content-Encoding": "gzip"})
+                if len(calls) == 3:
+                    return FakeResp(200, b'{"ok":true}')
+                return FakeResp(404, b'{"error":"not_found"}')
+
+            def close(self):
+                self.closed = True
+
+        api = PhotoApi("secret")
+        with patch("backfill.http.client.HTTPConnection", FakeConn):
+            # 1) gzip decompression + Keep-Alive header
+            out1 = api.get("/api/v1/library?ids=1", 1024 * 1024)
+            self.assertEqual(out1, payload)
+            self.assertEqual(calls[0][2].get("Accept-Encoding"), "gzip")
+            self.assertEqual(calls[0][2].get("Authorization"), "Bearer secret")
+            # 2) stale socket raises RemoteDisconnected -> auto-reconnect & retry once
+            out2 = api.get("/api/v1/healthz", 65536)
+            self.assertEqual(out2, b'{"ok":true}')
+            self.assertEqual(len(conns), 2)
+            self.assertTrue(conns[0].closed)
+            # 3) 404 raises HTTPError with code 404
+            with self.assertRaises(HTTPError) as ctx:
+                api.get("/api/v1/thumbnail?path=/x", 65536)
+            self.assertEqual(ctx.exception.code, 404)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

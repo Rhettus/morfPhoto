@@ -3,8 +3,10 @@
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -211,7 +213,7 @@ class SemanticSearch:
         self._local.inode = inode
         return conn, inode, db_stat
 
-    def _load_candidates(self, sql, binds):
+    def _load_candidates(self, sql, binds, track_hit=False):
         db, inode, db_stat = self._get_db()
         wal_stat = _stat_tuple(self._catalog_wal)
         db.execute("BEGIN")
@@ -222,7 +224,7 @@ class SemanticSearch:
                 candidates = self._candidate_cache.get(cache_key)
                 if candidates is not None:
                     self._candidate_cache.move_to_end(cache_key)
-                    return candidates
+                    return (candidates, True) if track_hit else candidates
             rows = db.execute(sql, binds).fetchall()
             candidates = {row[0]: (row[1], row[2], row[3]) for row in rows}
             with self._cache_lock:
@@ -230,7 +232,7 @@ class SemanticSearch:
                 self._candidate_cache.move_to_end(cache_key)
                 while len(self._candidate_cache) > self._MAX_CACHE_ENTRIES:
                     self._candidate_cache.popitem(last=False)
-            return candidates
+            return (candidates, False) if track_hit else candidates
         finally:
             try:
                 db.rollback()
@@ -238,6 +240,9 @@ class SemanticSearch:
                 pass
 
     def search(self, request):
+        debug = os.environ.get("MORFPHOTO_HTTP_DEBUG") == "1"
+        t0 = time.perf_counter() if debug else 0.0
+
         text = request["text"]
         folder = request["folder_path"]
         recursive = request.get("recursive", False)
@@ -271,7 +276,12 @@ class SemanticSearch:
                 raise ValueError("Search cursor does not match the query")
             after = (float(score), int(photo_id))
 
-        query = self.model.text(text)
+        if debug:
+            t_text0 = time.perf_counter()
+            query = self.model.text(text)
+            text_ms = (time.perf_counter() - t_text0) * 1000.0
+        else:
+            query = self.model.text(text)
 
         lf_join = "JOIN library_files lf ON lf.file_id = f.id " if needs_lf else ""
         sql = (
@@ -281,11 +291,20 @@ class SemanticSearch:
             + "JOIN library_versions v ON v.file_id = f.id AND v.version = 0 "
             "WHERE " + where_sql
         )
-        candidates = self._load_candidates(sql, binds)
-        ranked, indexed = self.index.rank(query, candidates, limit, after)
+        if debug:
+            t_sql0 = time.perf_counter()
+            candidates, cache_hit = self._load_candidates(sql, binds, track_hit=True)
+            sql_ms = (time.perf_counter() - t_sql0) * 1000.0
+            t_rank0 = time.perf_counter()
+            ranked, indexed = self.index.rank(query, candidates, limit, after)
+            rank_ms = (time.perf_counter() - t_rank0) * 1000.0
+        else:
+            candidates = self._load_candidates(sql, binds)
+            ranked, indexed = self.index.rank(query, candidates, limit, after)
 
         items = []
         top = ranked[:limit]
+        t_hyd0 = time.perf_counter() if debug else 0.0
         if top:
             ids_param = ",".join(str(photo_id) for _, photo_id in top)
             result = json.loads(
@@ -300,6 +319,16 @@ class SemanticSearch:
         next_cursor = None
         if len(ranked) > limit:
             next_cursor = json.dumps([signature, *ranked[limit - 1]], separators=(",", ":"))
+        if debug:
+            hydrate_ms = (time.perf_counter() - t_hyd0) * 1000.0 if top else 0.0
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            print(
+                f"morfPhoto CLIP search text_ms={text_ms:.1f} sql_ms={sql_ms:.1f} "
+                f"rank_ms={rank_ms:.1f} hydrate_ms={hydrate_ms:.1f} total_ms={total_ms:.1f} "
+                f"cache_hit={1 if cache_hit else 0} eligible={len(candidates)} "
+                f"indexed={indexed} returned={len(items)}",
+                flush=True,
+            )
         return {"items": items, "next": next_cursor,
                 "eligible": len(candidates), "indexed": indexed,
                 "revision": self.index.version}

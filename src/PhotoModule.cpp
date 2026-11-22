@@ -13,12 +13,15 @@
 #include "morfphoto/Paths.h"
 
 #include <QThread>
+#include <QThreadStorage>
 #include <QTimer>
 #include <QtConcurrent>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QMutexLocker>
+#include <QWaitCondition>
 #include <QHostInfo>
 #include <QFile>
 #include <QImageReader>
@@ -40,6 +43,8 @@
 #include <QLoggingCategory>
 
 #include <future>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 namespace morfphoto {
@@ -99,7 +104,407 @@ QJsonObject findById(const QJsonArray& folders, int id) {
     }
     return {};
 }
+
+std::atomic<quint64> s_moduleInstanceCounter{0};
+
+void appendFilterField(QString& out, const QString& value) {
+    out += QString::number(value.size()) + QLatin1Char(':') + value + QLatin1Char('|');
+}
+
+void appendFilterList(QString& out, const QStringList& list) {
+    out += QString::number(list.size()) + QLatin1Char('[');
+    for (const QString& item : list)
+        appendFilterField(out, item);
+    out += QLatin1Char(']');
+}
+
+QString serializeLibraryFilter(const LibraryFilter& f) {
+    QString out;
+    out.reserve(128);
+    out += QStringLiteral("F:");
+    out += QString::number(f.minRating) + QLatin1Char('|');
+    appendFilterField(out, f.rejected);
+    appendFilterField(out, f.edited);
+    out += QString::number(f.labels) + QLatin1Char('|');
+    out += f.unlabeled ? QStringLiteral("1|") : QStringLiteral("0|");
+    appendFilterList(out, f.kinds);
+    appendFilterList(out, f.cameras);
+    appendFilterList(out, f.bodies);
+    appendFilterList(out, f.lenses);
+    appendFilterList(out, f.keywords);
+    appendFilterList(out, f.iso);
+    appendFilterList(out, f.aperture);
+    appendFilterList(out, f.focal);
+    appendFilterList(out, f.shutter);
+    appendFilterField(out, f.takenFrom);
+    appendFilterField(out, f.takenTo);
+    appendFilterField(out, f.folderPath);
+    out += f.recursive ? QStringLiteral("1|") : QStringLiteral("0|");
+    appendFilterField(out, f.filename);
+    return out;
+}
+
+// ExifTool -stay_open process pinned to its own QThread so QProcess never
+// crosses thread boundaries across QtConcurrent/HttpServer workers.
+class PersistentExifProcess {
+public:
+    explicit PersistentExifProcess(QString binary)
+        : m_binary(std::move(binary)) {}
+
+    ~PersistentExifProcess() {
+        shutdown();
+    }
+
+    bool start() {
+        QMutexLocker lock(&m_mutex);
+        if (m_thread)
+            return m_running;
+        m_shutdown = false;
+        m_thread = QThread::create([this]() { runLoop(); });
+        m_thread->start();
+        while (!m_started && !m_shutdown)
+            m_doneCond.wait(&m_mutex);
+        return m_running;
+    }
+
+    QByteArray extract(const QString& tag, const QString& path, int timeoutMs, bool* processOk) {
+        if (processOk)
+            *processOk = false;
+        if (path.contains(QLatin1Char('\n')) || path.contains(QLatin1Char('\r')))
+            return {};
+        QMutexLocker lock(&m_mutex);
+        if (!m_thread || !m_running || m_shutdown)
+            return {};
+        m_reqTag = tag;
+        m_reqPath = path;
+        m_reqTimeoutMs = timeoutMs;
+        m_respBytes.clear();
+        m_respProcessOk = false;
+        m_hasRequest = true;
+        m_reqDone = false;
+        m_reqCond.wakeOne();
+        while (!m_reqDone)
+            m_doneCond.wait(&m_mutex);
+        if (processOk)
+            *processOk = m_respProcessOk;
+        return std::move(m_respBytes);
+    }
+
+    void shutdown() {
+        QThread* t = nullptr;
+        {
+            QMutexLocker lock(&m_mutex);
+            m_shutdown = true;
+            m_reqCond.wakeOne();
+            t = m_thread;
+        }
+        if (t) {
+            t->wait();
+            delete t;
+            QMutexLocker lock(&m_mutex);
+            m_thread = nullptr;
+            m_running = false;
+        }
+    }
+
+private:
+    void runLoop() {
+        QProcess proc;
+        proc.setProcessChannelMode(QProcess::SeparateChannels);
+        proc.start(m_binary, {QStringLiteral("-stay_open"), QStringLiteral("True"),
+                              QStringLiteral("-@"), QStringLiteral("-")});
+        const bool ok = proc.waitForStarted(5000);
+        {
+            QMutexLocker lock(&m_mutex);
+            m_running = ok;
+            m_started = true;
+            m_doneCond.wakeAll();
+        }
+        if (!ok)
+            return;
+
+        quint64 counter = 0;
+        while (true) {
+            QString tag;
+            QString path;
+            int timeoutMs = 8000;
+            {
+                QMutexLocker lock(&m_mutex);
+                while (!m_hasRequest && !m_shutdown)
+                    m_reqCond.wait(&m_mutex);
+                if (m_shutdown)
+                    break;
+                tag = std::move(m_reqTag);
+                path = std::move(m_reqPath);
+                timeoutMs = m_reqTimeoutMs;
+                m_hasRequest = false;
+            }
+
+            bool procHealthy = false;
+            QByteArray result = executeOne(proc, ++counter, tag, path, timeoutMs, &procHealthy);
+
+            {
+                QMutexLocker lock(&m_mutex);
+                m_respBytes = std::move(result);
+                m_respProcessOk = procHealthy;
+                if (!procHealthy)
+                    m_running = false;
+                m_reqDone = true;
+                m_doneCond.wakeAll();
+            }
+            if (!procHealthy)
+                break;
+        }
+
+        if (proc.state() == QProcess::Running) {
+            proc.write("-stay_open\nFalse\n");
+            proc.waitForBytesWritten(3000);
+            if (!proc.waitForFinished(3000)) {
+                proc.kill();
+                proc.waitForFinished(1000);
+            }
+        }
+    }
+
+    static QByteArray executeOne(QProcess& proc, quint64 seq, const QString& tag,
+                                 const QString& path, int timeoutMs, bool* procHealthy) {
+        *procHealthy = false;
+        if (proc.state() != QProcess::Running)
+            return {};
+
+        const QByteArray marker = "{ready" + QByteArray::number(seq) + "}";
+        QByteArray payload;
+        payload += "-json\n-b\n";
+        payload += tag.toUtf8() + "\n";
+        payload += path.toUtf8() + "\n";
+        payload += "-execute" + QByteArray::number(seq) + "\n";
+
+        if (proc.write(payload) != payload.size() || !proc.waitForBytesWritten(timeoutMs)) {
+            proc.kill();
+            proc.waitForFinished(1000);
+            return {};
+        }
+
+        QElapsedTimer timer;
+        timer.start();
+        QByteArray buf;
+        int at = -1;
+        while ((at = ExifExtractor::markerPos(buf, marker)) < 0) {
+            if (proc.bytesAvailable() > 0) {
+                buf += proc.readAllStandardOutput();
+                continue;
+            }
+            if (proc.state() != QProcess::Running) {
+                buf += proc.readAllStandardOutput();
+                at = ExifExtractor::markerPos(buf, marker);
+                break;
+            }
+            const qint64 remaining = timeoutMs - timer.elapsed();
+            if (remaining <= 0 || !proc.waitForReadyRead(static_cast<int>(remaining))) {
+                proc.kill();
+                proc.waitForFinished(1000);
+                return {};
+            }
+            buf += proc.readAllStandardOutput();
+        }
+        if (at < 0 || proc.state() != QProcess::Running) {
+            proc.kill();
+            proc.waitForFinished(1000);
+            return {};
+        }
+
+        *procHealthy = true;
+        proc.readAllStandardError();
+
+        const QByteArray jsonBytes = buf.left(at).trimmed();
+        if (jsonBytes.isEmpty())
+            return {};
+
+        QJsonParseError pe{};
+        const QJsonDocument doc = QJsonDocument::fromJson(jsonBytes, &pe);
+        if (pe.error != QJsonParseError::NoError || !doc.isArray() || doc.array().isEmpty())
+            return {};
+
+        const QJsonObject obj = doc.array().first().toObject();
+        const QString keyName = tag.startsWith(QLatin1Char('-')) ? tag.mid(1) : tag;
+        QJsonValue val = obj.value(keyName);
+        if (val.isUndefined()) {
+            for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
+                if (it.key().compare(keyName, Qt::CaseInsensitive) == 0) {
+                    val = it.value();
+                    break;
+                }
+            }
+        }
+        if (!val.isString())
+            return {};
+        const QString s = val.toString();
+        if (s.startsWith(QLatin1String("base64:")))
+            return QByteArray::fromBase64(s.mid(7).toLatin1());
+        return {};
+    }
+
+    QString m_binary;
+    QMutex m_mutex;
+    QWaitCondition m_reqCond;
+    QWaitCondition m_doneCond;
+    QThread* m_thread = nullptr;
+    bool m_started = false;
+    bool m_running = false;
+    bool m_shutdown = false;
+    bool m_hasRequest = false;
+    bool m_reqDone = false;
+    QString m_reqTag;
+    QString m_reqPath;
+    int m_reqTimeoutMs = 8000;
+    QByteArray m_respBytes;
+    bool m_respProcessOk = false;
+};
+
+class ExifToolPreviewPool {
+public:
+    ExifToolPreviewPool(QString binary, bool stayOpen, int maxIdle)
+        : m_binary(std::move(binary))
+        , m_stayOpen(stayOpen)
+        , m_maxIdle(qBound(2, maxIdle, 6)) {}
+
+    ~ExifToolPreviewPool() {
+        close();
+    }
+
+    void close() {
+        std::vector<std::unique_ptr<PersistentExifProcess>> toClose;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_closed = true;
+            toClose.swap(m_idle);
+        }
+        toClose.clear();
+    }
+
+    bool isClosed() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_closed;
+    }
+
+    QByteArray extract(const QString& tag, const QString& path, int timeoutMs) {
+        if (path.contains(QLatin1Char('\n')) || path.contains(QLatin1Char('\r')))
+            return {};
+        if (!m_stayOpen)
+            return extractOnce(tag, path, timeoutMs);
+
+        std::unique_ptr<PersistentExifProcess> proc;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_closed)
+                return {};
+            if (!m_idle.empty()) {
+                proc = std::move(m_idle.back());
+                m_idle.pop_back();
+            }
+        }
+        if (!proc) {
+            proc = std::make_unique<PersistentExifProcess>(m_binary);
+            if (!proc->start())
+                return {};
+        }
+
+        bool procOk = false;
+        QByteArray bytes = proc->extract(tag, path, timeoutMs, &procOk);
+        if (procOk) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_closed && static_cast<int>(m_idle.size()) < m_maxIdle)
+                m_idle.push_back(std::move(proc));
+        }
+        return bytes;
+    }
+
+private:
+    QByteArray extractOnce(const QString& tag, const QString& path, int timeoutMs) {
+        QProcess process;
+        process.start(m_binary, {QStringLiteral("-b"), tag, QStringLiteral("--"), path});
+        if (!process.waitForStarted(timeoutMs) || !process.waitForFinished(timeoutMs)) {
+            process.kill();
+            process.waitForFinished(1000);
+            return {};
+        }
+        return process.readAllStandardOutput();
+    }
+
+    QString m_binary;
+    bool m_stayOpen = true;
+    int m_maxIdle = 4;
+    std::mutex m_mutex;
+    bool m_closed = false;
+    std::vector<std::unique_ptr<PersistentExifProcess>> m_idle;
+};
 } // namespace
+
+struct ThumbnailSupport {
+    ThumbnailSupport(QString binary, bool stayOpen, int maxIdle)
+        : previewPool(std::move(binary), stayOpen, maxIdle) {}
+
+    ~ThumbnailSupport() {
+        close();
+    }
+
+    void close() {
+        previewPool.close();
+    }
+
+    bool isClosed() {
+        return previewPool.isClosed();
+    }
+
+    void clearDirCache() {
+        std::lock_guard<std::mutex> lock(dirCanonicalMutex);
+        dirCanonicalCache.clear();
+    }
+
+    bool cachedProbeAccessible(const QString& rootPath, int probeMs) {
+        constexpr qint64 kProbeTtlMs = 5000;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        {
+            std::lock_guard<std::mutex> lock(probeMutex);
+            const auto it = probeCache.constFind(rootPath);
+            if (it != probeCache.constEnd() && now >= it.value().first &&
+                (now - it.value().first) < kProbeTtlMs)
+                return it.value().second;
+        }
+        const bool ok = probeAccessible(rootPath, probeMs);
+        const qint64 doneAt = QDateTime::currentMSecsSinceEpoch();
+        {
+            std::lock_guard<std::mutex> lock(probeMutex);
+            probeCache.insert(rootPath, {doneAt, ok});
+        }
+        return ok;
+    }
+
+    bool cachedIsDirWithinRoots(const QString& dir, const QStringList& normalizedRoots) {
+        {
+            std::lock_guard<std::mutex> lock(dirCanonicalMutex);
+            const auto it = dirCanonicalCache.constFind(dir);
+            if (it != dirCanonicalCache.constEnd())
+                return it.value();
+        }
+        const bool within = isPathWithinNormalizedRoots(normalizePath(dir), normalizedRoots);
+        {
+            std::lock_guard<std::mutex> lock(dirCanonicalMutex);
+            if (dirCanonicalCache.size() > 4096)
+                dirCanonicalCache.clear();
+            dirCanonicalCache.insert(dir, within);
+        }
+        return within;
+    }
+
+    std::mutex probeMutex;
+    QHash<QString, std::pair<qint64, bool>> probeCache;
+
+    std::mutex dirCanonicalMutex;
+    QHash<QString, bool> dirCanonicalCache;
+
+    ExifToolPreviewPool previewPool;
+};
 
 PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* parent)
     : IModule(id, QStringLiteral("photo"), parent) {
@@ -138,11 +543,45 @@ PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* 
     if (hasThumbnailWorkers && validWorkerCount(thumbnailWorkers))
         m_thumbnailWorkers = thumbnailWorkers;
     m_library = params.value(QStringLiteral("xmp")).toObject().value(QStringLiteral("enabled")).toBool(false);
+    m_instanceId = s_moduleInstanceCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+    m_thumbnailSupport = std::make_shared<ThumbnailSupport>(m_exiftoolBinary, m_stayOpen, m_thumbnailWorkers);
 }
 
 PhotoModule::~PhotoModule() {
-    if (m_started)
+    if (m_started.load(std::memory_order_acquire))
         stop();
+    if (m_thumbnailSupport)
+        m_thumbnailSupport->close();
+}
+
+PhotoRepository* PhotoModule::readRepo() const {
+    if (QThread::currentThread() == thread())
+        return m_readRepo;
+    if (!m_started.load(std::memory_order_acquire) || m_dbPath.isEmpty())
+        return nullptr;
+
+    struct WorkerRepoHolder {
+        std::unique_ptr<PhotoRepository> repo;
+        QString openedDbPath;
+        quint64 instanceId = 0;
+    };
+    static QThreadStorage<WorkerRepoHolder> tls;
+    static std::atomic<quint64> s_connCounter{0};
+
+    WorkerRepoHolder& holder = tls.localData();
+    if (!holder.repo || holder.openedDbPath != m_dbPath || holder.instanceId != m_instanceId) {
+        holder.repo.reset();
+        holder.openedDbPath.clear();
+        holder.instanceId = 0;
+        const quint64 connId = s_connCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto repo = std::make_unique<PhotoRepository>(QStringLiteral("morfphoto:read-%1").arg(connId));
+        if (!repo->open(m_dbPath, /*readOnly=*/true))
+            return nullptr;
+        holder.repo = std::move(repo);
+        holder.openedDbPath = m_dbPath;
+        holder.instanceId = m_instanceId;
+    }
+    return holder.repo.get();
 }
 
 bool PhotoModule::start() {
@@ -154,6 +593,11 @@ bool PhotoModule::start() {
         QMutexLocker lock(&m_stateMutex);
         m_lastError = QStringLiteral("db: ") + e;   // visible via /modules et /api/v1/index/status
         return false;
+    }
+
+    if (!m_thumbnailSupport || m_thumbnailSupport->isClosed()) {
+        QMutexLocker lock(&m_stateMutex);
+        m_thumbnailSupport = std::make_shared<ThumbnailSupport>(m_exiftoolBinary, m_stayOpen, m_thumbnailWorkers);
     }
 
     // Sources SMB poussées par PhotoHub : leurs points de montage sont des racines
@@ -197,8 +641,10 @@ bool PhotoModule::start() {
     if (m_realtime)
         startWatcher();
 
-    m_started = true;
-    if (!qEnvironmentVariableIsEmpty("MORFPHOTO_THUMBNAIL_CACHE_DIR")) {
+    const bool hasCacheDir = !qEnvironmentVariableIsEmpty("MORFPHOTO_THUMBNAIL_CACHE_DIR");
+    m_thumbnailEnabled.store(hasCacheDir, std::memory_order_release);
+    m_started.store(true, std::memory_order_release);
+    if (hasCacheDir) {
         m_thumbnailTimer = new QTimer(this);
         m_thumbnailTimer->setSingleShot(true);
         connect(m_thumbnailTimer, &QTimer::timeout, this, &PhotoModule::warmThumbnails);
@@ -264,7 +710,8 @@ void PhotoModule::submitRealtime() {
 }
 
 void PhotoModule::stop() {
-    m_started = false;
+    m_started.store(false, std::memory_order_release);
+    m_thumbnailEnabled.store(false, std::memory_order_release);
     if (m_thumbnailTimer) {
         delete m_thumbnailTimer;
         m_thumbnailTimer = nullptr;
@@ -276,6 +723,8 @@ void PhotoModule::stop() {
         m_thumbnailWarmPass = nullptr;
         m_thumbnailWarmStop.reset();
     }
+    if (m_thumbnailSupport)
+        m_thumbnailSupport->close();
     stopWatcher();
     if (m_watchTimer) {
         m_watchTimer->stop();
@@ -293,7 +742,7 @@ void PhotoModule::stop() {
 }
 
 void PhotoModule::warmThumbnails() {
-    if (!m_started || m_thumbnailWarmPass)
+    if (!m_started.load(std::memory_order_acquire) || m_thumbnailWarmPass)
         return;
     if (!m_exiftoolReady) {
         m_thumbnailTimer->start(10000);
@@ -314,17 +763,28 @@ void PhotoModule::warmThumbnails() {
         m_thumbnailWarmPass->deleteLater();
         m_thumbnailWarmPass = nullptr;
         m_thumbnailWarmStop.reset();
-        m_thumbnailChecked += result.checked;
+        m_thumbnailChecked.fetch_add(result.checked, std::memory_order_relaxed);
+        const qint64 currentWrites = m_thumbnailWrites->load(std::memory_order_relaxed);
         if (result.cached >= 0) {
-            m_thumbnailCached = result.cached;
+            const qint64 writesDuringWarm = qMax<qint64>(0, currentWrites - result.writesAtCount);
+            m_thumbnailCached.store(result.cached + writesDuringWarm, std::memory_order_relaxed);
             m_thumbnailCountedAt = QDateTime::currentMSecsSinceEpoch();
+        } else {
+            const qint64 prevCached = m_thumbnailCached.load(std::memory_order_relaxed);
+            const qint64 delta = currentWrites - m_thumbnailLastWrites;
+            if (prevCached >= 0 && delta > 0)
+                m_thumbnailCached.store(prevCached + delta, std::memory_order_relaxed);
         }
-        m_thumbnailCaughtUp = !result.more;
-        m_thumbnailTimer->start(result.more ? 250 : 10000);
+        m_thumbnailLastWrites = currentWrites;
+        m_thumbnailCaughtUp.store(!result.more, std::memory_order_relaxed);
+        if (m_thumbnailTimer)
+            m_thumbnailTimer->start(result.more ? 250 : 10000);
     });
+    const bool needCount = m_thumbnailCached.load(std::memory_order_relaxed) < 0 ||
+                           (QDateTime::currentMSecsSinceEpoch() - m_thumbnailCountedAt >= 600000);
     auto future = QtConcurrent::run([dbPath = m_dbPath, stop = m_thumbnailWarmStop,
                                     read = thumbnailReader(true, true), workers = m_thumbnailWorkers,
-                                    count = QDateTime::currentMSecsSinceEpoch() - m_thumbnailCountedAt >= 30000,
+                                    writes = m_thumbnailWrites, count = needCount,
                                     root = qEnvironmentVariable("MORFPHOTO_THUMBNAIL_CACHE_DIR")] {
         ThumbnailWarmBatch result;
         const QStorageInfo disk(root);
@@ -341,11 +801,12 @@ void PhotoModule::warmThumbnails() {
             if (stop->load())
                 return result;
             result.cached = cached;
+            result.writesAtCount = writes->load(std::memory_order_relaxed);
         }
         if (!disk.isValid() || disk.bytesAvailable() < kMinThumbnailFreeBytes)
             return result;
         PhotoRepository repo(QStringLiteral("morfphoto:thumbnail-warmer"));
-        if (!repo.open(dbPath))
+        if (!repo.open(dbPath, /*readOnly=*/true))
             return result;
         const QString checkpoint = QDir(root).filePath(QStringLiteral(".warm-through-") + QString::fromLatin1(kJpegThumbnailCacheVersion));
         qint64 cursor = 0;
@@ -356,7 +817,7 @@ void PhotoModule::warmThumbnails() {
         }
         if (const qint64 lastId = repo.lastPhotoId(); lastId >= 0 && lastId < cursor)
             cursor = 0;
-        const auto candidates = repo.thumbnailCandidates(cursor, 8 * workers);
+        const auto candidates = repo.thumbnailCandidates(cursor, 32 * workers);
         repo.close();
         std::atomic<qsizetype> next{0};
         const auto warm = [&] {
@@ -683,16 +1144,18 @@ QJsonObject PhotoModule::indexStatus() const {
         }
     }
     o["clip"] = clipStatus;
+    const qint64 cachedThumbnails = m_thumbnailCached.load(std::memory_order_relaxed);
     o["thumbnails"] = QJsonObject{
-        {"state", !m_thumbnailTimer ? "disabled" : indexing ? "paused" :
-                  m_thumbnailCaughtUp ? "idle" : "warming"},
+        {"state", !m_thumbnailEnabled.load(std::memory_order_acquire) ? "disabled" : indexing ? "paused" :
+                  m_thumbnailCaughtUp.load(std::memory_order_relaxed) ? "idle" : "warming"},
         {"workers", m_thumbnailWorkers},
-        {"checked", m_thumbnailChecked},
+        {"checked", m_thumbnailChecked.load(std::memory_order_relaxed)},
         {"generated", m_thumbnailWrites->load()},
-        {"cached", m_thumbnailCached < 0 ? QJsonValue() : QJsonValue(m_thumbnailCached)},
+        {"cached", cachedThumbnails < 0 ? QJsonValue() : QJsonValue(cachedThumbnails)},
     };
     bool found = false;
-    const QJsonObject runRaw = m_readRepo ? m_readRepo->latestRun(&found) : QJsonObject{};
+    PhotoRepository* repo = readRepo();
+    const QJsonObject runRaw = repo ? repo->latestRun(&found) : QJsonObject{};
     if (found) {
         QJsonObject run = runRaw;
         int lastFolders = 0;
@@ -712,13 +1175,13 @@ QJsonObject PhotoModule::indexStatus() const {
 // --- Lectures ---------------------------------------------------------------
 
 QJsonObject PhotoModule::summary() const {
-    if (!m_readRepo)
+    PhotoRepository* repo = readRepo();
+    if (!repo)
         return {};
     // Le resume est couteux (DISTINCT, jointures par repertoire) et PhotoHub l'interroge en
-    // boucle, sur le thread HTTP UNIQUE : pendant une indexation, les appels s'empilaient
-    // et /status (donc morfMonitor) comme PhotoHub expiraient. On le garde donc en cache :
-    // 10 s au repos, 60 s pendant une passe (les compteurs bougent, mais un resume legerement
-    // perime vaut mieux qu'un service muet). Meme thread que les autres lectures : pas de verrou.
+    // boucle : pendant une indexation, les appels s'empilaient et /status (donc morfMonitor)
+    // comme PhotoHub expiraient. On le garde donc en cache : 10 s au repos, 60 s pendant une
+    // passe (les compteurs bougent, mais un resume legerement perime vaut mieux qu'un service muet).
     bool indexing;
     {
         QMutexLocker lock(&m_stateMutex);
@@ -726,58 +1189,120 @@ QJsonObject PhotoModule::summary() const {
     }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     const qint64 ttl = indexing ? 60000 : 10000;
+    QMutexLocker summaryLock(&m_summaryMutex);
     if (m_summaryAtMs == 0 || now - m_summaryAtMs > ttl || m_summaryCache.isEmpty()) {
-        m_summaryCache = m_readRepo->summary();
+        m_summaryCache = repo->summary();
         m_summaryAtMs  = QDateTime::currentMSecsSinceEpoch();
     }
     return m_summaryCache;
 }
 QJsonObject PhotoModule::listPhotos(const QVariantMap& filters, int page, int pageSize) const {
-    return m_readRepo ? m_readRepo->listPhotos(filters, page, pageSize) : QJsonObject{};
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->listPhotos(filters, page, pageSize) : QJsonObject{};
 }
 QStringList PhotoModule::directorySample(const QString& directory, int count) const {
-    return m_readRepo ? m_readRepo->directorySample(directory, count) : QStringList{};
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->directorySample(directory, count) : QStringList{};
 }
 QJsonObject PhotoModule::getPhoto(int fileId, bool* found) const {
-    if (!m_readRepo) { if (found) *found = false; return {}; }
-    return m_readRepo->getPhoto(fileId, found);
+    PhotoRepository* repo = readRepo();
+    if (!repo) { if (found) *found = false; return {}; }
+    return repo->getPhoto(fileId, found);
 }
-QJsonArray PhotoModule::cameras() const { return m_readRepo ? m_readRepo->distinctCameras() : QJsonArray{}; }
-QJsonArray PhotoModule::lenses()  const { return m_readRepo ? m_readRepo->distinctLenses()  : QJsonArray{}; }
-QJsonArray PhotoModule::focals()  const { return m_readRepo ? m_readRepo->distinctFocals()  : QJsonArray{}; }
-QJsonArray PhotoModule::years()   const { return m_readRepo ? m_readRepo->years()           : QJsonArray{}; }
-QJsonObject PhotoModule::photoDataset() const { return m_readRepo ? m_readRepo->photoDataset() : QJsonObject{}; }
+QJsonArray PhotoModule::cameras() const {
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->distinctCameras() : QJsonArray{};
+}
+QJsonArray PhotoModule::lenses() const {
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->distinctLenses() : QJsonArray{};
+}
+QJsonArray PhotoModule::focals() const {
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->distinctFocals() : QJsonArray{};
+}
+QJsonArray PhotoModule::years() const {
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->years() : QJsonArray{};
+}
+QJsonObject PhotoModule::photoDataset() const {
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->photoDataset() : QJsonObject{};
+}
 
 // --- Bibliothèque -----------------------------------------------------------
 
+QJsonObject PhotoModule::cachedLibraryQuery(PhotoRepository* repo, const QString& key,
+                                             const std::function<QJsonObject()>& compute) const {
+    const quint64 epoch = m_writeEpoch.load(std::memory_order_acquire);
+    const qint64 dataVer = repo->dataVersion();
+    {
+        QMutexLocker lock(&m_libraryCacheMutex);
+        for (auto it = m_libraryCache.begin(); it != m_libraryCache.end(); ++it) {
+            if (it->writeEpoch == epoch && it->dataVersion == dataVer && it->key == key) {
+                m_libraryCache.splice(m_libraryCache.begin(), m_libraryCache, it);
+                return it->value;
+            }
+        }
+    }
+    const QJsonObject result = compute();
+    {
+        QMutexLocker lock(&m_libraryCacheMutex);
+        for (auto it = m_libraryCache.begin(); it != m_libraryCache.end(); ++it) {
+            if (it->writeEpoch == epoch && it->dataVersion == dataVer && it->key == key) {
+                m_libraryCache.splice(m_libraryCache.begin(), m_libraryCache, it);
+                return result;
+            }
+        }
+        m_libraryCache.push_front({epoch, dataVer, key, result});
+        if (m_libraryCache.size() > 16)
+            m_libraryCache.pop_back();
+    }
+    return result;
+}
+
 QJsonObject PhotoModule::librarySubfolders(const QString& folder) const {
-    return m_readRepo ? m_readRepo->librarySubfolders(folder) : QJsonObject{};
+    PhotoRepository* repo = readRepo();
+    if (!repo)
+        return {};
+    return cachedLibraryQuery(repo, QStringLiteral("S:") + folder,
+                              [&]() { return repo->librarySubfolders(folder); });
 }
 
 QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int pageSize) const {
-    return m_readRepo ? m_readRepo->libraryList(filter, page, pageSize) : QJsonObject{};
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->libraryList(filter, page, pageSize) : QJsonObject{};
 }
+
 QJsonObject PhotoModule::libraryFacets(const LibraryFilter& filter) const {
-    return m_readRepo ? m_readRepo->libraryFacets(filter) : QJsonObject{};
+    PhotoRepository* repo = readRepo();
+    if (!repo)
+        return {};
+    return cachedLibraryQuery(repo, serializeLibraryFilter(filter),
+                              [&]() { return repo->libraryFacets(filter); });
 }
 QJsonObject PhotoModule::libraryPhoto(int fileId, bool* found) const {
-    if (!m_readRepo) { if (found) *found = false; return {}; }
-    return m_readRepo->libraryPhoto(fileId, found);
+    PhotoRepository* repo = readRepo();
+    if (!repo) { if (found) *found = false; return {}; }
+    return repo->libraryPhoto(fileId, found);
 }
 
 QJsonArray PhotoModule::libraryPhotos(const QVector<int>& fileIds, bool withRaw) const {
-    return m_readRepo ? m_readRepo->libraryPhotos(fileIds, withRaw) : QJsonArray{};
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->libraryPhotos(fileIds, withRaw) : QJsonArray{};
 }
 
 // --- Contexte photographique (morfphoto-context/2) --------------------------
 
 QJsonArray PhotoModule::listContexts(const QString& status) const {
-    return m_readRepo ? m_readRepo->listContexts(status) : QJsonArray{};
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->listContexts(status) : QJsonArray{};
 }
 
 QJsonObject PhotoModule::getContext(const QString& directory) const {
-    if (!m_readRepo) return {};
-    return m_readRepo->getContext(directory);
+    PhotoRepository* repo = readRepo();
+    if (!repo) return {};
+    return repo->getContext(directory);
 }
 
 bool PhotoModule::putContext(const QString& directory, const QString& context,
@@ -847,6 +1372,7 @@ bool PhotoModule::putContext(const QString& directory, const QString& context,
     fc.sourceMtime = QFileInfo(filePath).lastModified().toSecsSinceEpoch();
     fc.status      = QStringLiteral("ok");
     m_readRepo->upsertContext(fc);
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
 
     if (out) *out = m_readRepo->getContext(directory);
     return true;
@@ -854,22 +1380,73 @@ bool PhotoModule::putContext(const QString& directory, const QString& context,
 
 std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requireCache, bool prewarm) const {
     const QString cacheRoot = qEnvironmentVariable("MORFPHOTO_THUMBNAIL_CACHE_DIR");
-    return [roots = m_roots, binary = m_exiftoolBinary, ready = m_exiftoolReady,
-            probeMs = m_probeTimeoutMs, cacheRoot, requireCache, prewarm,
-            writes = m_thumbnailWrites](const QString& path) -> QByteArray {
-        constexpr qint64 kShardBytes = 2 * 1024 * 1024;
-        if (!QDir::isAbsolutePath(path) || path.contains(QChar::Null))
+    qint64 shardBytes = 8LL * 1024 * 1024;
+    bool hasMaxMb = false;
+    const int maxMb = qEnvironmentVariableIntValue("MORFPHOTO_THUMBNAIL_MAX_MB", &hasMaxMb);
+    if (hasMaxMb && maxMb > 0)
+        shardBytes = qMax<qint64>(2LL * 1024 * 1024, (qint64(maxMb) * 1024LL * 1024LL) / 4096LL);
+
+    QStringList roots;
+    bool ready = false;
+    std::shared_ptr<ThumbnailSupport> support;
+    {
+        QMutexLocker lock(&m_stateMutex);
+        roots = m_roots;
+        ready = m_exiftoolReady;
+        support = m_thumbnailSupport;
+    }
+    if (!support)
+        support = std::make_shared<ThumbnailSupport>(m_exiftoolBinary, m_stayOpen, m_thumbnailWorkers);
+
+    QStringList cleanedRoots;
+    cleanedRoots.reserve(roots.size());
+    for (const QString& root : roots) {
+        if (!root.isEmpty())
+            cleanedRoots.push_back(QDir::cleanPath(root));
+    }
+    const QStringList normalizedRoots = normalizeRoots(roots);
+
+    return [cleanedRoots, normalizedRoots, ready, probeMs = m_probeTimeoutMs,
+            cacheRoot, shardBytes, requireCache, prewarm,
+            writes = m_thumbnailWrites, support](const QString& path) -> QByteArray {
+        if (path.isEmpty() || !QDir::isAbsolutePath(path) || path.contains(QChar::Null))
             return {};
         const bool cacheEnabled = QDir::isAbsolutePath(cacheRoot) && QDir(cacheRoot).exists();
         if (requireCache && !cacheEnabled)
             return {};
-        const QFileInfo file(QDir::cleanPath(path));
-        const auto underRoot = std::any_of(roots.begin(), roots.end(), [&](const QString& root) {
-            const QString prefix = QDir::cleanPath(root);
-            return file.absoluteFilePath().startsWith(prefix.endsWith('/') ? prefix : prefix + '/');
-        });
-        if (!underRoot || !probeAccessible(file.absolutePath(), probeMs) ||
-            !isWithinRoots(file.absoluteFilePath(), roots) || !file.isFile())
+
+        const QString cleanPath = QDir::cleanPath(path);
+        QString matchingRoot;
+        for (const QString& root : cleanedRoots) {
+            if (root == QLatin1String("/")) {
+                matchingRoot = root;
+                break;
+            }
+            if (cleanPath.startsWith(root + QLatin1Char('/'))) {
+                matchingRoot = root;
+                break;
+            }
+        }
+        if (matchingRoot.isEmpty()) {
+            for (const QString& root : normalizedRoots) {
+                if (root == QLatin1String("/")) {
+                    matchingRoot = root;
+                    break;
+                }
+                if (cleanPath.startsWith(root + QLatin1Char('/'))) {
+                    matchingRoot = root;
+                    break;
+                }
+            }
+        }
+        if (matchingRoot.isEmpty() || !support->cachedProbeAccessible(matchingRoot, probeMs))
+            return {};
+
+        const QFileInfo file(cleanPath);
+        const bool contained = file.isSymLink()
+            ? isPathWithinNormalizedRoots(normalizePath(file.absoluteFilePath()), normalizedRoots)
+            : support->cachedIsDirWithinRoots(file.absolutePath(), normalizedRoots);
+        if (!contained || !file.isFile())
             return {};
 
         const qint64 size = file.size();
@@ -903,25 +1480,17 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
             QImageReader reader(file.absoluteFilePath(), "jpeg");
             jpeg = encodeGridImage(readGridImage(reader));
         } else {
-            auto extract = [&](const QString& tag) -> QByteArray {
-                QProcess process;
-                process.start(binary, {QStringLiteral("-b"), tag, QStringLiteral("--"),
-                                       file.absoluteFilePath()});
-                if (!process.waitForStarted(requireCache ? 1000 : 3000) ||
-                    !process.waitForFinished(requireCache ? 3000 : 8000)) {
-                    process.kill();
-                    process.waitForFinished(1000);
-                    return {};
-                }
-                return process.readAllStandardOutput();
-            };
+            const int extractTimeoutMs = requireCache ? 3000 : 8000;
+            const QString filePath = file.absoluteFilePath();
             int edge = 0;
-            jpeg = gridThumbnail(extract(QStringLiteral("-ThumbnailImage")), &edge);
-            for (const auto& tag : {QStringLiteral("-PreviewImage"), QStringLiteral("-JpgFromRaw")}) {
+            for (const auto& tag : {QStringLiteral("-PreviewImage"),
+                                    QStringLiteral("-JpgFromRaw"),
+                                    QStringLiteral("-ThumbnailImage")}) {
                 if (edge >= kThumbnailEdge)
                     break;
                 int previewEdge = 0;
-                auto preview = gridThumbnail(extract(tag), &previewEdge);
+                auto preview = gridThumbnail(support->previewPool.extract(tag, filePath, extractTimeoutMs),
+                                             &previewEdge);
                 if (!preview.isEmpty() && previewEdge > edge) {
                     jpeg = std::move(preview);
                     edge = previewEdge;
@@ -951,16 +1520,16 @@ std::function<QByteArray(const QString&)> PhotoModule::thumbnailReader(bool requ
         for (const QFileInfo& entry : entries)
             if (entry.absoluteFilePath() != target && entry.absoluteFilePath() != previous)
                 bytes += entry.size();
-        if (prewarm && bytes > kShardBytes)
+        if (prewarm && bytes > shardBytes)
             return jpeg;
         for (const QFileInfo& entry : entries) {
-            if (bytes <= kShardBytes)
+            if (bytes <= shardBytes)
                 break;
             if (entry.absoluteFilePath() != target && entry.absoluteFilePath() != previous &&
                 QFile::remove(entry.absoluteFilePath()))
                 bytes -= entry.size();
         }
-        if (bytes <= kShardBytes) {
+        if (bytes <= shardBytes) {
             QSaveFile output(target);
             if (output.open(QIODevice::WriteOnly) && output.write(jpeg) == jpeg.size() &&
                 output.commit()) {
@@ -991,6 +1560,7 @@ bool PhotoModule::deleteContext(const QString& directory, QJsonObject* out, QStr
         return false;
     }
     m_readRepo->deleteContextRow(directory);
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     if (out) *out = m_readRepo->getContext(directory);   // status:"unqualified"
     return true;
 }
@@ -998,18 +1568,29 @@ bool PhotoModule::deleteContext(const QString& directory, QJsonObject* out, QStr
 // --- Dossiers ---------------------------------------------------------------
 
 QJsonArray PhotoModule::listFolders() const {
-    return m_readRepo ? m_readRepo->listFoldersDetail() : QJsonArray{};
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->listFoldersDetail() : QJsonArray{};
 }
 
 QJsonArray PhotoModule::allowedRoots() const {
+    QStringList roots;
+    {
+        QMutexLocker lock(&m_stateMutex);
+        roots = m_roots;
+    }
     QJsonArray arr;
-    for (const QString& root : m_roots)
+    for (const QString& root : roots)
         arr.append(root);
     return arr;
 }
 
 QString PhotoModule::matchingRoot(const QString& path) const {
-    for (const QString& root : m_roots)
+    QStringList roots;
+    {
+        QMutexLocker lock(&m_stateMutex);
+        roots = m_roots;
+    }
+    for (const QString& root : roots)
         if (isWithinRoots(path, {root}))
             return root;
     return {};
@@ -1028,11 +1609,15 @@ bool PhotoModule::addSource(const QString& host, const QString& share, const QSt
         return false;
     }
     const QString mp = src.value(QStringLiteral("mountpoint")).toString();
+    std::shared_ptr<ThumbnailSupport> support;
     {
         QMutexLocker lock(&m_stateMutex);
         if (!m_roots.contains(mp))
             m_roots << mp;
+        support = m_thumbnailSupport;
     }
+    if (support)
+        support->clearDirCache();
     // Reactiver une selection eventuellement desactivee avant que la racine existe.
     // Pas d'indexation automatique : PhotoHub la declenche apres choix du dossier.
     reconcileRoots();
@@ -1096,6 +1681,7 @@ bool PhotoModule::addFolder(const QString& path, const QVariant& label, bool rec
         if (!restoreFolder(existing, out))
             return false;
         m_readRepo->setFolderMedia(existing, removable, volumeLabel);
+        m_writeEpoch.fetch_add(1, std::memory_order_release);
         if (out) *out = findById(m_readRepo->listFoldersDetail(), existing);
         refreshWatcher();
         return true;
@@ -1103,6 +1689,7 @@ bool PhotoModule::addFolder(const QString& path, const QVariant& label, bool rec
 
     const int id = m_readRepo->addFolder(path, root, label, recursive, removable, volumeLabel, nowIso());
     if (id < 0) { if (error) *error = QStringLiteral("insertion impossible"); return false; }
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     if (out) *out = findById(m_readRepo->listFoldersDetail(), id);
     refreshWatcher();
     return true;
@@ -1112,6 +1699,7 @@ bool PhotoModule::setFolderEnabled(int folderId, bool enabled, QJsonObject* out)
     if (!m_readRepo || !m_readRepo->getFolder(folderId))
         return false;
     m_readRepo->setFolderEnabled(folderId, enabled);
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     if (out) *out = findById(m_readRepo->listFoldersDetail(), folderId);
     refreshWatcher();
     return true;
@@ -1122,6 +1710,7 @@ bool PhotoModule::setFolderMedia(int folderId, bool removable, const QVariant& v
     if (!m_readRepo || !m_readRepo->getFolder(folderId))
         return false;
     m_readRepo->setFolderMedia(folderId, removable, volumeLabel);
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     if (out) *out = findById(m_readRepo->listFoldersDetail(), folderId);
     return true;
 }
@@ -1130,6 +1719,7 @@ bool PhotoModule::setFolderAnalyticsExcluded(int folderId, bool excluded, QJsonO
     if (!m_readRepo || !m_readRepo->getFolder(folderId))
         return false;
     m_readRepo->setFolderAnalyticsExcluded(folderId, excluded);
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     if (out) *out = findById(m_readRepo->listFoldersDetail(), folderId);
     return true;
 }
@@ -1171,6 +1761,7 @@ QJsonObject PhotoModule::purge(const QString& scope, const QVariant& value) {
         o["error"] = QStringLiteral("portee inconnue: %1").arg(scope);
         return o;
     }
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     o["deleted"] = deleted;
     refreshWatcher();
     return o;
@@ -1181,6 +1772,7 @@ bool PhotoModule::removeFolder(int folderId) {
         return false;
     // Retrait DOUX : historique conservé, sélection désactivée (voir contrat).
     m_readRepo->softDeleteFolder(folderId, nowIso());
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     refreshWatcher();
     return true;
 }
@@ -1189,6 +1781,7 @@ bool PhotoModule::restoreFolder(int folderId, QJsonObject* out) {
     if (!m_readRepo || !m_readRepo->getFolder(folderId))
         return false;
     m_readRepo->restoreFolder(folderId);
+    m_writeEpoch.fetch_add(1, std::memory_order_release);
     refreshWatcher();
     if (out) *out = findById(m_readRepo->listFoldersDetail(), folderId);
     // Raviver les fichiers tout de suite plutôt que d'attendre la passe périodique.
@@ -1199,6 +1792,13 @@ bool PhotoModule::restoreFolder(int folderId, QJsonObject* out) {
 void PhotoModule::reconcileRoots() {
     if (!m_readRepo)
         return;
+    QStringList roots;
+    {
+        QMutexLocker lock(&m_stateMutex);
+        roots = m_roots;
+    }
+    const QStringList normalizedRoots = normalizeRoots(roots);
+    bool changed = false;
     const QJsonArray folders = m_readRepo->listFoldersDetail();
     for (const QJsonValue& v : folders) {
         const QJsonObject f = v.toObject();
@@ -1206,20 +1806,26 @@ void PhotoModule::reconcileRoots() {
         const QString path = f.value(QStringLiteral("path")).toString();
         const bool enabled = f.value(QStringLiteral("enabled")).toInt() == 1;
         const bool autoDisabled = f.value(QStringLiteral("auto_disabled")).toInt() == 1;
-        const bool covered = isWithinRoots(path, m_roots);
-        if (!covered && enabled)
+        const bool covered = isPathWithinNormalizedRoots(normalizePath(path), normalizedRoots);
+        if (!covered && enabled) {
             m_readRepo->setFolderAutoDisabled(id, true);
-        else if (covered && autoDisabled)
+            changed = true;
+        } else if (covered && autoDisabled) {
             m_readRepo->setFolderAutoDisabled(id, false);
+            changed = true;
+        }
     }
+    if (changed)
+        m_writeEpoch.fetch_add(1, std::memory_order_release);
 }
 
 // --- /modules ---------------------------------------------------------------
 
 QJsonObject PhotoModule::statusJson() const {
     QJsonObject o = observableState();
-    if (m_readRepo && m_readRepo->isOpen()) {
-        const QJsonObject s = m_readRepo->statusCounts();
+    PhotoRepository* repo = readRepo();
+    if (repo && repo->isOpen()) {
+        const QJsonObject s = repo->statusCounts();
         o["files_present"]  = s.value(QStringLiteral("files_present"));
         o["files_missing"]  = s.value(QStringLiteral("files_missing"));
         o["folders_active"] = s.value(QStringLiteral("folders_active"));
@@ -1228,7 +1834,7 @@ QJsonObject PhotoModule::statusJson() const {
         // morfMonitor de distinguer une indexation terminée normalement d'une passe
         // interrompue par une source indisponible, sans parser tout `last_run`.
         bool found = false;
-        const QJsonObject run = m_readRepo->latestRun(&found);
+        const QJsonObject run = repo->latestRun(&found);
         o["last_index_state"] = found ? run.value(QStringLiteral("state"))
                                       : QJsonValue(QJsonValue::Null);
     }

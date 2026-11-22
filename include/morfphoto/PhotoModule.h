@@ -7,6 +7,7 @@
 #pragma once
 #include <atomic>
 #include <functional>
+#include <list>
 #include <memory>
 #include "morfphoto/IModule.h"
 #include "morfphoto/Indexer.h"
@@ -46,6 +47,7 @@ namespace morfphoto {
 
 class PhotoRepository;
 class FolderWatcher;
+struct ThumbnailSupport;
 
 class PhotoModule : public IModule {
     Q_OBJECT
@@ -164,9 +166,13 @@ private:
     struct ThumbnailWarmBatch {
         int checked = 0;
         qint64 cached = -1;
+        qint64 writesAtCount = 0;
         bool more = false;
     };
 
+    PhotoRepository* readRepo() const;
+    QJsonObject cachedLibraryQuery(PhotoRepository* repo, const QString& key,
+                                   const std::function<QJsonObject()>& compute) const;
     void reconcileRoots();
     void doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes, QString trigger); // thread du pool
     QString matchingRoot(const QString& path) const;
@@ -207,16 +213,21 @@ private:
     QString     m_exiftoolDetail;        // version si prêt, sinon cause de l'échec
 
     PhotoRepository* m_readRepo = nullptr;  // connexion du thread principal
+    quint64          m_instanceId = 0;
+    std::atomic<quint64> m_writeEpoch{0};
     QTimer*          m_watchTimer = nullptr;
     int              m_thumbnailWorkers = 4;
     QTimer*          m_thumbnailTimer = nullptr;
+    std::atomic<bool> m_thumbnailEnabled{false};
     QFutureWatcher<ThumbnailWarmBatch>* m_thumbnailWarmPass = nullptr;
     std::shared_ptr<std::atomic_bool> m_thumbnailWarmStop;
     std::shared_ptr<std::atomic<qint64>> m_thumbnailWrites = std::make_shared<std::atomic<qint64>>(0);
-    qint64 m_thumbnailChecked = 0;
-    qint64 m_thumbnailCached = -1;
+    std::shared_ptr<ThumbnailSupport> m_thumbnailSupport;
+    std::atomic<qint64> m_thumbnailChecked{0};
+    std::atomic<qint64> m_thumbnailCached{-1};
+    qint64 m_thumbnailLastWrites = 0;
     qint64 m_thumbnailCountedAt = 0;
-    bool m_thumbnailCaughtUp = false;
+    std::atomic<bool> m_thumbnailCaughtUp{false};
 
     bool           m_realtime = false;     // defaut : aucune surveillance de fond
     int            m_debounceMs = 2000;
@@ -225,9 +236,21 @@ private:
     QTimer*        m_realtimeRetry = nullptr;
     QVector<IndexScope> m_pendingRealtime; // portees en attente d'une passe
 
-    // Cache du resume (thread HTTP uniquement) : voir PhotoModule::summary().
+    // Cache du resume (protege par m_summaryMutex) : voir PhotoModule::summary().
+    mutable QMutex      m_summaryMutex;
     mutable QJsonObject m_summaryCache;
     mutable qint64      m_summaryAtMs = 0;
+
+    // Cache LRU borne (max 16 entrees) pour libraryFacets / librarySubfolders.
+    struct LibraryCacheEntry {
+        quint64     writeEpoch = 0;
+        qint64      dataVersion = 0;
+        QString     key;
+        QJsonObject value;
+    };
+    mutable QMutex                       m_libraryCacheMutex;
+    mutable std::list<LibraryCacheEntry> m_libraryCache;
+
     mutable QMutex m_stateMutex;         // protège le drapeau et l'état observable
     bool           m_indexing = false;
     QString        m_startedAt;          // ISO UTC, lisible (API existante)
@@ -246,7 +269,7 @@ private:
     QString m_progPhase;
     QString m_progCurrentFolder;
     int     m_lastFoldersTotal = 0;
-    bool           m_started = false;
+    std::atomic<bool> m_started{false};
 };
 
 } // namespace morfphoto

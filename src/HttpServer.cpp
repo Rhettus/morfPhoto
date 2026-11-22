@@ -30,8 +30,16 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkProxy>
+#include <QCryptographicHash>
+#include <QThread>
 #include <QtConcurrent>
 
+#ifdef MORFPHOTO_HAS_ZLIB
+#include <zlib.h>
+#endif
+
+#include <atomic>
+#include <memory>
 #include <utility>
 
 namespace morfphoto {
@@ -58,6 +66,7 @@ QByteArray reasonFor(int code) {
         case 200: return "OK";
         case 201: return "Created";
         case 202: return "Accepted";
+        case 304: return "Not Modified";
         case 400: return "Bad Request";
         case 401: return "Unauthorized";
         case 403: return "Forbidden";
@@ -69,22 +78,70 @@ QByteArray reasonFor(int code) {
         default:  return "OK";
     }
 }
+
+bool etagMatches(const QByteArray& ifNoneMatch, const QByteArray& etag) {
+    if (ifNoneMatch.isEmpty())
+        return false;
+    for (const QByteArray& raw : ifNoneMatch.split(',')) {
+        QByteArray token = raw.trimmed();
+        if (token.startsWith("W/"))
+            token = token.mid(2).trimmed();
+        if (token == etag)
+            return true;
+    }
+    return false;
+}
+
+#ifdef MORFPHOTO_HAS_ZLIB
+QByteArray gzipCompress(const QByteArray& input) {
+    if (input.isEmpty())
+        return {};
+    z_stream zs{};
+    if (deflateInit2(&zs, Z_BEST_SPEED, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        return {};
+    zs.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input.constData()));
+    zs.avail_in = static_cast<uInt>(input.size());
+
+    QByteArray out;
+    out.resize(static_cast<qsizetype>(deflateBound(&zs, zs.avail_in)) + 32);
+    int rc = Z_OK;
+    do {
+        if (static_cast<qsizetype>(zs.total_out) >= out.size())
+            out.resize(out.size() + 16384);
+        zs.next_out = reinterpret_cast<Bytef*>(out.data() + zs.total_out);
+        zs.avail_out = static_cast<uInt>(out.size() - static_cast<qsizetype>(zs.total_out));
+        rc = deflate(&zs, Z_FINISH);
+    } while (rc == Z_OK);
+
+    const auto totalOut = static_cast<qsizetype>(zs.total_out);
+    deflateEnd(&zs);
+    if (rc != Z_STREAM_END)
+        return {};
+    out.resize(totalOut);
+    return out;
+}
+#endif
 } // namespace
 
 HttpServer::HttpServer(ServiceConfig config, ModuleRegistry* registry, QObject* parent)
     : QObject(parent),
       m_config(std::move(config)),
       m_registry(registry),
-      m_server(new QTcpServer(this)) {
+      m_server(new QTcpServer(this)),
+      m_proxyManager(new QNetworkAccessManager(this)) {
     connect(m_server, &QTcpServer::newConnection, this, &HttpServer::onNewConnection);
+    m_proxyManager->setProxy(QNetworkProxy::NoProxy);
     // L'environnement prime : un secret de conteneur n'a pas a vivre dans un fichier.
-    m_thumbnailPool.setMaxThreadCount(2);
-    m_cachedThumbnailPool.setMaxThreadCount(2);
+    m_apiReadPool.setMaxThreadCount(qBound(2, QThread::idealThreadCount(), 4));
+    m_thumbnailPool.setMaxThreadCount(qBound(4, QThread::idealThreadCount(), 8));
+    m_cachedThumbnailPool.setMaxThreadCount(8);
     const QString envKey = qEnvironmentVariable("MORFPHOTO_API_KEY").trimmed();
     m_apiKey = (envKey.isEmpty() ? m_config.apiKey.trimmed() : envKey).toUtf8();
 }
 
-HttpServer::~HttpServer() = default;
+HttpServer::~HttpServer() {
+    stop();
+}
 
 bool HttpServer::start() {
     if (m_config.httpPort == 0)
@@ -96,13 +153,20 @@ bool HttpServer::start() {
     return m_server->listen(addr, m_config.httpPort);
 }
 
-void HttpServer::stop()            { m_server->close(); }
+void HttpServer::stop() {
+    if (m_server)
+        m_server->close();
+    m_apiReadPool.waitForDone();
+    m_thumbnailPool.waitForDone();
+    m_cachedThumbnailPool.waitForDone();
+}
 bool HttpServer::isListening() const { return m_server->isListening(); }
 quint16 HttpServer::port() const   { return m_server->isListening() ? m_server->serverPort() : 0; }
 
 void HttpServer::onNewConnection() {
     while (m_server->hasPendingConnections()) {
         QTcpSocket* sock = m_server->nextPendingConnection();
+        sock->setSocketOption(QAbstractSocket::LowDelayOption, 1);
         connect(sock, &QTcpSocket::readyRead, this, [this, sock]() { onSocketReadyRead(sock); });
         connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
     }
@@ -112,6 +176,12 @@ void HttpServer::onSocketReadyRead(QTcpSocket* sock) {
     QByteArray buf = sock->property("buf").toByteArray();
     buf += sock->readAll();
 
+    if (sock->property("inFlight").toBool()) {
+        if (buf.size() > kMaxRequestBytes * 2) { sock->abort(); return; }
+        sock->setProperty("buf", buf);
+        return;
+    }
+
     const int headerEnd = buf.indexOf("\r\n\r\n");
     if (headerEnd < 0) {
         if (buf.size() > kMaxRequestBytes) { sock->abort(); return; }
@@ -120,7 +190,7 @@ void HttpServer::onSocketReadyRead(QTcpSocket* sock) {
     }
 
     const QByteArray headerBlock = buf.left(headerEnd);
-    const int needed = contentLength(headerBlock);
+    const int needed = qMax(0, contentLength(headerBlock));
     const int bodyStart = headerEnd + 4;
     if (buf.size() - bodyStart < needed) {
         if (buf.size() > kMaxRequestBytes) { sock->abort(); return; }
@@ -131,38 +201,54 @@ void HttpServer::onSocketReadyRead(QTcpSocket* sock) {
     const int lineEnd = buf.indexOf("\r\n");
     const QList<QByteArray> parts = buf.left(lineEnd).split(' ');
     const QByteArray method = parts.value(0);
+    const QByteArray path = parts.value(1);
+    const QByteArray httpVersion = parts.value(2);
+    const QByteArray body = buf.mid(bodyStart, needed);
+
+    const QByteArray connHdr = headerValue(headerBlock, "Connection").toLower();
+    const bool keepAlive = (httpVersion == "HTTP/1.0")
+        ? connHdr.contains("keep-alive")
+        : !connHdr.contains("close");
+    const bool acceptsGzip = headerValue(headerBlock, "Accept-Encoding").toLower().contains("gzip");
+    const QByteArray ifNoneMatch = headerValue(headerBlock, "If-None-Match");
+
+    sock->setProperty("keepAlive", keepAlive);
+    sock->setProperty("acceptsGzip", acceptsGzip);
+    sock->setProperty("ifNoneMatch", ifNoneMatch);
+    sock->setProperty("inFlight", true);
+
+    if (auto* idleTimer = sock->findChild<QTimer*>(QStringLiteral("idleTimer")))
+        idleTimer->stop();
+
+    buf.remove(0, bodyStart + needed);
+    sock->setProperty("buf", buf);
+
     if (qEnvironmentVariableIntValue("MORFPHOTO_HTTP_DEBUG") == 1) {
-        const QByteArray path = parts.value(1).split('?').value(0);
+        const QByteArray logPath = path.split('?').value(0);
         const char* route = "other";
-        if (path == "/healthz")
+        if (logPath == "/healthz")
             route = "health";
-        else if (path == "/api/v1/library/subfolders")
+        else if (logPath == "/api/v1/library/subfolders")
             route = "subfolders";
-        else if (path == "/api/v1/library" || path.startsWith("/api/v1/library/"))
+        else if (logPath == "/api/v1/library" || logPath.startsWith("/api/v1/library/"))
             route = "catalog";
-        else if (path.startsWith("/api/v1/thumbnail"))
+        else if (logPath.startsWith("/api/v1/thumbnail"))
             route = "thumbnail";
-        else if (path == "/api/v1/search/semantic")
+        else if (logPath == "/api/v1/search/semantic")
             route = "semantic";
-        else if (path == "/api/v1/index/status")
+        else if (logPath == "/api/v1/index/status")
             route = "index-status";
         sock->setProperty("httpLogRoute", QString::fromLatin1(route));
         sock->setProperty("httpLogStartMs", m_uptime.elapsed());
     }
 
-
     // Anti-CSRF : une ecriture portant un Origin different de Host vient d'une page tierce.
     if (isCrossOriginWrite(method, headerValue(headerBlock, "Origin"),
                            headerValue(headerBlock, "Host"))) {
-        sock->setProperty("buf", QByteArray());
         reply(sock, 403, reasonFor(403), "{\"error\":\"cross_origin_forbidden\"}",
               QByteArrayLiteral("application/json; charset=utf-8"), false);
         return;
     }
-    const QByteArray path   = parts.value(1);
-    const QByteArray body   = buf.mid(bodyStart, needed);
-
-    sock->setProperty("buf", QByteArray());
 
     // Meme decoupe que handleRequest : la garde et le routage voient le meme chemin.
     const int query = path.indexOf('?');
@@ -200,25 +286,40 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
             reply(sock, 404, reasonFor(404), "{\"error\":\"semantic_search_disabled\"}");
             return;
         }
-        if (m_semanticRequests >= 2) {
+        if (m_semanticRequests >= 4) {
             reply(sock, 503, reasonFor(503), "{\"error\":\"semantic_search_busy\"}");
             return;
         }
         ++m_semanticRequests;
-        connect(sock, &QObject::destroyed, this, [this] { --m_semanticRequests; });
-        disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
-        auto* manager = new QNetworkAccessManager(sock);
-        manager->setProxy(QNetworkProxy::NoProxy);
+        auto released = std::make_shared<std::atomic_bool>(false);
+        auto release = [this, released]() {
+            if (!released->exchange(true))
+                --m_semanticRequests;
+        };
         QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:8794/search")));
         request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
         request.setTransferTimeout(8000);
-        auto* result = manager->post(request, body);
-        connect(result, &QNetworkReply::finished, sock, [this, sock, result] {
+        auto* result = m_proxyManager->post(request, body);
+        auto abortOnClose = [release, resultPtr = QPointer<QNetworkReply>(result)]() {
+            release();
+            if (resultPtr) {
+                resultPtr->abort();
+                resultPtr->deleteLater();
+            }
+        };
+        connect(sock, &QTcpSocket::disconnected, result, abortOnClose);
+        connect(sock, &QObject::destroyed, result, abortOnClose);
+        connect(result, &QNetworkReply::finished, this,
+                [this, sp = QPointer<QTcpSocket>(sock), result, release] {
+            release();
             const int status = result->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-            const int code = status ? status : 503;
             const QByteArray payload = status ? result->readAll() :
                 QByteArrayLiteral("{\"error\":\"semantic_search_unavailable\"}");
-            reply(sock, code, reasonFor(code), payload);
+            result->deleteLater();
+            if (!sp || sp->state() == QAbstractSocket::UnconnectedState)
+                return;
+            const int code = status ? status : 503;
+            reply(sp, code, reasonFor(code), payload);
         });
         return;
     }
@@ -226,14 +327,44 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
     // ---- API metier /api/v1 : deleguee au domaine photo (PhotoApi) ----
     if (path.startsWith("/api/")) {
         IModule* mod = m_registry ? m_registry->firstOfType(QStringLiteral("photo")) : nullptr;
-        PhotoApi api(qobject_cast<PhotoModule*>(mod));
+        auto* photos = qobject_cast<PhotoModule*>(mod);
+        const bool isOffloadableRead = (method == "GET") &&
+            (path == "/api/v1/library" || path.startsWith("/api/v1/library/") ||
+             path == "/api/v1/photos" || path.startsWith("/api/v1/photos/") ||
+             path == "/api/v1/contexts" || path == "/api/v1/context");
+        const QString pathStr = QString::fromUtf8(path);
+        const bool isLibraryPath = (method == "GET") &&
+            (path == "/api/v1/library" || path.startsWith("/api/v1/library/"));
+
+        if (isOffloadableRead && photos != nullptr) {
+            QElapsedTimer timer;
+            timer.start();
+            auto* watcher = new QFutureWatcher<PhotoApi::Result>(this);
+            connect(watcher, &QFutureWatcher<PhotoApi::Result>::finished, this,
+                    [this, sp = QPointer<QTcpSocket>(sock), watcher, timer, isLibraryPath] {
+                const PhotoApi::Result r = watcher->result();
+                watcher->deleteLater();
+                const qint64 elapsedMs = timer.elapsed();
+                if (isLibraryPath && elapsedMs >= 500) {
+                    qWarning() << "morfPhoto slow library request:" << elapsedMs << "ms, HTTP" << r.code;
+                }
+                if (!sp || sp->state() == QAbstractSocket::UnconnectedState)
+                    return;
+                reply(sp, r.code, reasonFor(r.code), r.body, r.contentType, true);
+            });
+            watcher->setFuture(QtConcurrent::run(&m_apiReadPool,
+                [photos, method, pathStr, queryString, body] {
+                    return PhotoApi(photos).handle(method, pathStr, queryString, body);
+                }));
+            return;
+        }
+
+        PhotoApi api(photos);
         QElapsedTimer timer;
         timer.start();
-        const PhotoApi::Result r = api.handle(method, QString::fromUtf8(path), queryString, body);
+        const PhotoApi::Result r = api.handle(method, pathStr, queryString, body);
         const qint64 elapsedMs = timer.elapsed();
-        if (method == "GET" &&
-            (path == "/api/v1/library" || path.startsWith("/api/v1/library/")) &&
-            elapsedMs >= 500) {
+        if (isLibraryPath && elapsedMs >= 500) {
             qWarning() << "morfPhoto slow library request:" << elapsedMs << "ms, HTTP" << r.code;
         }
         reply(sock, r.code, reasonFor(r.code), r.body, r.contentType, method == "GET");
@@ -283,14 +414,14 @@ void HttpServer::serveThumbnail(QTcpSocket* sock, const QByteArray& method,
     IModule* mod = m_registry ? m_registry->firstOfType(QStringLiteral("photo")) : nullptr;
     const auto* photos = qobject_cast<PhotoModule*>(mod);
     int& requests = requireCache ? m_cachedThumbnailRequests : m_thumbnailRequests;
-    if (!photos || requests >= 8) {
+    const int maxInFlight = requireCache ? 128 : 64;
+    if (!photos || requests >= maxInFlight) {
         reply(sock, 503, reasonFor(503), "{\"error\":\"thumbnail_unavailable\"}");
         return;
     }
 
     // Le travail ne retient ni le module ni la socket. Le thread HTTP seul
     // installe et retire les demandes et publie les réponses.
-    disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
     ++requests;
     struct ThumbnailResult {
         QByteArray jpeg;
@@ -311,12 +442,19 @@ void HttpServer::serveThumbnail(QTcpSocket* sock, const QByteArray& method,
             qInfo().noquote() << "morfPhoto HTTP thumbnail cache" << (jpeg.isEmpty() ? "miss" : "hit")
                               << "queue_ms" << result.queueMs << "read_ms" << result.readMs;
         }
-        if (!socket)
+        if (!socket || socket->state() == QAbstractSocket::UnconnectedState)
             return;
-        if (jpeg.isEmpty())
+        if (jpeg.isEmpty()) {
             reply(socket, 404, reasonFor(404), "{\"error\":\"thumbnail_not_found\"}");
+            return;
+        }
+        const QByteArray etag = "\"" + QCryptographicHash::hash(jpeg, QCryptographicHash::Md5).toHex() + "\"";
+        const QByteArray cacheHeaders = "Cache-Control: public, max-age=86400\r\nETag: " + etag + "\r\n";
+        const QByteArray ifNoneMatch = socket->property("ifNoneMatch").toByteArray();
+        if (etagMatches(ifNoneMatch, etag))
+            reply(socket, 304, reasonFor(304), "", "image/jpeg", true, cacheHeaders);
         else
-            reply(socket, 200, reasonFor(200), jpeg, "image/jpeg", true);
+            reply(socket, 200, reasonFor(200), jpeg, "image/jpeg", true, cacheHeaders);
     });
     auto* pool = requireCache ? &m_cachedThumbnailPool : &m_thumbnailPool;
     watcher->setFuture(QtConcurrent::run(pool,
@@ -361,27 +499,71 @@ QByteArray HttpServer::buildStatusJson() const {
 void HttpServer::reply(QTcpSocket* sock, int code, const QByteArray& reason, const QByteArray& body,
                        const QByteArray& contentType, bool allowCors,
                        const QByteArray& extraHeaders) {
+    const bool keepAlive = sock->property("keepAlive").toBool();
+    QByteArray payload = body;
+    QByteArray gzipHeaders;
+#ifdef MORFPHOTO_HAS_ZLIB
+    const bool acceptsGzip = sock->property("acceptsGzip").toBool();
+    if (acceptsGzip && body.size() >= 1024 && contentType.startsWith("application/json")
+        && !extraHeaders.contains("Content-Encoding:")) {
+        QByteArray compressed = gzipCompress(body);
+        if (!compressed.isEmpty() && compressed.size() < body.size()) {
+            payload = std::move(compressed);
+            gzipHeaders = QByteArrayLiteral("Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n");
+        }
+    }
+#endif
+
     const auto route = sock->property("httpLogRoute");
     if (route.isValid()) {
         qInfo().noquote() << "morfPhoto HTTP" << route.toString() << "status" << code
                           << "handler_ms" << m_uptime.elapsed() - sock->property("httpLogStartMs").toLongLong()
-                          << "bytes" << body.size();
+                          << "bytes" << payload.size();
     }
-    QByteArray resp;
-    resp += "HTTP/1.1 " + QByteArray::number(code) + " " + reason + "\r\n";
-    resp += "Content-Type: " + contentType + "\r\n";
-    resp += "Content-Length: " + QByteArray::number(body.size()) + "\r\n";
+
+    QByteArray header;
+    header.reserve(256 + extraHeaders.size() + gzipHeaders.size());
+    header += "HTTP/1.1 " + QByteArray::number(code) + " " + reason + "\r\n";
+    header += "Content-Type: " + contentType + "\r\n";
+    header += "Content-Length: " + QByteArray::number(payload.size()) + "\r\n";
     // CORS ouvert en lecture seule uniquement : jamais sur une ecriture (CSRF).
     if (allowCors)
-        resp += "Access-Control-Allow-Origin: *\r\n";
-    resp += extraHeaders;
-    resp += "Connection: close\r\n\r\n";
-    resp += body;
-    disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
-    if (sock->write(resp) < 0) {
+        header += "Access-Control-Allow-Origin: *\r\n";
+    header += extraHeaders;
+    header += gzipHeaders;
+    if (keepAlive)
+        header += "Connection: keep-alive\r\nKeep-Alive: timeout=30\r\n\r\n";
+    else
+        header += "Connection: close\r\n\r\n";
+
+    if (!keepAlive)
+        disconnect(sock, &QTcpSocket::readyRead, this, nullptr);
+
+    if (sock->write(header) < 0 || (!payload.isEmpty() && sock->write(payload) < 0)) {
         sock->abort();
         return;
     }
+
+    if (keepAlive) {
+        sock->setProperty("inFlight", false);
+        sock->setProperty("httpLogRoute", QVariant());
+        auto* idleTimer = sock->findChild<QTimer*>(QStringLiteral("idleTimer"));
+        if (!idleTimer) {
+            idleTimer = new QTimer(sock);
+            idleTimer->setObjectName(QStringLiteral("idleTimer"));
+            idleTimer->setSingleShot(true);
+            connect(idleTimer, &QTimer::timeout, sock, &QTcpSocket::disconnectFromHost);
+        }
+        idleTimer->start(30000);
+        if (!sock->property("buf").toByteArray().isEmpty()) {
+            QMetaObject::invokeMethod(this, [this, sp = QPointer<QTcpSocket>(sock)] {
+                if (sp)
+                    onSocketReadyRead(sp);
+            }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
     // Qt drains queued bytes before closing. Bound the drain for clients that stop reading.
     QTimer::singleShot(10000, sock, [sock, route] {
         if (route.isValid())

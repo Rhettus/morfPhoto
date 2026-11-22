@@ -35,9 +35,11 @@ public:
     ~PhotoRepository();
 
     // Ouvre la connexion, pose les PRAGMA et applique les migrations en attente.
-    bool open(const QString& dbPath);
+    // En mode readOnly, ouvre avec QSQLITE_OPEN_READONLY sans créer le dossier ni migrer.
+    bool open(const QString& dbPath, bool readOnly = false);
     void close();
     bool isOpen() const;
+    qint64 dataVersion();
     QString openError() const { return m_openError; }  // detail si open() a echoue
 
     // --- Transactions par lot (indexation) ---

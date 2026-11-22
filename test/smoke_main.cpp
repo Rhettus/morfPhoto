@@ -23,9 +23,16 @@
 #include <QVariantMap>
 #include <QEventLoop>
 #include <QTimer>
+#include <QElapsedTimer>
+#include <QJsonDocument>
+#include <QUrl>
+#include <QTcpServer>
+#include <QTcpSocket>
 
 #include "morfphoto/PhotoScanner.h"
 #include "morfphoto/PhotoModule.h"
+#include "morfphoto/HttpServer.h"
+#include "morfphoto/ModuleRegistry.h"
 #include "morfphoto/FolderWatcher.h"
 #include "morfphoto/PhotoRepository.h"
 #include "morfphoto/ExifExtractor.h"
@@ -1008,6 +1015,181 @@ int main(int argc, char** argv) {
         }
 
         srepo.close();
+
+        // 13) Optimisations Phase 2 : open(readOnly), dataVersion, Keep-Alive,
+        //     gzip JSON, offload m_apiReadPool, et thumbnail ETag/304.
+        {
+            // Creer un JPEG valide pour tester thumbnail ETag / 304 + Keep-Alive + gzip.
+            const QString httpRoot = base + QStringLiteral("/http_root");
+            QDir().mkpath(httpRoot);
+            const QString jpgPath = httpRoot + QStringLiteral("/sample.jpg");
+            QImage img(640, 480, QImage::Format_RGB32);
+            img.fill(Qt::darkBlue);
+            CHECK(img.save(jpgPath, "JPEG", 85), "phase2: JPEG test genere");
+
+            const QString httpDb = base + QStringLiteral("/http_test.db");
+            QJsonObject modParams;
+            modParams[QStringLiteral("db_path")] = httpDb;
+            modParams[QStringLiteral("roots")] = QJsonArray{httpRoot};
+            modParams[QStringLiteral("xmp")] = QJsonObject{{QStringLiteral("enabled"), true}};
+            modParams[QStringLiteral("watch")] = QJsonObject{
+                {QStringLiteral("scan_on_startup"), false},
+                {QStringLiteral("interval_ms"), 0},
+                {QStringLiteral("realtime"), false},
+            };
+
+            ModuleRegistry reg;
+            auto* mod = new PhotoModule(QStringLiteral("photo-http"), modParams, &reg);
+            reg.add(mod);
+            reg.startAll();
+
+            // Inserer assez de fichiers pour depasser 1024 octets JSON (declenche gzip).
+            QJsonObject addedFolder;
+            QString addErr;
+            CHECK(mod->addFolder(httpRoot, QVariant(), true, false, QVariant(), &addedFolder, &addErr),
+                  "phase2: addFolder sur module HTTP");
+            {
+                PhotoRepository seedRepo(QStringLiteral("smoke-phase2-seed"));
+                seedRepo.open(httpDb);
+                const int fid = addedFolder.value(QStringLiteral("id")).toInt();
+                seedRepo.beginTransaction();
+                for (int i = 0; i < 15; ++i) {
+                    FileInfo fi;
+                    fi.path = QStringLiteral("%1/item_%2.jpg").arg(httpRoot).arg(i);
+                    fi.directory = httpRoot;
+                    fi.filename = QStringLiteral("item_%1.jpg").arg(i);
+                    fi.extension = QStringLiteral(".jpg");
+                    fi.fileType = QStringLiteral("jpeg");
+                    fi.size = 1000 + i;
+                    fi.mtime = 1700000000 + i;
+                    ExifData ex;
+                    ex.ok = true;
+                    ex.takenAt = QStringLiteral("2026-05-%1 10:00:00").arg(i + 1, 2, 10, QLatin1Char('0'));
+                    ex.cameraModel = QStringLiteral("Camera %1").arg(i % 3);
+                    ex.iso = 100 * ((i % 4) + 1);
+                    const int id = seedRepo.insertFile(fid, fi, ex, true, nowIso());
+                    LibraryFileLabels lbl = fileLabels(fi.filename, ex);
+                    QVector<LibraryVersion> vers = {mergeVersion(0, QString(), nullptr, ex)};
+                    seedRepo.storeLibrary(id, QStringLiteral("fp"), lbl, vers);
+                }
+                seedRepo.commitTransaction();
+                seedRepo.close();
+            }
+
+            PhotoRepository roRepo(QStringLiteral("smoke-phase2-ro"));
+            CHECK(roRepo.open(httpDb, /*readOnly=*/true),
+                  "phase2: open(readOnly=true) reussit");
+            CHECK(roRepo.dataVersion() >= 0,
+                  "phase2: PRAGMA data_version lisible sur connexion RO");
+            roRepo.close();
+
+            ServiceConfig cfg;
+            cfg.bindAddress = QStringLiteral("127.0.0.1");
+            cfg.httpPort = 0; // port ephemere via QTcpServer::listen(addr, 0) impossible si httpPort==0 -> utiliser port libre
+            // Trouver un port libre temporaire.
+            quint16 freePort = 0;
+            {
+                QTcpServer probe;
+                if (probe.listen(QHostAddress::LocalHost, 0))
+                    freePort = probe.serverPort();
+            }
+            cfg.httpPort = freePort;
+            HttpServer server(cfg, &reg);
+            CHECK(freePort > 0 && server.start(), "phase2: HttpServer demarre sur port loopback");
+
+            auto readHttpResponse = [](QTcpSocket& sock, QByteArray& raw) -> bool {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < 5000) {
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                    raw += sock.readAll();
+                    const int hdrEnd = raw.indexOf("\r\n\r\n");
+                    if (hdrEnd >= 0) {
+                        const QByteArray hdr = raw.left(hdrEnd);
+                        int cl = 0;
+                        for (const QByteArray& line : hdr.split('\n')) {
+                            const QByteArray l = line.trimmed();
+                            if (l.toLower().startsWith("content-length:"))
+                                cl = l.mid(l.indexOf(':') + 1).trimmed().toInt();
+                        }
+                        if (raw.size() >= hdrEnd + 4 + cl)
+                            return true;
+                    }
+                    sock.waitForReadyRead(20);
+                }
+                return false;
+            };
+
+            QTcpSocket client;
+            client.connectToHost(QHostAddress::LocalHost, server.port());
+            bool connected = false;
+            for (int i = 0; i < 50 && !connected; ++i) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                connected = (client.state() == QAbstractSocket::ConnectedState);
+            }
+            CHECK(connected, "phase2: client TCP connecte a HttpServer");
+
+            // Requete 1 sur la socket : /healthz avec Keep-Alive
+            client.write("GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            client.flush();
+            QByteArray r1;
+            CHECK(readHttpResponse(client, r1) && r1.startsWith("HTTP/1.1 200 OK")
+                  && r1.toLower().contains("connection: keep-alive"),
+                  "phase2: Keep-Alive actif sur requete 1 (/healthz)");
+
+            // Requete 2 sur LA MEME socket : /api/v1/library (offload thread pool + gzip)
+            client.write("GET /api/v1/library?page_size=50 HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip\r\n\r\n");
+            client.flush();
+            QByteArray r2;
+            const bool gotR2 = readHttpResponse(client, r2);
+            CHECK(gotR2 && r2.startsWith("HTTP/1.1 200 OK")
+                  && r2.toLower().contains("content-encoding: gzip"),
+                  "phase2: requete 2 sur meme socket (/api/v1/library) servie en gzip");
+
+            // Requete 3 sur LA MEME socket : /api/v1/library/facets (single-pass + cache)
+            client.write("GET /api/v1/library/facets HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            client.flush();
+            QByteArray r3;
+            const bool gotR3 = readHttpResponse(client, r3);
+            const QByteArray r3Body = gotR3 ? r3.mid(r3.indexOf("\r\n\r\n") + 4) : QByteArray();
+            const QJsonObject facetsObj = QJsonDocument::fromJson(r3Body).object();
+            CHECK(gotR3 && r3.startsWith("HTTP/1.1 200 OK")
+                  && facetsObj.value(QStringLiteral("cameras")).toArray().size() == 3
+                  && facetsObj.value(QStringLiteral("rejected")).toObject().value(QStringLiteral("all")).toInt() == 15,
+                  "phase2: /api/v1/library/facets single-pass renvoie les bons compteurs");
+
+            // Requete 4 & 5 sur LA MEME socket : thumbnail -> ETag + Cache-Control -> 304 Not Modified
+            const QByteArray thumbReq = "GET /api/v1/thumbnail?path=" + QUrl::toPercentEncoding(jpgPath) +
+                                        " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+            client.write(thumbReq);
+            client.flush();
+            QByteArray r4;
+            const bool gotR4 = readHttpResponse(client, r4);
+            QByteArray etag;
+            if (gotR4) {
+                for (const QByteArray& line : r4.left(r4.indexOf("\r\n\r\n")).split('\n')) {
+                    const QByteArray l = line.trimmed();
+                    if (l.toLower().startsWith("etag:"))
+                        etag = l.mid(l.indexOf(':') + 1).trimmed();
+                }
+            }
+            CHECK(gotR4 && r4.startsWith("HTTP/1.1 200 OK") && !etag.isEmpty()
+                  && r4.toLower().contains("cache-control:"),
+                  "phase2: /api/v1/thumbnail renvoie ETag et Cache-Control");
+
+            const QByteArray thumb304Req = "GET /api/v1/thumbnail?path=" + QUrl::toPercentEncoding(jpgPath) +
+                                           " HTTP/1.1\r\nHost: 127.0.0.1\r\nIf-None-Match: " + etag + "\r\nConnection: close\r\n\r\n";
+            client.write(thumb304Req);
+            client.flush();
+            QByteArray r5;
+            const bool gotR5 = readHttpResponse(client, r5);
+            CHECK(gotR5 && r5.startsWith("HTTP/1.1 304 Not Modified"),
+                  "phase2: /api/v1/thumbnail avec If-None-Match renvoie 304 Not Modified");
+
+            client.close();
+            server.stop();
+            reg.stopAll();
+        }
     }
     QDir(base).removeRecursively();
 

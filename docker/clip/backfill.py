@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Build semantic vectors from the saved catalog and existing thumbnail API."""
 
+import gzip
+import http.client
 import inspect
 import json
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
 
 MAX_PREVIEW_BYTES = 32 * 1024 * 1024
 
@@ -29,14 +31,72 @@ def fingerprint(path, size, mtime):
 
 class PhotoApi:
     def __init__(self, key):
-        self.headers = {"Authorization": f"Bearer {key}"} if key else {}
+        self.headers = {
+            "Accept-Encoding": "gzip",
+            "Connection": "keep-alive",
+        }
+        if key:
+            self.headers["Authorization"] = f"Bearer {key}"
+        self._local = threading.local()
+
+    def _close_conn(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
 
     def get(self, path, maximum):
-        request = Request("http://127.0.0.1:8793" + path, headers=self.headers)
-        with urlopen(request, timeout=30) as response:
-            body = response.read(maximum + 1)
+        for attempt in range(2):
+            conn = getattr(self._local, "conn", None)
+            reused = conn is not None
+            if conn is None:
+                conn = http.client.HTTPConnection("127.0.0.1", 8793, timeout=30)
+                self._local.conn = conn
+            try:
+                conn.request("GET", path, headers=self.headers)
+                resp = conn.getresponse()
+                status = resp.status
+                reason = resp.reason
+                headers = resp.headers
+                connection_hdr = headers.get("Connection", "")
+                if status >= 400:
+                    try:
+                        err_body = resp.read(65536 + 1)
+                    except (OSError, http.client.HTTPException):
+                        self._close_conn()
+                    else:
+                        if len(err_body) > 65536 or "close" in connection_hdr.lower() or resp.will_close:
+                            self._close_conn()
+                    raise HTTPError("http://127.0.0.1:8793" + path, status, reason, headers, None)
+                body = resp.read(maximum + 1)
+            except HTTPError:
+                raise
+            except TimeoutError:
+                self._close_conn()
+                raise
+            except (http.client.RemoteDisconnected, http.client.HTTPException,
+                    BrokenPipeError, ConnectionResetError) as error:
+                self._close_conn()
+                if attempt == 0 and reused:
+                    continue
+                raise URLError(error) from error
+            except OSError as error:
+                self._close_conn()
+                raise URLError(error) from error
+            break
+
         if len(body) > maximum:
+            self._close_conn()
             raise ValueError("morfPhoto response exceeded size limit")
+        if "close" in connection_hdr.lower() or resp.will_close:
+            self._close_conn()
+        if "gzip" in headers.get("Content-Encoding", "").lower():
+            body = gzip.decompress(body)
+            if len(body) > maximum:
+                raise ValueError("morfPhoto response exceeded size limit")
         return body
 
     def indexing(self):

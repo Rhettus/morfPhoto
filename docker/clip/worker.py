@@ -31,6 +31,7 @@ def main():
     threads = int(os.environ.get("MORFPHOTO_CLIP_THREADS", "1"))
     if not 1 <= threads <= 16:
         raise ValueError("MORFPHOTO_CLIP_THREADS must be between 1 and 16")
+    text_threads = max(threads, min(4, os.cpu_count() or 1))
     catalog = Path(os.environ.get("STATE_DIRECTORY", "/data")) / "photos.db"
     catalog_wal = Path(str(catalog) + "-wal")
     key = os.environ.get("MORFPHOTO_API_KEY")
@@ -57,7 +58,7 @@ def main():
     print("CLIP worker loading model", flush=True)
     report("starting", {"phase": "model_load"})
     try:
-        model = TextModel(root / "model", threads)
+        model = TextModel(root / "model", text_threads)
         index = EmbeddingIndex(root / "embeddings.db", EMBEDDING_VERSION)
     except Exception as error:
         report("error", {"last_error": type(error).__name__})

@@ -6,6 +6,7 @@
 
 #include "morfphoto/ExifExtractor.h"
 
+#include <QDir>
 #include <QFileInfo>
 #include <QProcess>
 #include <QJsonDocument>
@@ -55,7 +56,8 @@ constexpr int kProbeTimeoutMs = 5000;
 // Assemble le bloc d'arguments commun (JSON, charset, format de date, tags).
 QStringList argBlock(bool libraryTags) {
     QStringList args;
-    args << QStringLiteral("-json")
+    args << QStringLiteral("-fast")
+         << QStringLiteral("-json")
          << QStringLiteral("-charset") << QStringLiteral("filename=UTF8")
          << QStringLiteral("-d") << QString::fromLatin1(kDateFormat);
     for (const char* t : kTags)
@@ -148,6 +150,12 @@ ExifExtractor::~ExifExtractor() {
     close();
 }
 
+void ExifExtractor::setLibraryTags(bool enabled) {
+    m_libraryTags = enabled;
+    for (const auto& worker : m_batchWorkers)
+        worker->setLibraryTags(enabled);
+}
+
 void ExifExtractor::open() {
     if (!m_stayOpen || m_proc)
         return;
@@ -162,7 +170,7 @@ void ExifExtractor::open() {
     }
 }
 
-void ExifExtractor::close() {
+void ExifExtractor::closeProc() {
     if (!m_proc)
         return;
     if (m_proc->state() == QProcess::Running) {
@@ -177,12 +185,26 @@ void ExifExtractor::close() {
     m_proc = nullptr;
 }
 
+void ExifExtractor::restartProc() {
+    closeProc();
+    open();
+}
+
+void ExifExtractor::close() {
+    closeProc();
+    for (const auto& worker : m_batchWorkers)
+        worker->close();
+    m_batchWorkers.clear();
+}
+
 ExifData ExifExtractor::extract(const QString& path, QString* error) {
     QString localError;
     QString* err = error ? error : &localError;
     err->clear();
     const bool persistent = m_stayOpen && m_proc;
-    const QString file = persistent ? QFileInfo(path).absoluteFilePath() : path;
+    const QString file = (persistent && !QDir::isAbsolutePath(path))
+        ? QFileInfo(path).absoluteFilePath()
+        : path;
 
     // Le protocole argfile est ligne par ligne : un \n ou \r dans le nom injecterait des
     // arguments ExifTool arbitraires (ex. « -overwrite_original »). Fichier refuse.
@@ -200,6 +222,8 @@ ExifData ExifExtractor::extract(const QString& path, QString* error) {
 QHash<QString, QPair<ExifData, QString>> ExifExtractor::extractBatch(const QStringList& paths,
                                                                    int workers) {
     using Results = QHash<QString, QPair<ExifData, QString>>;
+    if (paths.isEmpty())
+        return {};
     const qsizetype lanes = qMin<qsizetype>(qMax(1, workers), paths.size());
     auto readLane = [&paths, lanes](ExifExtractor& extractor, qsizetype first) {
         Results results;
@@ -210,18 +234,23 @@ QHash<QString, QPair<ExifData, QString>> ExifExtractor::extractBatch(const QStri
         }
         return results;
     };
-    if (paths.isEmpty())
-        return {};
 
-    // Chaque voie possède son QProcess. Les résultats sont réunis avant de
-    // reprendre les écritures SQLite dans le thread de la passe.
+    const auto neededWorkers = static_cast<size_t>(lanes - 1);
+    while (m_batchWorkers.size() < neededWorkers) {
+        auto worker = std::make_unique<ExifExtractor>(m_binary, m_stayOpen);
+        worker->setLibraryTags(m_libraryTags);
+        worker->open();
+        m_batchWorkers.push_back(std::move(worker));
+    }
+
+    // Chaque voie réutilise son QProcess persistant. Les résultats sont réunis
+    // avant de reprendre les écritures SQLite dans le thread de la passe.
     std::vector<std::future<Results>> workersInFlight;
+    workersInFlight.reserve(neededWorkers);
     for (qsizetype lane = 1; lane < lanes; ++lane) {
-        workersInFlight.push_back(std::async(std::launch::async | std::launch::deferred, [&, lane] {
-            ExifExtractor extractor(m_binary, m_stayOpen);
-            extractor.setLibraryTags(m_libraryTags);
-            extractor.open();
-            return readLane(extractor, lane);
+        ExifExtractor* worker = m_batchWorkers[static_cast<size_t>(lane - 1)].get();
+        workersInFlight.push_back(std::async(std::launch::async | std::launch::deferred, [&, worker, lane] {
+            return readLane(*worker, lane);
         }));
     }
     auto results = readLane(*this, 0);
@@ -231,6 +260,13 @@ QHash<QString, QPair<ExifData, QString>> ExifExtractor::extractBatch(const QStri
 }
 
 QString ExifExtractor::readPersistent(const QString& path, QString* error) {
+    if (!m_proc || m_proc->state() != QProcess::Running)
+        restartProc();
+    if (!m_proc || m_proc->state() != QProcess::Running) {
+        *error = QStringLiteral("ExifTool: process indisponible pour %1").arg(path);
+        return {};
+    }
+
     ++m_counter;
     const QByteArray marker = "{ready" + QByteArray::number(m_counter) + "}";
 
@@ -254,6 +290,7 @@ QString ExifExtractor::readPersistent(const QString& path, QString* error) {
     while ((at = markerPos(buf, marker)) < 0) {
         if (!m_proc->waitForReadyRead(kTimeoutMs)) {
             *error = QStringLiteral("ExifTool: pas de reponse pour %1").arg(path);
+            restartProc();
             return {};
         }
         buf += m_proc->readAllStandardOutput();

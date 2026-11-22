@@ -5,6 +5,8 @@
  */
 
 #pragma once
+#include <memory>
+#include <vector>
 #include <QHash>
 #include <QStringList>
 #include "morfphoto/PhotoTypes.h"
@@ -37,7 +39,7 @@ public:
     ~ExifExtractor();
 
     // Demande aussi les champs de la bibliothèque (mots-clés, étiquette, numéro de série...).
-    void setLibraryTags(bool enabled) { m_libraryTags = enabled; }
+    void setLibraryTags(bool enabled);
 
     void open();     // démarre le process persistant (idempotent)
     void close();    // arrête proprement le process
@@ -63,6 +65,8 @@ public:
     static int markerPos(const QByteArray& buf, const QByteArray& marker);
 
 private:
+    void closeProc();
+    void restartProc();
     QString readPersistent(const QString& path, QString* error);
     QString readOnce(const QString& path, QString* error);
 
@@ -71,6 +75,7 @@ private:
     QProcess*  m_proc = nullptr;
     int        m_counter = 0;   // numérote les -execute pour synchroniser
     bool       m_libraryTags = false;
+    std::vector<std::unique_ptr<ExifExtractor>> m_batchWorkers;
 };
 
 } // namespace morfphoto

@@ -200,10 +200,12 @@ QSqlDatabase PhotoRepository::db() const {
     return QSqlDatabase::database(m_connectionName);
 }
 
-bool PhotoRepository::open(const QString& dbPath) {
-    // Créer le dossier de la base au besoin (première installation).
-    const QFileInfo fi(dbPath);
-    QDir().mkpath(fi.absolutePath());
+bool PhotoRepository::open(const QString& dbPath, bool readOnly) {
+    if (!readOnly) {
+        // Créer le dossier de la base au besoin (première installation).
+        const QFileInfo fi(dbPath);
+        QDir().mkpath(fi.absolutePath());
+    }
 
     if (!QSqlDatabase::isDriverAvailable(QStringLiteral("QSQLITE"))) {
         m_openError = QStringLiteral("driver QSQLITE indisponible");
@@ -212,10 +214,20 @@ bool PhotoRepository::open(const QString& dbPath) {
     }
     QSqlDatabase database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), m_connectionName);
     database.setDatabaseName(dbPath);
+    if (readOnly)
+        database.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
     if (!database.open()) {
         m_openError = database.lastError().text();
         qWarning() << "morfPhoto: ouverture base impossible" << dbPath << m_openError;
         return false;
+    }
+    if (readOnly) {
+        QSqlQuery q(database);
+        q.exec(QStringLiteral("PRAGMA query_only = ON"));
+        q.exec(QStringLiteral("PRAGMA busy_timeout = 5000"));
+        q.exec(QStringLiteral("PRAGMA cache_size = -65536"));
+        q.exec(QStringLiteral("PRAGMA temp_store = MEMORY"));
+        return true;
     }
     // Scoper les PRAGMA : une requête encore active bloquerait le commit des
     // migrations (« SQL statements in progress »). La détruire la finalise.
@@ -249,6 +261,13 @@ void PhotoRepository::close() {
 
 bool PhotoRepository::isOpen() const {
     return QSqlDatabase::contains(m_connectionName) && db().isOpen();
+}
+
+qint64 PhotoRepository::dataVersion() {
+    QSqlQuery q(db());
+    if (!run(q, QStringLiteral("PRAGMA data_version")) || !q.next())
+        return 0;
+    return q.value(0).toLongLong();
 }
 
 bool PhotoRepository::beginTransaction() {
@@ -898,24 +917,6 @@ QJsonArray PhotoRepository::libraryPhotos(const QVector<int>& fileIds, bool with
 }
 
 QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
-    // Chaque liste ignore son propre choix : choisir un boitier ne masque pas les autres.
-    auto counted = [this](const LibraryFilter& f, const QString& column, const QString& order,
-                          bool keepEmpty = false) {
-        QVariantList binds;
-        QString where = libraryWhere(f, binds);
-        where += QStringLiteral(" AND %1 IS NOT NULL").arg(column);
-        if (!keepEmpty)
-            where += QStringLiteral(" AND %1 != ''").arg(column);
-        QSqlQuery q(db());
-        run(q, QStringLiteral("SELECT %1 AS value, COUNT(*) AS count").arg(column) +
-                   QLatin1String(kLibraryFrom) + where +
-                   QStringLiteral(" GROUP BY %1 ORDER BY %2").arg(column, order), binds);
-        QJsonArray out;
-        while (q.next())
-            out.append(QJsonObject{{QStringLiteral("value"), q.value(0).toString()},
-                                   {QStringLiteral("count"), q.value(1).toInt()}});
-        return out;
-    };
     auto without = [&filter](QStringList LibraryFilter::*member) {
         LibraryFilter f = filter;
         (f.*member).clear();
@@ -923,36 +924,265 @@ QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
     };
 
     QJsonObject o;
-    {
-        // Le groupe RAW d'abord, puis chaque extension, comme la liste du client.
-        const LibraryFilter f = without(&LibraryFilter::kinds);
+    const bool noFacetOverrides =
+        filter.kinds.isEmpty() && filter.cameras.isEmpty() && filter.bodies.isEmpty() &&
+        filter.lenses.isEmpty() && filter.iso.isEmpty() && filter.aperture.isEmpty() &&
+        filter.focal.isEmpty() && filter.shutter.isEmpty() && filter.takenFrom.isEmpty() &&
+        filter.takenTo.isEmpty() && filter.rejected.isEmpty();
+
+    if (noFacetOverrides) {
+        struct KindBucket {
+            int count = 0;
+            bool isRaw = false;
+        };
+        struct NumericFacet {
+            struct Bucket {
+                int count = 0;
+                bool hasNum = false;
+                double minNum = 0.0;
+            };
+            QHash<QString, Bucket> buckets;
+
+            void add(const QString& label, const QVariant& num) {
+                if (label.isEmpty())
+                    return;
+                Bucket& b = buckets[label];
+                ++b.count;
+                if (!num.isNull()) {
+                    bool ok = false;
+                    const double v = num.toDouble(&ok);
+                    if (ok && (!b.hasNum || v < b.minNum)) {
+                        b.hasNum = true;
+                        b.minNum = v;
+                    }
+                }
+            }
+
+            QJsonArray toJson() const {
+                struct Entry {
+                    QString value;
+                    int count;
+                    bool hasNum;
+                    double minNum;
+                };
+                QVector<Entry> entries;
+                entries.reserve(buckets.size());
+                for (auto it = buckets.constBegin(); it != buckets.constEnd(); ++it)
+                    entries.append({it.key(), it.value().count, it.value().hasNum, it.value().minNum});
+                std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+                    if (a.hasNum != b.hasNum)
+                        return !a.hasNum;
+                    if (a.hasNum && a.minNum != b.minNum)
+                        return a.minNum < b.minNum;
+                    return a.value < b.value;
+                });
+                QJsonArray out;
+                for (const Entry& e : std::as_const(entries))
+                    out.append(QJsonObject{{QStringLiteral("value"), e.value},
+                                           {QStringLiteral("count"), e.count}});
+                return out;
+            }
+        };
+
+        auto mapToJson = [](const QMap<QString, int>& counts, bool descending = false) {
+            QJsonArray out;
+            if (!descending) {
+                for (auto it = counts.constBegin(); it != counts.constEnd(); ++it)
+                    out.append(QJsonObject{{QStringLiteral("value"), it.key()},
+                                           {QStringLiteral("count"), it.value()}});
+            } else {
+                auto it = counts.constEnd();
+                while (it != counts.constBegin()) {
+                    --it;
+                    out.append(QJsonObject{{QStringLiteral("value"), it.key()},
+                                           {QStringLiteral("count"), it.value()}});
+                }
+            }
+            return out;
+        };
+
         QVariantList binds;
         QSqlQuery q(db());
-        run(q, QStringLiteral("SELECT COUNT(*)") + QLatin1String(kLibraryFrom) + libraryWhere(f, binds) +
-                   QStringLiteral(" AND lf.kind_label = 'RAW'"), binds);
-        QJsonArray kinds;
-        if (q.next() && q.value(0).toInt() > 0)
-            kinds.append(QJsonObject{{QStringLiteral("value"), QStringLiteral("RAW")},
-                                     {QStringLiteral("count"), q.value(0).toInt()}});
-        for (const QJsonValue& value : counted(f, QStringLiteral("lf.ext_label"),
-                                               QStringLiteral("lf.kind_label != 'RAW', lf.ext_label")))
-            kinds.append(value);
-        o["kinds"] = kinds;
-    }
-    o["cameras"]  = counted(without(&LibraryFilter::cameras), QStringLiteral("lf.camera_label"), QStringLiteral("value"));
-    o["bodies"]   = counted(without(&LibraryFilter::bodies), QStringLiteral("lf.body_key"), QStringLiteral("value"), true);
-    o["lenses"]   = counted(without(&LibraryFilter::lenses), QStringLiteral("f.lens"), QStringLiteral("value"));
-    o["iso"]      = counted(without(&LibraryFilter::iso), QStringLiteral("lf.iso_label"), QStringLiteral("MIN(f.iso)"));
-    o["aperture"] = counted(without(&LibraryFilter::aperture), QStringLiteral("lf.aperture_label"), QStringLiteral("MIN(f.aperture)"));
-    o["focal"]    = counted(without(&LibraryFilter::focal), QStringLiteral("lf.focal_label"), QStringLiteral("MIN(f.focal_length)"));
-    o["shutter"]  = counted(without(&LibraryFilter::shutter), QStringLiteral("lf.shutter_label"), QStringLiteral("MIN(f.shutter_speed_s)"));
+        if (run(q, QStringLiteral(
+                       "SELECT lf.kind_label, lf.ext_label, lf.camera_label, lf.body_key, f.lens, "
+                       "lf.iso_label, f.iso, lf.aperture_label, f.aperture, "
+                       "lf.focal_label, f.focal_length, lf.shutter_label, f.shutter_speed_s, "
+                       "substr(v.taken_at, 1, 7), v.rejected") +
+                       QLatin1String(kLibraryFrom) + libraryWhere(filter, binds),
+                binds)) {
+            int rawCount = 0;
+            QHash<QString, KindBucket> extBuckets;
+            QMap<QString, int> cameras;
+            QMap<QString, int> bodies;
+            QMap<QString, int> lenses;
+            NumericFacet iso;
+            NumericFacet aperture;
+            NumericFacet focal;
+            NumericFacet shutter;
+            QMap<QString, int> months;
+            int totalRows = 0;
+            int rejectedSum = 0;
 
-    {
-        LibraryFilter f = filter;
-        f.takenFrom.clear();
-        f.takenTo.clear();
-        o["months"] = counted(f, QStringLiteral("substr(v.taken_at, 1, 7)"), QStringLiteral("value DESC"));
+            while (q.next()) {
+                const QString kindLabel = q.value(0).toString();
+                const QString extLabel = q.value(1).toString();
+                const bool isRaw = (kindLabel == QLatin1String("RAW"));
+                if (isRaw)
+                    ++rawCount;
+                if (!extLabel.isEmpty()) {
+                    KindBucket& kb = extBuckets[extLabel];
+                    ++kb.count;
+                    kb.isRaw = kb.isRaw || isRaw;
+                }
+
+                const QString camera = q.value(2).toString();
+                if (!camera.isEmpty())
+                    ++cameras[camera];
+
+                const QVariant bodyVar = q.value(3);
+                if (!bodyVar.isNull())
+                    ++bodies[bodyVar.toString()];
+
+                const QString lens = q.value(4).toString();
+                if (!lens.isEmpty())
+                    ++lenses[lens];
+
+                iso.add(q.value(5).toString(), q.value(6));
+                aperture.add(q.value(7).toString(), q.value(8));
+                focal.add(q.value(9).toString(), q.value(10));
+                shutter.add(q.value(11).toString(), q.value(12));
+
+                const QString month = q.value(13).toString();
+                if (!month.isEmpty())
+                    ++months[month];
+
+                ++totalRows;
+                rejectedSum += q.value(14).toInt();
+            }
+
+            struct KindEntry {
+                QString value;
+                int count;
+                bool isRaw;
+            };
+            QVector<KindEntry> kindEntries;
+            kindEntries.reserve(extBuckets.size());
+            for (auto it = extBuckets.constBegin(); it != extBuckets.constEnd(); ++it)
+                kindEntries.append({it.key(), it.value().count, it.value().isRaw});
+            std::sort(kindEntries.begin(), kindEntries.end(), [](const KindEntry& a, const KindEntry& b) {
+                if (a.isRaw != b.isRaw)
+                    return a.isRaw;
+                return a.value < b.value;
+            });
+            QJsonArray kinds;
+            if (rawCount > 0)
+                kinds.append(QJsonObject{{QStringLiteral("value"), QStringLiteral("RAW")},
+                                         {QStringLiteral("count"), rawCount}});
+            for (const KindEntry& ke : std::as_const(kindEntries))
+                kinds.append(QJsonObject{{QStringLiteral("value"), ke.value},
+                                         {QStringLiteral("count"), ke.count}});
+
+            o["kinds"]    = kinds;
+            o["cameras"]  = mapToJson(cameras);
+            o["bodies"]   = mapToJson(bodies);
+            o["lenses"]   = mapToJson(lenses);
+            o["iso"]      = iso.toJson();
+            o["aperture"] = aperture.toJson();
+            o["focal"]    = focal.toJson();
+            o["shutter"]  = shutter.toJson();
+            o["months"]   = mapToJson(months, true);
+            o["rejected"] = QJsonObject{{QStringLiteral("all"), totalRows},
+                                        {QStringLiteral("hide"), totalRows - rejectedSum},
+                                        {QStringLiteral("only"), rejectedSum}};
+        }
+    } else {
+        // Chaque liste ignore son propre choix : choisir un boitier ne masque pas les autres.
+        auto counted = [this](const LibraryFilter& f, const QString& column, const QString& order,
+                              bool keepEmpty = false) {
+            QVariantList binds;
+            QString where = libraryWhere(f, binds);
+            where += QStringLiteral(" AND %1 IS NOT NULL").arg(column);
+            if (!keepEmpty)
+                where += QStringLiteral(" AND %1 != ''").arg(column);
+            QSqlQuery q(db());
+            run(q, QStringLiteral("SELECT %1 AS value, COUNT(*) AS count").arg(column) +
+                       QLatin1String(kLibraryFrom) + where +
+                       QStringLiteral(" GROUP BY %1 ORDER BY %2").arg(column, order), binds);
+            QJsonArray out;
+            while (q.next())
+                out.append(QJsonObject{{QStringLiteral("value"), q.value(0).toString()},
+                                       {QStringLiteral("count"), q.value(1).toInt()}});
+            return out;
+        };
+
+        {
+            // Le groupe RAW d'abord, puis chaque extension, comme la liste du client.
+            const LibraryFilter f = without(&LibraryFilter::kinds);
+            QVariantList binds;
+            QSqlQuery q(db());
+            run(q, QStringLiteral("SELECT lf.ext_label, lf.kind_label, COUNT(*)") +
+                       QLatin1String(kLibraryFrom) + libraryWhere(f, binds) +
+                       QStringLiteral(" GROUP BY lf.ext_label, lf.kind_label "
+                                      "ORDER BY lf.kind_label != 'RAW', lf.ext_label"),
+                binds);
+            int rawCount = 0;
+            QVector<QPair<QString, int>> extList;
+            QHash<QString, int> extIndex;
+            while (q.next()) {
+                const QString ext = q.value(0).toString();
+                const QString kind = q.value(1).toString();
+                const int count = q.value(2).toInt();
+                if (kind == QLatin1String("RAW"))
+                    rawCount += count;
+                if (!ext.isEmpty()) {
+                    const auto it = extIndex.constFind(ext);
+                    if (it != extIndex.constEnd()) {
+                        extList[*it].second += count;
+                    } else {
+                        extIndex.insert(ext, extList.size());
+                        extList.append({ext, count});
+                    }
+                }
+            }
+            QJsonArray kinds;
+            if (rawCount > 0)
+                kinds.append(QJsonObject{{QStringLiteral("value"), QStringLiteral("RAW")},
+                                         {QStringLiteral("count"), rawCount}});
+            for (const auto& entry : std::as_const(extList))
+                kinds.append(QJsonObject{{QStringLiteral("value"), entry.first},
+                                         {QStringLiteral("count"), entry.second}});
+            o["kinds"] = kinds;
+        }
+        o["cameras"]  = counted(without(&LibraryFilter::cameras), QStringLiteral("lf.camera_label"), QStringLiteral("value"));
+        o["bodies"]   = counted(without(&LibraryFilter::bodies), QStringLiteral("lf.body_key"), QStringLiteral("value"), true);
+        o["lenses"]   = counted(without(&LibraryFilter::lenses), QStringLiteral("f.lens"), QStringLiteral("value"));
+        o["iso"]      = counted(without(&LibraryFilter::iso), QStringLiteral("lf.iso_label"), QStringLiteral("MIN(f.iso)"));
+        o["aperture"] = counted(without(&LibraryFilter::aperture), QStringLiteral("lf.aperture_label"), QStringLiteral("MIN(f.aperture)"));
+        o["focal"]    = counted(without(&LibraryFilter::focal), QStringLiteral("lf.focal_label"), QStringLiteral("MIN(f.focal_length)"));
+        o["shutter"]  = counted(without(&LibraryFilter::shutter), QStringLiteral("lf.shutter_label"), QStringLiteral("MIN(f.shutter_speed_s)"));
+
+        {
+            LibraryFilter f = filter;
+            f.takenFrom.clear();
+            f.takenTo.clear();
+            o["months"] = counted(f, QStringLiteral("substr(v.taken_at, 1, 7)"), QStringLiteral("value DESC"));
+        }
+        {
+            LibraryFilter f = filter;
+            f.rejected.clear();
+            QVariantList binds;
+            QSqlQuery q(db());
+            run(q, QStringLiteral("SELECT COUNT(*), COALESCE(SUM(v.rejected), 0)") + QLatin1String(kLibraryFrom) +
+                       libraryWhere(f, binds), binds);
+            if (q.next()) {
+                const int all = q.value(0).toInt();
+                const int rejected = q.value(1).toInt();
+                o["rejected"] = QJsonObject{{QStringLiteral("all"), all}, {QStringLiteral("hide"), all - rejected},
+                                            {QStringLiteral("only"), rejected}};
+            }
+        }
     }
+
     {
         // Un mot-cle compte sa version une fois, et chaque niveau au-dessus aussi.
         const LibraryFilter f = without(&LibraryFilter::keywords);
@@ -976,20 +1206,6 @@ QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
         for (auto it = counts.constBegin(); it != counts.constEnd(); ++it)
             keywords.append(QJsonObject{{QStringLiteral("value"), it.key()}, {QStringLiteral("count"), it.value()}});
         o["keywords"] = keywords;
-    }
-    {
-        LibraryFilter f = filter;
-        f.rejected.clear();
-        QVariantList binds;
-        QSqlQuery q(db());
-        run(q, QStringLiteral("SELECT COUNT(*), COALESCE(SUM(v.rejected), 0)") + QLatin1String(kLibraryFrom) +
-                   libraryWhere(f, binds), binds);
-        if (q.next()) {
-            const int all = q.value(0).toInt();
-            const int rejected = q.value(1).toInt();
-            o["rejected"] = QJsonObject{{QStringLiteral("all"), all}, {QStringLiteral("hide"), all - rejected},
-                                        {QStringLiteral("only"), rejected}};
-        }
     }
     return o;
 }
