@@ -1371,6 +1371,30 @@ int main(int argc, char** argv) {
                     CHECK(cv && !miss && cp2 == sp2,
                           "phase3: pagination curseur via LibraryIdList identique a SQL");
                 }
+
+                // Verifier aussi PhotoModule::libraryListJson + prefetch page N+1
+                {
+                    QJsonObject pfParams;
+                    pfParams[QStringLiteral("db_path")] = p3Db;
+                    pfParams[QStringLiteral("roots")] = QJsonArray{p3Root};
+                    pfParams[QStringLiteral("xmp")] = QJsonObject{{QStringLiteral("enabled"), true}};
+                    pfParams[QStringLiteral("watch")] = QJsonObject{
+                        {QStringLiteral("scan_on_startup"), false},
+                        {QStringLiteral("interval_ms"), 0},
+                        {QStringLiteral("realtime"), false},
+                    };
+                    PhotoModule pfMod(QStringLiteral("photo-prefetch"), pfParams);
+                    CHECK(pfMod.start(), "phase3: PhotoModule prefetch demarre");
+                    for (int p = 1; p <= 4; ++p) {
+                        bool okJson = false;
+                        const QByteArray raw = pfMod.libraryListJson(allFilter, p, 2, QString(), &okJson);
+                        const QJsonObject parsed = QJsonDocument::fromJson(raw).object();
+                        const QJsonObject expected = pfMod.libraryList(allFilter, p, 2);
+                        CHECK(okJson && parsed == expected,
+                              "phase3: libraryListJson + prefetch identique a libraryList");
+                    }
+                    pfMod.stop();
+                }
             }
 
             // Annulation cooperative de l'Indexer

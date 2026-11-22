@@ -14,9 +14,11 @@
 #include "morfphoto/LibraryMetadata.h"
 #include "morfphoto/SourceManager.h"
 
+#include <QByteArray>
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QStringList>
+#include <QThreadPool>
 #include <QVariantMap>
 #include <QVector>
 #include <QMutex>
@@ -84,6 +86,10 @@ public:
                             const QString& cursor = QString(),
                             bool* cursorValid = nullptr,
                             bool skipTotal = false) const;
+    QByteArray  libraryListJson(const LibraryFilter& filter, int page, int pageSize,
+                                const QString& cursor = QString(),
+                                bool* cursorValid = nullptr,
+                                bool skipTotal = false) const;
     QJsonObject librarySubfolders(const QString& folder) const;
     QJsonObject libraryFacets(const LibraryFilter& filter) const;
     QJsonObject libraryPhoto(int fileId, bool* found) const;
@@ -177,6 +183,12 @@ private:
     PhotoRepository* readRepo() const;
     QJsonObject cachedLibraryQuery(PhotoRepository* repo, const QString& key,
                                    const std::function<QJsonObject()>& compute) const;
+    std::shared_ptr<const LibraryIdList> cachedLibraryIds(
+        PhotoRepository* repo, quint64 epoch, qint64 dataVer, const QString& key,
+        const LibraryFilter& filter) const;
+    void scheduleLibraryPagePrefetch(quint64 epoch, qint64 dataVer, const QString& filterKey,
+                                     std::shared_ptr<const LibraryIdList> ids,
+                                     int nextPage, int pageSize, bool skipTotal) const;
     void reconcileRoots();
     void doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes,
                 QString trigger, std::shared_ptr<std::atomic_bool> cancel); // thread du pool
@@ -266,6 +278,23 @@ private:
     };
     mutable QMutex                         m_libraryIdCacheMutex;
     mutable std::list<LibraryIdCacheEntry> m_libraryIdCache;
+
+    // Cache LRU borne (max 2 entrees, ~1 Mo) de pages JSON pre-serialisees pour
+    // superposer la construction de page N+1 avec le transfert/parsing client de page N.
+    struct LibraryPageCacheEntry {
+        quint64    writeEpoch = 0;
+        qint64     dataVersion = 0;
+        QString    filterKey;
+        int        page = 1;
+        int        pageSize = 50;
+        bool       skipTotal = false;
+        bool       hasMore = false;
+        QByteArray json;
+    };
+    mutable QMutex                           m_libraryPageCacheMutex;
+    mutable std::list<LibraryPageCacheEntry> m_libraryPageCache;
+    mutable QString                          m_prefetchInFlightKey;
+    mutable QThreadPool                      m_prefetchPool;
 
     mutable QMutex m_stateMutex;         // protège le drapeau et l'état observable
     bool           m_indexing = false;

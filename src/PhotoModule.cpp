@@ -545,6 +545,7 @@ PhotoModule::PhotoModule(const QString& id, const QJsonObject& params, QObject* 
     m_library = params.value(QStringLiteral("xmp")).toObject().value(QStringLiteral("enabled")).toBool(false);
     m_instanceId = s_moduleInstanceCounter.fetch_add(1, std::memory_order_relaxed) + 1;
     m_thumbnailSupport = std::make_shared<ThumbnailSupport>(m_exiftoolBinary, m_stayOpen, m_thumbnailWorkers);
+    m_prefetchPool.setMaxThreadCount(1);
 }
 
 PhotoModule::~PhotoModule() {
@@ -712,6 +713,8 @@ void PhotoModule::submitRealtime() {
 void PhotoModule::stop() {
     m_started.store(false, std::memory_order_release);
     m_thumbnailEnabled.store(false, std::memory_order_release);
+    m_prefetchPool.clear();
+    m_prefetchPool.waitForDone();
     if (m_thumbnailTimer) {
         delete m_thumbnailTimer;
         m_thumbnailTimer = nullptr;
@@ -1285,6 +1288,106 @@ QJsonObject PhotoModule::librarySubfolders(const QString& folder) const {
                               [&]() { return repo->librarySubfolders(folder); });
 }
 
+std::shared_ptr<const LibraryIdList> PhotoModule::cachedLibraryIds(
+    PhotoRepository* repo, quint64 epoch, qint64 dataVer, const QString& key,
+    const LibraryFilter& filter) const {
+    {
+        QMutexLocker lock(&m_libraryIdCacheMutex);
+        for (auto it = m_libraryIdCache.begin(); it != m_libraryIdCache.end(); ++it) {
+            if (it->writeEpoch == epoch && it->dataVersion == dataVer && it->key == key) {
+                m_libraryIdCache.splice(m_libraryIdCache.begin(), m_libraryIdCache, it);
+                return it->list;
+            }
+        }
+    }
+    auto fresh = std::make_shared<LibraryIdList>(repo->libraryIdList(filter));
+    {
+        QMutexLocker lock(&m_libraryIdCacheMutex);
+        for (auto it = m_libraryIdCache.begin(); it != m_libraryIdCache.end(); ++it) {
+            if (it->writeEpoch == epoch && it->dataVersion == dataVer && it->key == key) {
+                m_libraryIdCache.splice(m_libraryIdCache.begin(), m_libraryIdCache, it);
+                return it->list;
+            }
+        }
+        m_libraryIdCache.push_front({epoch, dataVer, key, fresh});
+        if (m_libraryIdCache.size() > 8)
+            m_libraryIdCache.pop_back();
+    }
+    return fresh;
+}
+
+void PhotoModule::scheduleLibraryPagePrefetch(quint64 epoch, qint64 dataVer,
+                                              const QString& filterKey,
+                                              std::shared_ptr<const LibraryIdList> ids,
+                                              int nextPage, int pageSize, bool skipTotal) const {
+    if (!m_started.load(std::memory_order_acquire) || !ids || nextPage < 1 || pageSize < 1)
+        return;
+    const qint64 nextOffset = static_cast<qint64>(nextPage - 1) * pageSize;
+    if (nextOffset >= ids->ids.size())
+        return;
+
+    const QString prefetchKey = QStringLiteral("%1|%2|%3|%4|%5|%6")
+                                    .arg(epoch).arg(dataVer).arg(filterKey)
+                                    .arg(nextPage).arg(pageSize).arg(skipTotal ? 1 : 0);
+    {
+        QMutexLocker lock(&m_libraryPageCacheMutex);
+        for (const auto& entry : m_libraryPageCache) {
+            if (entry.writeEpoch == epoch && entry.dataVersion == dataVer
+                && entry.filterKey == filterKey && entry.page == nextPage
+                && entry.pageSize == pageSize && entry.skipTotal == skipTotal)
+                return;
+        }
+        if (m_prefetchInFlightKey == prefetchKey)
+            return;
+        m_prefetchInFlightKey = prefetchKey;
+    }
+
+    m_prefetchPool.start([this, epoch, dataVer, filterKey, ids = std::move(ids),
+                          nextPage, pageSize, skipTotal, prefetchKey]() {
+        auto clearInFlight = [this, &prefetchKey]() {
+            QMutexLocker lock(&m_libraryPageCacheMutex);
+            if (m_prefetchInFlightKey == prefetchKey)
+                m_prefetchInFlightKey.clear();
+        };
+        if (!m_started.load(std::memory_order_acquire)
+            || m_writeEpoch.load(std::memory_order_acquire) != epoch) {
+            clearInFlight();
+            return;
+        }
+        PhotoRepository* bgRepo = readRepo();
+        if (!bgRepo || bgRepo->dataVersion() != dataVer) {
+            clearInFlight();
+            return;
+        }
+        const QJsonObject obj = bgRepo->libraryListFromCache(
+            *ids, nextPage, pageSize, QString(), nullptr, skipTotal);
+        if (!m_started.load(std::memory_order_acquire)
+            || m_writeEpoch.load(std::memory_order_acquire) != epoch) {
+            clearInFlight();
+            return;
+        }
+        const QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+        const bool hasMore = obj.value(QStringLiteral("has_more")).toBool();
+        {
+            QMutexLocker lock(&m_libraryPageCacheMutex);
+            if (m_prefetchInFlightKey == prefetchKey)
+                m_prefetchInFlightKey.clear();
+            for (auto it = m_libraryPageCache.begin(); it != m_libraryPageCache.end(); ++it) {
+                if (it->writeEpoch == epoch && it->dataVersion == dataVer
+                    && it->filterKey == filterKey && it->page == nextPage
+                    && it->pageSize == pageSize && it->skipTotal == skipTotal) {
+                    m_libraryPageCache.splice(m_libraryPageCache.begin(), m_libraryPageCache, it);
+                    return;
+                }
+            }
+            m_libraryPageCache.push_front(
+                {epoch, dataVer, filterKey, nextPage, pageSize, skipTotal, hasMore, json});
+            while (m_libraryPageCache.size() > 2)
+                m_libraryPageCache.pop_back();
+        }
+    });
+}
+
 QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int pageSize,
                                      const QString& cursor, bool* cursorValid,
                                      bool skipTotal) const {
@@ -1299,6 +1402,11 @@ QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int 
     const qint64 dataVer = repo->dataVersion();
     const QString key = serializeLibraryFilter(filter);
 
+    if (cursor.isEmpty()) {
+        const auto ids = cachedLibraryIds(repo, epoch, dataVer, key, filter);
+        return repo->libraryListFromCache(*ids, page, pageSize, cursor, cursorValid, skipTotal);
+    }
+
     std::shared_ptr<const LibraryIdList> cached;
     {
         QMutexLocker lock(&m_libraryIdCacheMutex);
@@ -1310,40 +1418,80 @@ QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int 
             }
         }
     }
-
     if (cached) {
         bool cacheMiss = false;
         const QJsonObject res = repo->libraryListFromCache(
             *cached, page, pageSize, cursor, cursorValid, skipTotal, &cacheMiss);
         if (!cacheMiss)
             return res;
-        return repo->libraryList(filter, page, pageSize, cursor, cursorValid, skipTotal);
-    }
-
-    // Sans curseur : calculer la liste triee UNE fois (evite aussi le COUNT(DISTINCT))
-    // puis mettre en cache pour que les pages 2..N repondent en ~15 ms.
-    if (cursor.isEmpty()) {
-        auto fresh = std::make_shared<LibraryIdList>(repo->libraryIdList(filter));
-        {
-            QMutexLocker lock(&m_libraryIdCacheMutex);
-            bool exists = false;
-            for (auto it = m_libraryIdCache.begin(); it != m_libraryIdCache.end(); ++it) {
-                if (it->writeEpoch == epoch && it->dataVersion == dataVer && it->key == key) {
-                    m_libraryIdCache.splice(m_libraryIdCache.begin(), m_libraryIdCache, it);
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                m_libraryIdCache.push_front({epoch, dataVer, key, fresh});
-                if (m_libraryIdCache.size() > 8)
-                    m_libraryIdCache.pop_back();
-            }
-        }
-        return repo->libraryListFromCache(*fresh, page, pageSize, cursor, cursorValid, skipTotal);
     }
 
     return repo->libraryList(filter, page, pageSize, cursor, cursorValid, skipTotal);
+}
+
+QByteArray PhotoModule::libraryListJson(const LibraryFilter& filter, int page, int pageSize,
+                                        const QString& cursor, bool* cursorValid,
+                                        bool skipTotal) const {
+    PhotoRepository* repo = readRepo();
+    if (!repo) {
+        if (cursorValid)
+            *cursorValid = true;
+        return QByteArrayLiteral("{}");
+    }
+
+    if (!cursor.isEmpty()) {
+        const QJsonObject obj = libraryList(filter, page, pageSize, cursor, cursorValid, skipTotal);
+        if (cursorValid && !*cursorValid)
+            return {};
+        return QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    }
+
+    if (cursorValid)
+        *cursorValid = true;
+
+    const int boundedPage = qBound(1, page, 1000000);
+    const int boundedPageSize = qMax(1, pageSize);
+    const quint64 epoch = m_writeEpoch.load(std::memory_order_acquire);
+    const qint64 dataVer = repo->dataVersion();
+    const QString key = serializeLibraryFilter(filter);
+
+    {
+        QMutexLocker lock(&m_libraryPageCacheMutex);
+        for (auto it = m_libraryPageCache.begin(); it != m_libraryPageCache.end(); ++it) {
+            if (it->writeEpoch == epoch && it->dataVersion == dataVer
+                && it->filterKey == key && it->page == boundedPage
+                && it->pageSize == boundedPageSize && it->skipTotal == skipTotal) {
+                const QByteArray hit = it->json;
+                const bool hasMore = it->hasMore;
+                m_libraryPageCache.splice(m_libraryPageCache.begin(), m_libraryPageCache, it);
+                lock.unlock();
+                if (hasMore) {
+                    const auto ids = cachedLibraryIds(repo, epoch, dataVer, key, filter);
+                    scheduleLibraryPagePrefetch(epoch, dataVer, key, ids,
+                                                boundedPage + 1, boundedPageSize, skipTotal);
+                }
+                return hit;
+            }
+        }
+    }
+
+    const auto ids = cachedLibraryIds(repo, epoch, dataVer, key, filter);
+    const QJsonObject obj = repo->libraryListFromCache(
+        *ids, boundedPage, boundedPageSize, QString(), nullptr, skipTotal);
+    const QByteArray bytes = QJsonDocument(obj).toJson(QJsonDocument::Compact);
+    const bool hasMore = obj.value(QStringLiteral("has_more")).toBool();
+    {
+        QMutexLocker lock(&m_libraryPageCacheMutex);
+        m_libraryPageCache.push_front(
+            {epoch, dataVer, key, boundedPage, boundedPageSize, skipTotal, hasMore, bytes});
+        while (m_libraryPageCache.size() > 2)
+            m_libraryPageCache.pop_back();
+    }
+    if (hasMore) {
+        scheduleLibraryPagePrefetch(epoch, dataVer, key, ids,
+                                    boundedPage + 1, boundedPageSize, skipTotal);
+    }
+    return bytes;
 }
 
 QJsonObject PhotoModule::libraryFacets(const LibraryFilter& filter) const {

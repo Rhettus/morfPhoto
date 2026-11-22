@@ -230,6 +230,7 @@ bool PhotoRepository::open(const QString& dbPath, bool readOnly) {
             q.exec(QStringLiteral("PRAGMA busy_timeout = 5000"));
             q.exec(QStringLiteral("PRAGMA cache_size = -65536"));
             q.exec(QStringLiteral("PRAGMA temp_store = MEMORY"));
+            q.exec(QStringLiteral("PRAGMA mmap_size = 268435456"));
         }
         QSqlQuery fq(database);
         m_hasFilesFts = fq.exec(QStringLiteral(
@@ -870,49 +871,91 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
     if (fileIds.isEmpty())
         return {};
     QStringList idList;
+    idList.reserve(fileIds.size());
     for (int id : fileIds)
         idList << QString::number(id);    // entiers venus de la base : interpolation sure
     const QString ids = idList.join(QLatin1Char(','));
 
-    QHash<int, QJsonArray> keywords;
-    {
-        QSqlQuery q(db());
-        q.exec(QStringLiteral("SELECT k.version_id, k.keyword FROM library_keywords k "
-                              "JOIN library_versions v ON v.id = k.version_id "
-                              "WHERE v.file_id IN (%1) ORDER BY k.keyword").arg(ids));
-        while (q.next())
-            keywords[q.value(0).toInt()].append(q.value(1).toString());
-    }
+    auto valOrNull = [](const QSqlQuery& q, int idx) -> QJsonValue {
+        const QVariant v = q.value(idx);
+        return v.isNull() ? QJsonValue(QJsonValue::Null) : QJsonValue::fromVariant(v);
+    };
 
-    QHash<int, QJsonArray> versions;
+    struct PendingVersion {
+        int versionId = 0;
+        int fileId = 0;
+        QJsonObject obj;
+    };
+    QVector<PendingVersion> pendingVersions;
+    pendingVersions.reserve(fileIds.size());
+    QStringList versionIdList;
+    versionIdList.reserve(fileIds.size());
     {
         QSqlQuery q(db());
         q.exec(QStringLiteral("SELECT id, file_id, version, is_copy, sidecar, rating, rejected, labels, "
                               "edited, taken_at, latitude, longitude, title, description, creator, rights, "
                               "version_name%1 FROM library_versions WHERE file_id IN (%2) ORDER BY version")
                    .arg(withRaw ? QStringLiteral(", raw_xmp") : QString(), ids));
-        QStringList names;
         while (q.next()) {
-            if (names.isEmpty())
-                names = queryFieldNames(q);
-            QJsonObject o = rowToJson(q, names);
-            const int versionId = o.take(QStringLiteral("id")).toInt();
-            const int fileId = o.take(QStringLiteral("file_id")).toInt();
-            o["copy"] = o.take(QStringLiteral("is_copy")).toInt() != 0;
-            o["rejected"] = o.value(QStringLiteral("rejected")).toInt() != 0;
-            const QJsonValue edited = o.value(QStringLiteral("edited"));
-            o["edited"] = edited.isNull() ? QJsonValue(QJsonValue::Null) : QJsonValue(edited.toInt() != 0);
-            o["has_sidecar"] = !o.value(QStringLiteral("sidecar")).isNull();
-            o["keywords"] = keywords.value(versionId);
+            const int versionId = q.value(0).toInt();
+            const int fileId = q.value(1).toInt();
+            versionIdList << QString::number(versionId);
+
+            const QVariant sidecarV = q.value(4);
+            const QVariant editedV = q.value(8);
+            QJsonObject o;
+            o.insert(QStringLiteral("version"), q.value(2).toInt());
+            o.insert(QStringLiteral("copy"), q.value(3).toInt() != 0);
+            o.insert(QStringLiteral("sidecar"), sidecarV.isNull() ? QJsonValue(QJsonValue::Null) : QJsonValue(sidecarV.toString()));
+            o.insert(QStringLiteral("rating"), q.value(5).toInt());
+            o.insert(QStringLiteral("rejected"), q.value(6).toInt() != 0);
+            o.insert(QStringLiteral("labels"), q.value(7).toInt());
+            o.insert(QStringLiteral("edited"), editedV.isNull() ? QJsonValue(QJsonValue::Null) : QJsonValue(editedV.toInt() != 0));
+            o.insert(QStringLiteral("taken_at"), valOrNull(q, 9));
+            o.insert(QStringLiteral("latitude"), valOrNull(q, 10));
+            o.insert(QStringLiteral("longitude"), valOrNull(q, 11));
+            o.insert(QStringLiteral("title"), valOrNull(q, 12));
+            o.insert(QStringLiteral("description"), valOrNull(q, 13));
+            o.insert(QStringLiteral("creator"), valOrNull(q, 14));
+            o.insert(QStringLiteral("rights"), valOrNull(q, 15));
+            o.insert(QStringLiteral("version_name"), valOrNull(q, 16));
+            o.insert(QStringLiteral("has_sidecar"), !sidecarV.isNull());
             if (withRaw) {
-                const QJsonDocument raw = QJsonDocument::fromJson(o.value(QStringLiteral("raw_xmp")).toString().toUtf8());
-                o["raw_xmp"] = raw.isObject() ? QJsonValue(raw.object()) : QJsonValue(QJsonValue::Null);
+                const QVariant rawV = q.value(17);
+                if (rawV.isNull()) {
+                    o.insert(QStringLiteral("raw_xmp"), QJsonValue::Null);
+                } else {
+                    const QJsonDocument raw = QJsonDocument::fromJson(rawV.toString().toUtf8());
+                    o.insert(QStringLiteral("raw_xmp"), raw.isObject() ? QJsonValue(raw.object()) : QJsonValue(QJsonValue::Null));
+                }
             }
-            versions[fileId].append(o);
+            pendingVersions.push_back({versionId, fileId, std::move(o)});
         }
     }
 
+    QHash<int, QJsonArray> keywords;
+    if (!versionIdList.isEmpty()) {
+        // library_keywords est PRIMARY KEY (version_id, keyword) WITHOUT ROWID :
+        // requete directe sans joindre library_versions et deja triee par keyword.
+        QSqlQuery q(db());
+        q.exec(QStringLiteral("SELECT version_id, keyword FROM library_keywords "
+                              "WHERE version_id IN (%1)").arg(versionIdList.join(QLatin1Char(','))));
+        while (q.next())
+            keywords[q.value(0).toInt()].append(q.value(1).toString());
+    }
+
+    QHash<int, QJsonArray> versions;
+    versions.reserve(fileIds.size());
+    const QJsonArray emptyKeywords;
+    for (PendingVersion& pv : pendingVersions) {
+        const auto kwIt = keywords.constFind(pv.versionId);
+        pv.obj.insert(QStringLiteral("keywords"), kwIt != keywords.constEnd() ? kwIt.value() : emptyKeywords);
+        versions[pv.fileId].append(std::move(pv.obj));
+    }
+
+    static const QJsonArray kDefaultMatched{0};
     QHash<int, QJsonObject> rows;
+    rows.reserve(fileIds.size());
     {
         QSqlQuery q(db());
         q.exec(QStringLiteral(
@@ -923,14 +966,48 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
             "lf.body_serial, lf.iso_label, lf.aperture_label, lf.focal_label, lf.shutter_label%1 "
             "FROM files f JOIN library_files lf ON lf.file_id = f.id JOIN folders fo ON fo.id = f.folder_id "
             "WHERE f.id IN (%2)").arg(withRaw ? QStringLiteral(", f.raw_exif") : QString(), ids));
-        QStringList names;
         while (q.next()) {
-            if (names.isEmpty())
-                names = queryFieldNames(q);
-            QJsonObject o = rowToJson(q, names);
-            const int id = o.value(QStringLiteral("id")).toInt();
-            const QString root = o.value(QStringLiteral("root")).toString();
-            const QString filePath = o.value(QStringLiteral("path")).toString();
+            const int id = q.value(0).toInt();
+            const QString filePath = q.value(1).toString();
+            const QString root = q.value(2).toString();
+            QJsonObject o;
+            o.insert(QStringLiteral("id"), id);
+            o.insert(QStringLiteral("path"), filePath);
+            o.insert(QStringLiteral("root"), root);
+            o.insert(QStringLiteral("directory"), valOrNull(q, 3));
+            o.insert(QStringLiteral("filename"), valOrNull(q, 4));
+            o.insert(QStringLiteral("extension"), valOrNull(q, 5));
+            o.insert(QStringLiteral("file_type"), valOrNull(q, 6));
+            o.insert(QStringLiteral("size"), valOrNull(q, 7));
+            o.insert(QStringLiteral("mtime"), valOrNull(q, 8));
+            o.insert(QStringLiteral("make"), valOrNull(q, 9));
+            o.insert(QStringLiteral("camera_model"), valOrNull(q, 10));
+            o.insert(QStringLiteral("lens"), valOrNull(q, 11));
+            o.insert(QStringLiteral("focal_length"), valOrNull(q, 12));
+            o.insert(QStringLiteral("focal_length_35mm"), valOrNull(q, 13));
+            o.insert(QStringLiteral("aperture"), valOrNull(q, 14));
+            o.insert(QStringLiteral("shutter_speed"), valOrNull(q, 15));
+            o.insert(QStringLiteral("shutter_speed_s"), valOrNull(q, 16));
+            o.insert(QStringLiteral("iso"), valOrNull(q, 17));
+            o.insert(QStringLiteral("exposure_compensation"), valOrNull(q, 18));
+            o.insert(QStringLiteral("kind"), valOrNull(q, 19));
+            o.insert(QStringLiteral("file_ext"), valOrNull(q, 20));
+            o.insert(QStringLiteral("camera"), valOrNull(q, 21));
+            o.insert(QStringLiteral("body_key"), valOrNull(q, 22));
+            o.insert(QStringLiteral("body_serial"), valOrNull(q, 23));
+            o.insert(QStringLiteral("iso_label"), valOrNull(q, 24));
+            o.insert(QStringLiteral("aperture_label"), valOrNull(q, 25));
+            o.insert(QStringLiteral("focal_label"), valOrNull(q, 26));
+            o.insert(QStringLiteral("shutter_label"), valOrNull(q, 27));
+            if (withRaw) {
+                const QVariant rawV = q.value(28);
+                if (rawV.isNull()) {
+                    o.insert(QStringLiteral("raw_exif"), QJsonValue::Null);
+                } else {
+                    const QJsonDocument d = QJsonDocument::fromJson(rawV.toString().toUtf8());
+                    o.insert(QStringLiteral("raw_exif"), d.isObject() ? QJsonValue(d.object()) : QJsonValue(QJsonValue::Null));
+                }
+            }
             // Le client voit ces fichiers sous un autre chemin que le conteneur.
             QString relPath;
             if (root == QLatin1String("/") && filePath.startsWith(QLatin1Char('/'))) {
@@ -941,22 +1018,29 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
             } else {
                 relPath = QDir(root).relativeFilePath(filePath);
             }
-            o["relative_path"] = relPath;
-            o["versions"] = versions.value(id);
-            if (matched.contains(id)) {
-                QJsonArray list;
-                for (const QString& version : matched.value(id).split(QLatin1Char(',')))
-                    list.append(version.toInt());
-                o["matched_versions"] = list;
+            o.insert(QStringLiteral("relative_path"), relPath);
+            o.insert(QStringLiteral("versions"), versions.value(id));
+            const auto mIt = matched.constFind(id);
+            if (mIt != matched.constEnd()) {
+                if (mIt.value() == QLatin1String("0")) {
+                    o.insert(QStringLiteral("matched_versions"), kDefaultMatched);
+                } else {
+                    QJsonArray list;
+                    for (const QString& version : mIt.value().split(QLatin1Char(',')))
+                        list.append(version.toInt());
+                    o.insert(QStringLiteral("matched_versions"), list);
+                }
             }
-            rows.insert(id, o);
+            rows.insert(id, std::move(o));
         }
     }
 
     QJsonArray items;
-    for (int id : fileIds)
-        if (rows.contains(id))
-            items.append(rows.value(id));
+    for (int id : fileIds) {
+        const auto it = rows.constFind(id);
+        if (it != rows.constEnd())
+            items.append(it.value());
+    }
     return items;
 }
 

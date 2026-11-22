@@ -185,11 +185,11 @@ PhotoApi::Result PhotoApi::handle(const QByteArray& method, const QString& path,
         const QString skipTotalParam = query.queryItemValue(QStringLiteral("skip_total"));
         const bool skipTotal = skipTotalParam == QLatin1String("true") || skipTotalParam == QLatin1String("1");
         bool cursorValid = true;
-        const QJsonObject res = m_module->libraryList(filter, page, qMin(pageSize, kMaxPageSize),
-                                                    cursor, &cursorValid, skipTotal);
+        const QByteArray payload = m_module->libraryListJson(filter, page, qMin(pageSize, kMaxPageSize),
+                                                             cursor, &cursorValid, skipTotal);
         if (!cursorValid)
             return error(400, QStringLiteral("bad_request"), QStringLiteral("cursor invalide"));
-        return ok(res);
+        return {200, payload};
     }
 
     // ---- /photos... ----
