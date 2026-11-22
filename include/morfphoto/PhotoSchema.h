@@ -23,7 +23,7 @@
 // -----------------------------------------------------------------------------
 namespace morfphoto {
 
-inline constexpr int kSchemaVersion = 9;
+inline constexpr int kSchemaVersion = 10;
 
 // Instructions de la migration 001 (création initiale). La colonne calculée
 // `taken_year` permet de regrouper par année sans reparser la date à chaque fois.
@@ -304,6 +304,19 @@ inline QStringList schemaV9Statements() {
     };
 }
 
+// Migration 010 : index couvrants sur `files` et `library_versions` pour eviter
+// de lire les gros blobs `raw_exif` / `raw_xmp` lors des parcours catalogue et CLIP.
+inline QStringList schemaV10Statements() {
+    return {
+        QStringLiteral(
+            "CREATE INDEX IF NOT EXISTS idx_files_state_dir_meta "
+            "ON files(state, directory, path, size, mtime)"),
+        QStringLiteral(
+            "CREATE INDEX IF NOT EXISTS idx_library_ver_cover "
+            "ON library_versions(file_id, version, taken_at, edited, rejected, rating, labels)"),
+    };
+}
+
 // Instructions à exécuter pour atteindre une version de schéma donnée. Le dépôt
 // applique dans l'ordre chaque version manquante (voir applyMigrations).
 inline QStringList migrationStatements(int version) {
@@ -317,6 +330,7 @@ inline QStringList migrationStatements(int version) {
     case 7:  return schemaV7Statements();
     case 8:  return schemaV8Statements();
     case 9:  return schemaV9Statements();
+    case 10: return schemaV10Statements();
     default: return {};
     }
 }

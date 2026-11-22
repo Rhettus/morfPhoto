@@ -1290,9 +1290,59 @@ QJsonObject PhotoModule::libraryList(const LibraryFilter& filter, int page, int 
                                      bool skipTotal) const {
     PhotoRepository* repo = readRepo();
     if (!repo) {
-        if (cursorValid) *cursorValid = true;
+        if (cursorValid)
+            *cursorValid = true;
         return QJsonObject{};
     }
+
+    const quint64 epoch = m_writeEpoch.load(std::memory_order_acquire);
+    const qint64 dataVer = repo->dataVersion();
+    const QString key = serializeLibraryFilter(filter);
+
+    std::shared_ptr<const LibraryIdList> cached;
+    {
+        QMutexLocker lock(&m_libraryIdCacheMutex);
+        for (auto it = m_libraryIdCache.begin(); it != m_libraryIdCache.end(); ++it) {
+            if (it->writeEpoch == epoch && it->dataVersion == dataVer && it->key == key) {
+                m_libraryIdCache.splice(m_libraryIdCache.begin(), m_libraryIdCache, it);
+                cached = it->list;
+                break;
+            }
+        }
+    }
+
+    if (cached) {
+        bool cacheMiss = false;
+        const QJsonObject res = repo->libraryListFromCache(
+            *cached, page, pageSize, cursor, cursorValid, skipTotal, &cacheMiss);
+        if (!cacheMiss)
+            return res;
+        return repo->libraryList(filter, page, pageSize, cursor, cursorValid, skipTotal);
+    }
+
+    // Sans curseur : calculer la liste triee UNE fois (evite aussi le COUNT(DISTINCT))
+    // puis mettre en cache pour que les pages 2..N repondent en ~15 ms.
+    if (cursor.isEmpty()) {
+        auto fresh = std::make_shared<LibraryIdList>(repo->libraryIdList(filter));
+        {
+            QMutexLocker lock(&m_libraryIdCacheMutex);
+            bool exists = false;
+            for (auto it = m_libraryIdCache.begin(); it != m_libraryIdCache.end(); ++it) {
+                if (it->writeEpoch == epoch && it->dataVersion == dataVer && it->key == key) {
+                    m_libraryIdCache.splice(m_libraryIdCache.begin(), m_libraryIdCache, it);
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                m_libraryIdCache.push_front({epoch, dataVer, key, fresh});
+                if (m_libraryIdCache.size() > 8)
+                    m_libraryIdCache.pop_back();
+            }
+        }
+        return repo->libraryListFromCache(*fresh, page, pageSize, cursor, cursorValid, skipTotal);
+    }
+
     return repo->libraryList(filter, page, pageSize, cursor, cursorValid, skipTotal);
 }
 

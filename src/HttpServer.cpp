@@ -298,7 +298,7 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
         };
         QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:8794/search")));
         request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-        request.setTransferTimeout(8000);
+        request.setTransferTimeout(20000);
         auto* result = m_proxyManager->post(request, body);
         auto abortOnClose = [release, resultPtr = QPointer<QNetworkReply>(result)]() {
             release();

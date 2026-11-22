@@ -142,9 +142,16 @@ def main():
                             vision.close()
             time.sleep(10)
 
+    def warmup_text():
+        try:
+            model.text("photo")
+        except Exception as error:
+            print(f"CLIP text warmup skipped: {type(error).__name__}: {error}", flush=True)
+
     try:
         with ThreadingHTTPServer(("127.0.0.1", 8794), Handler) as server:
             print("CLIP worker ready", flush=True)
+            Thread(target=warmup_text, daemon=True).start()
             Thread(target=backfill, daemon=True).start()
             server.serve_forever()
     finally:

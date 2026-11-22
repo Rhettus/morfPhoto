@@ -143,8 +143,11 @@ def _build_where(folder, recursive, filters, has_files_fts=False):
         if norm_folder == "/":
             clauses.append("f.directory >= '/' AND f.directory < '0'")
         else:
-            clauses.append("(f.directory = ? OR (f.directory >= ? AND f.directory < ?))")
-            binds.extend((norm_folder, norm_folder + "/", norm_folder + "0"))
+            clauses.append(
+                "f.directory >= ? AND f.directory < ? "
+                "AND (f.directory = ? OR f.directory >= ?)"
+            )
+            binds.extend((norm_folder, norm_folder + "0", norm_folder, norm_folder + "/"))
     else:
         clauses.append("f.directory = ?")
         binds.append(norm_folder)
@@ -190,6 +193,7 @@ class SemanticSearch:
             self._local.conn = None
             self._local.inode = None
             self._local.has_files_fts = False
+            self._local.has_cover_idx = False
 
     def _get_db(self):
         try:
@@ -210,6 +214,7 @@ class SemanticSearch:
             self._local.conn = None
             self._local.inode = None
             self._local.has_files_fts = False
+            self._local.has_cover_idx = False
         conn = sqlite3.connect(self.catalog.as_uri() + "?mode=ro", uri=True)
         try:
             conn.execute("PRAGMA busy_timeout = 5000")
@@ -221,12 +226,18 @@ class SemanticSearch:
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_fts'"
                 ).fetchone()
             )
+            has_cover_idx = bool(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_files_state_dir_meta'"
+                ).fetchone()
+            )
         except Exception:
             conn.close()
             raise
         self._local.conn = conn
         self._local.inode = inode
         self._local.has_files_fts = has_files_fts
+        self._local.has_cover_idx = has_cover_idx
         return conn, inode, db_stat
 
     def _load_candidates(self, sql, binds, track_hit=False):
@@ -276,11 +287,9 @@ class SemanticSearch:
         if not isinstance(filters, dict) or filters.keys() - allowed:
             raise ValueError("Unsupported semantic search filter")
 
-        has_files_fts = False
-        filename = filters.get("filename")
-        if isinstance(filename, str) and len(filename) >= 3:
-            self._get_db()
-            has_files_fts = getattr(self._local, "has_files_fts", False)
+        self._get_db()
+        has_files_fts = getattr(self._local, "has_files_fts", False)
+        has_cover_idx = getattr(self._local, "has_cover_idx", False)
         where_sql, binds = _build_where(folder, recursive, filters, has_files_fts)
         needs_lf = any(_parse_str_list(filters, key) for key in _LIBRARY_FILE_FILTERS)
 
@@ -305,12 +314,17 @@ class SemanticSearch:
             query = self.model.text(text)
 
         lf_join = "JOIN library_files lf ON lf.file_id = f.id " if needs_lf else ""
+        ver_join = (
+            "CROSS JOIN library_versions v ON v.file_id = f.id AND v.version = 0 "
+            if (not needs_lf and has_cover_idx)
+            else "JOIN library_versions v ON v.file_id = f.id AND v.version = 0 "
+        )
         sql = (
             "SELECT f.id, f.path, f.size, f.mtime "
             "FROM files f "
             + lf_join
-            + "JOIN library_versions v ON v.file_id = f.id AND v.version = 0 "
-            "WHERE " + where_sql
+            + ver_join
+            + "WHERE " + where_sql
         )
         if debug:
             t_sql0 = time.perf_counter()

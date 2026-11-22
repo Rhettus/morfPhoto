@@ -1344,6 +1344,33 @@ int main(int argc, char** argv) {
                 bool badValid = true;
                 p3Repo.libraryList(allFilter, 1, 2, QStringLiteral("!!!not-valid!!!"), &badValid);
                 CHECK(!badValid, "phase3: curseur invalide rejete (cursorValid=false)");
+
+                // Cache LibraryIdList : memes resultats bit-a-bit que libraryList SQL
+                const LibraryIdList cachedIds = p3Repo.libraryIdList(allFilter);
+                CHECK(cachedIds.ids == expectedIds,
+                      "phase3: libraryIdList renvoie le meme ordre que libraryList SQL");
+                QVector<int> cachedPageIds;
+                QString cachedCur;
+                for (int p = 1; p <= 4; ++p) {
+                    bool cv = false;
+                    const QJsonObject cp = p3Repo.libraryListFromCache(cachedIds, p, 2, QString(), &cv);
+                    const QJsonObject sp = p3Repo.libraryList(allFilter, p, 2);
+                    CHECK(cv && cp == sp, "phase3: libraryListFromCache identique a libraryList SQL");
+                    for (const QJsonValue& v : cp.value(QStringLiteral("items")).toArray())
+                        cachedPageIds.append(v.toObject().value(QStringLiteral("id")).toInt());
+                    if (p == 1)
+                        cachedCur = cp.value(QStringLiteral("next_cursor")).toString();
+                }
+                CHECK(cachedPageIds == expectedIds,
+                      "phase3: pagination offset via LibraryIdList couvre les 7 photos");
+                {
+                    bool cv = false;
+                    bool miss = true;
+                    const QJsonObject cp2 = p3Repo.libraryListFromCache(cachedIds, 1, 2, cachedCur, &cv, false, &miss);
+                    const QJsonObject sp2 = p3Repo.libraryList(allFilter, 1, 2, cachedCur);
+                    CHECK(cv && !miss && cp2 == sp2,
+                          "phase3: pagination curseur via LibraryIdList identique a SQL");
+                }
             }
 
             // Annulation cooperative de l'Indexer

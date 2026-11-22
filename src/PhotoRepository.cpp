@@ -652,8 +652,17 @@ QString libraryWhere(const LibraryFilter& f, QVariantList& binds, bool hasFilesF
     }
     if (!f.folderPath.isEmpty()) {
         if (f.recursive) {
-            c << QStringLiteral("(f.directory = ? OR (f.directory >= ? AND f.directory < ?))");
-            binds << f.folderPath << f.folderPath + QLatin1Char('/') << f.folderPath + QLatin1Char('0');
+            if (f.folderPath == QLatin1String("/")) {
+                c << QStringLiteral("f.directory >= '/' AND f.directory < '0'");
+            } else {
+                // Plage contigue [folder, folder0) exploitable par idx_files_state_dir_meta,
+                // raffinee dans l'index couvrant pour exclure /folder-autre.
+                c << QStringLiteral(
+                    "f.directory >= ? AND f.directory < ? "
+                    "AND (f.directory = ? OR f.directory >= ?)");
+                binds << f.folderPath << f.folderPath + QLatin1Char('0')
+                      << f.folderPath << f.folderPath + QLatin1Char('/');
+            }
         } else {
             c << QStringLiteral("f.directory = ?");
             binds << f.folderPath;
@@ -921,8 +930,18 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
             QJsonObject o = rowToJson(q, names);
             const int id = o.value(QStringLiteral("id")).toInt();
             const QString root = o.value(QStringLiteral("root")).toString();
+            const QString filePath = o.value(QStringLiteral("path")).toString();
             // Le client voit ces fichiers sous un autre chemin que le conteneur.
-            o["relative_path"] = QDir(root).relativeFilePath(o.value(QStringLiteral("path")).toString());
+            QString relPath;
+            if (root == QLatin1String("/") && filePath.startsWith(QLatin1Char('/'))) {
+                relPath = filePath.mid(1);
+            } else if (!root.isEmpty() && filePath.size() > root.size()
+                       && filePath.startsWith(root) && filePath.at(root.size()) == QLatin1Char('/')) {
+                relPath = filePath.mid(root.size() + 1);
+            } else {
+                relPath = QDir(root).relativeFilePath(filePath);
+            }
+            o["relative_path"] = relPath;
             o["versions"] = versions.value(id);
             if (matched.contains(id)) {
                 QJsonArray list;
@@ -1044,6 +1063,109 @@ QJsonObject PhotoRepository::libraryList(const LibraryFilter& filter, int page, 
     o["has_more"]    = hasMore;
     o["next_cursor"] = (hasMore && !ids.isEmpty())
         ? QJsonValue(encodeLibraryCursor(lastTakenAt, ids.last()))
+        : QJsonValue(QJsonValue::Null);
+    return o;
+}
+
+LibraryIdList PhotoRepository::libraryIdList(const LibraryFilter& filter) {
+    QVariantList binds;
+    const QString tail = QLatin1String(kLibraryFrom) + libraryWhere(filter, binds, m_hasFilesFts);
+    LibraryIdList out;
+    QSqlQuery q(db());
+    run(q, QStringLiteral("SELECT f.id, GROUP_CONCAT(v.version)") + tail +
+               QStringLiteral(" GROUP BY f.id ORDER BY MIN(v.taken_at) IS NULL, MIN(v.taken_at), f.id"),
+        binds);
+    while (q.next()) {
+        const int id = q.value(0).toInt();
+        out.ids.append(id);
+        const QString matched = q.value(1).toString();
+        if (matched != QLatin1String("0"))
+            out.nonDefaultMatched.insert(id, matched);
+    }
+    return out;
+}
+
+QJsonObject PhotoRepository::libraryListFromCache(const LibraryIdList& cached, int page, int pageSize,
+                                                  const QString& cursor, bool* cursorValid,
+                                                  bool skipTotal, bool* cacheMiss) {
+    if (cacheMiss)
+        *cacheMiss = false;
+    LibraryCursor parsedCursor;
+    const bool useCursor = !cursor.isEmpty();
+    if (useCursor && !decodeLibraryCursor(cursor, &parsedCursor)) {
+        if (cursorValid)
+            *cursorValid = false;
+        return {};
+    }
+    if (cursorValid)
+        *cursorValid = true;
+
+    page = qBound(1, page, 1000000);
+    pageSize = qMax(1, pageSize);
+
+    qsizetype startIdx = 0;
+    if (useCursor) {
+        const qsizetype pos = cached.ids.indexOf(parsedCursor.fileId);
+        if (pos < 0) {
+            if (cacheMiss)
+                *cacheMiss = true;
+            return {};
+        }
+        startIdx = pos + 1;
+    } else {
+        const qint64 offset = static_cast<qint64>(page - 1) * pageSize;
+        startIdx = (offset >= cached.ids.size()) ? cached.ids.size() : static_cast<qsizetype>(offset);
+    }
+
+    const qsizetype count = qMin<qsizetype>(pageSize, qMax<qsizetype>(0, cached.ids.size() - startIdx));
+    const bool hasMore = (startIdx + count) < cached.ids.size();
+
+    QVector<int> pageIds;
+    pageIds.reserve(count);
+    QHash<int, QString> pageMatched;
+    pageMatched.reserve(count);
+    for (qsizetype i = 0; i < count; ++i) {
+        const int id = cached.ids.at(startIdx + i);
+        pageIds.append(id);
+        const auto it = cached.nonDefaultMatched.constFind(id);
+        pageMatched.insert(id, it != cached.nonDefaultMatched.constEnd()
+                                   ? it.value()
+                                   : QStringLiteral("0"));
+    }
+
+    QVariant lastTakenAt;
+    if (hasMore && !pageIds.isEmpty()) {
+        const int lastId = pageIds.last();
+        const QStringList vParts = pageMatched.value(lastId).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        QStringList vHolders;
+        QVariantList vBinds;
+        vBinds << lastId;
+        for (const QString& vp : vParts) {
+            bool okV = false;
+            const int vNum = vp.toInt(&okV);
+            if (okV) {
+                vHolders << QStringLiteral("?");
+                vBinds << vNum;
+            }
+        }
+        QSqlQuery q(db());
+        const QString vSql = vHolders.isEmpty()
+            ? QStringLiteral("SELECT MIN(taken_at) FROM library_versions WHERE file_id = ?")
+            : QStringLiteral("SELECT MIN(taken_at) FROM library_versions WHERE file_id = ? AND version IN (%1)")
+                  .arg(vHolders.join(QLatin1Char(',')));
+        if (run(q, vSql, vBinds) && q.next())
+            lastTakenAt = q.value(0);
+    }
+
+    QJsonObject o;
+    o["items"]       = libraryItems(pageIds, pageMatched, false);
+    if (!skipTotal)
+        o["total"]   = static_cast<int>(cached.ids.size());
+    o["page"]        = page;
+    o["page_size"]   = pageSize;
+    o["has_more"]    = hasMore;
+    o["next_cursor"] = (hasMore && !pageIds.isEmpty())
+        ? QJsonValue(encodeLibraryCursor(lastTakenAt, pageIds.last()))
         : QJsonValue(QJsonValue::Null);
     return o;
 }

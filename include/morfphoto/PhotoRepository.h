@@ -29,6 +29,13 @@
 // -----------------------------------------------------------------------------
 namespace morfphoto {
 
+// Liste ordonnee des identifiants correspondant a un filtre bibliotheque,
+// mise en cache par PhotoModule pour servir toutes les pages en O(pageSize).
+struct LibraryIdList {
+    QVector<int>        ids;
+    QHash<int, QString> nonDefaultMatched;   // file_id -> GROUP_CONCAT(version) si != "0"
+};
+
 class PhotoRepository {
 public:
     explicit PhotoRepository(QString connectionName);
@@ -109,6 +116,12 @@ public:
                             const QString& cursor = QString(),
                             bool* cursorValid = nullptr,
                             bool skipTotal = false);
+    LibraryIdList libraryIdList(const LibraryFilter& filter);
+    QJsonObject libraryListFromCache(const LibraryIdList& cached, int page, int pageSize,
+                                     const QString& cursor = QString(),
+                                     bool* cursorValid = nullptr,
+                                     bool skipTotal = false,
+                                     bool* cacheMiss = nullptr);
     QJsonObject librarySubfolders(const QString& folder);
     QJsonObject libraryFacets(const LibraryFilter& filter);
     QJsonObject libraryPhoto(int fileId, bool* found);

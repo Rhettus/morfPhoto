@@ -197,15 +197,19 @@ SCHEMA_V9 = [
     END""",
     "INSERT INTO files_fts(files_fts) VALUES('rebuild')",
 ]
+SCHEMA_V10 = [
+    "CREATE INDEX IF NOT EXISTS idx_files_state_dir_meta ON files(state, directory, path, size, mtime)",
+    "CREATE INDEX IF NOT EXISTS idx_library_ver_cover ON library_versions(file_id, version, taken_at, edited, rejected, rating, labels)",
+]
 
 
-def create_catalog_db(path: Path, version: int = 9):
+def create_catalog_db(path: Path, version: int = 10):
     with closing(sqlite3.connect(path)) as db:
         db.execute("PRAGMA foreign_keys = ON")
         db.execute("PRAGMA journal_mode = WAL")
         migrations = (
             SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4,
-            SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9,
+            SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10,
         )
         for stmts in migrations[:version]:
             for s in stmts:

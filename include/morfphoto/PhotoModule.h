@@ -46,6 +46,7 @@ class QTimer;
 namespace morfphoto {
 
 class PhotoRepository;
+struct LibraryIdList;
 class FolderWatcher;
 struct ThumbnailSupport;
 
@@ -254,6 +255,17 @@ private:
     };
     mutable QMutex                       m_libraryCacheMutex;
     mutable std::list<LibraryCacheEntry> m_libraryCache;
+
+    // Cache LRU borne (max 8 entrees) des listes ordonnees d'IDs par filtre pour
+    // servir page 2..N de /api/v1/library en O(pageSize) sans re-trier toute la base.
+    struct LibraryIdCacheEntry {
+        quint64                              writeEpoch = 0;
+        qint64                               dataVersion = 0;
+        QString                              key;
+        std::shared_ptr<const LibraryIdList> list;
+    };
+    mutable QMutex                         m_libraryIdCacheMutex;
+    mutable std::list<LibraryIdCacheEntry> m_libraryIdCache;
 
     mutable QMutex m_stateMutex;         // protège le drapeau et l'état observable
     bool           m_indexing = false;
