@@ -5,11 +5,13 @@
  */
 
 #pragma once
-#include <QString>
-#include <QVariant>
-#include <QJsonObject>
+#include <QDir>
 #include <QHash>
+#include <QJsonObject>
+#include <QMetaType>
+#include <QString>
 #include <QStringList>
+#include <QVariant>
 #include <QVector>
 
 // -----------------------------------------------------------------------------
@@ -90,6 +92,56 @@ struct FolderRow {
     bool    removable = false;
 };
 
+// Portée ciblée d'une passe d'indexation (ex. événement inotify sur un répertoire
+// ou sous-arbre précis). Si `path` est vide, vise toute la sélection `folderId`.
+struct IndexScope {
+    int     folderId  = 0;
+    QString path;
+    bool    recursive = false;
+
+    bool operator==(const IndexScope& other) const {
+        return folderId == other.folderId && path == other.path && recursive == other.recursive;
+    }
+};
+
+inline bool isSubpathOf(const QString& candidate, const QString& ancestor) {
+    if (ancestor.isEmpty() || candidate == ancestor)
+        return false;
+    if (ancestor == QLatin1String("/"))
+        return candidate.startsWith(QLatin1Char('/'));
+    return candidate.startsWith(ancestor + QLatin1Char('/'));
+}
+
+// Fusionne une portée dans une liste en éliminant les doublons et les portées
+// déjà couvertes par un ancêtre récursif de la même sélection.
+inline void mergeScope(QVector<IndexScope>& scopes, IndexScope incoming) {
+    if (!incoming.path.isEmpty())
+        incoming.path = QDir::cleanPath(incoming.path);
+    for (const IndexScope& existing : scopes) {
+        if (existing.folderId != incoming.folderId)
+            continue;
+        if (existing.path.isEmpty())
+            return;
+        if (!incoming.path.isEmpty()) {
+            if (existing.path == incoming.path && (existing.recursive || !incoming.recursive))
+                return;
+            if (existing.recursive && isSubpathOf(incoming.path, existing.path))
+                return;
+        }
+    }
+    for (qsizetype i = scopes.size() - 1; i >= 0; --i) {
+        const IndexScope& existing = scopes.at(i);
+        if (existing.folderId != incoming.folderId)
+            continue;
+        const bool covered = incoming.path.isEmpty()
+            || existing.path == incoming.path
+            || (incoming.recursive && isSubpathOf(existing.path, incoming.path));
+        if (covered)
+            scopes.removeAt(i);
+    }
+    scopes.push_back(std::move(incoming));
+}
+
 // Compteurs d'une passe de réconciliation, tenus à jour puis écrits dans index_runs.
 struct RunCounts {
     int seen        = 0;
@@ -125,3 +177,6 @@ struct FolderContext {
 };
 
 } // namespace morfphoto
+
+Q_DECLARE_METATYPE(morfphoto::IndexScope)
+Q_DECLARE_METATYPE(QVector<morfphoto::IndexScope>)

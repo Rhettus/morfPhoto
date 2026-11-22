@@ -217,9 +217,9 @@ void PhotoModule::startWatcher() {
     m_watcher = new FolderWatcher(m_debounceMs, m_probeTimeoutMs);
     m_watcher->moveToThread(m_watcherThread);
     connect(m_watcherThread, &QThread::finished, m_watcher, &QObject::deleteLater);
-    connect(m_watcher, &FolderWatcher::foldersChanged, this, [this](const QVector<int>& ids) {
-        for (int id : ids)
-            m_pendingRealtime.insert(id);
+    connect(m_watcher, &FolderWatcher::scopesChanged, this, [this](const QVector<IndexScope>& scopes) {
+        for (const IndexScope& scope : scopes)
+            mergeScope(m_pendingRealtime, scope);
         submitRealtime();
     });
     m_watcherThread->start();
@@ -255,9 +255,8 @@ void PhotoModule::refreshWatcher() {
 void PhotoModule::submitRealtime() {
     if (m_pendingRealtime.isEmpty())
         return;
-    const QVector<int> ids(m_pendingRealtime.cbegin(), m_pendingRealtime.cend());
     // Une passe tourne deja : elle a pu manquer ce changement, on repassera apres elle.
-    if (triggerIndex(IndexMode::Incremental, ids, QStringLiteral("inotify"))
+    if (triggerIndexScopes(IndexMode::Incremental, m_pendingRealtime, QStringLiteral("inotify"))
             .value(QStringLiteral("accepted")).toBool())
         m_pendingRealtime.clear();
     else
@@ -395,6 +394,16 @@ void PhotoModule::warmThumbnails() {
 
 QJsonObject PhotoModule::triggerIndex(IndexMode mode, const QVector<int>& folderIds,
                                       const QString& trigger) {
+    return startPass(mode, folderIds, {}, trigger);
+}
+
+QJsonObject PhotoModule::triggerIndexScopes(IndexMode mode, const QVector<IndexScope>& scopes,
+                                            const QString& trigger) {
+    return startPass(mode, {}, scopes, trigger);
+}
+
+QJsonObject PhotoModule::startPass(IndexMode mode, const QVector<int>& folderIds,
+                                   const QVector<IndexScope>& scopes, const QString& trigger) {
     {
         QMutexLocker lock(&m_stateMutex);
         if (m_indexing) {
@@ -422,8 +431,8 @@ QJsonObject PhotoModule::triggerIndex(IndexMode mode, const QVector<int>& folder
 
     if (m_thumbnailWarmStop)
         m_thumbnailWarmStop->store(true);
-    m_pass = QtConcurrent::run([this, mode, folderIds, trigger]() {
-        doPass(mode, folderIds, trigger);
+    m_pass = QtConcurrent::run([this, mode, folderIds, scopes, trigger]() {
+        doPass(mode, folderIds, scopes, trigger);
     });
 
     QJsonObject o;
@@ -432,7 +441,7 @@ QJsonObject PhotoModule::triggerIndex(IndexMode mode, const QVector<int>& folder
     return o;
 }
 
-void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QString trigger) {
+void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes, QString trigger) {
     int pass;
     QStringList roots;
     {
@@ -465,7 +474,10 @@ void PhotoModule::doPass(IndexMode mode, QVector<int> folderIds, QString trigger
                 m_progPhase         = p.phase;
                 m_progCurrentFolder = p.currentFolder;
             });
-            indexer.run(mode, folderIds, trigger);
+            if (!scopes.isEmpty())
+                indexer.runScopes(mode, scopes, trigger);
+            else
+                indexer.run(mode, folderIds, trigger);
             extractor.close();
             const QJsonObject st = indexer.state();
             if (!st.value(QStringLiteral("last_error")).isNull())

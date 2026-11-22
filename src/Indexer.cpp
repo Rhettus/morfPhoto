@@ -78,25 +78,13 @@ int Indexer::run(IndexMode mode, const QVector<int>& folderIds, const QString& t
     // Racines constatées indisponibles pendant CETTE passe : une fois une racine KO,
     // ses autres sélections sont sautées sans re-sonder (ne pas s'acharner sur une
     // source muette : un timeout par racine, pas un par dossier).
-    m_pFoldersTotal     = folders.size();
-    m_pFoldersDone      = 0;
-    m_pCurrentFolder.clear();
-    m_pFilesDiscovered  = 0;
-    m_pFilesTotalFinal  = false;
-    m_pPhase            = QStringLiteral("indexing");
     // Pas de parcours de comptage : l'EXIF (ou le touch) commence avec le premier
     // dossier. Un walk à vide doublerait l'I/O disque/SMB pour un pourcentage.
-    m_pFilesTotal = (estimate > 0) ? estimate : -1;
-    reportProgress(0);
+    initProgress(folders.size(), (estimate > 0) ? estimate : -1);
 
     QSet<QString> unavailableRoots;
 
     bool interrupted = false;
-    if (m_pFoldersTotal == 0) {
-        m_pFilesTotal = 0;
-        m_pFilesTotalFinal = true;
-        reportProgress(0);
-    }
     for (const FolderRow& folder : folders) {
         m_pCurrentFolder = folder.path;
         reportProgress(counts.seen);            // dossier entamé
@@ -111,6 +99,94 @@ int Indexer::run(IndexMode mode, const QVector<int>& folderIds, const QString& t
         reportProgress(counts.seen);            // dossier terminé
     }
 
+    finishPass(runId, interrupted, counts);
+    return runId;
+}
+
+int Indexer::runScopes(IndexMode mode, const QVector<IndexScope>& scopes, const QString& trigger) {
+    if (!m_runMutex.tryLock())
+        return -1;
+
+    {
+        QMutexLocker lock(&m_stateMutex);
+        m_indexing = true;
+        m_startedAt = nowIso();
+    }
+
+    const int runId = m_repo->startRun(indexModeName(mode), trigger, nowIso());
+    RunCounts counts;
+    m_ctxMtimes = m_repo->knownContextMtimes();
+
+    QHash<int, FolderRow> activeById;
+    for (const FolderRow& f : m_repo->activeFolders())
+        activeById.insert(f.id, f);
+
+    QVector<IndexScope> resolved;
+    for (IndexScope scope : scopes) {
+        const auto it = activeById.constFind(scope.folderId);
+        if (it == activeById.constEnd())
+            continue;
+        const FolderRow& folder = it.value();
+        const QString cleanFolderPath = QDir::cleanPath(folder.path);
+        if (scope.path.isEmpty()) {
+            scope.path = cleanFolderPath;
+            scope.recursive = folder.recursive;
+        } else {
+            scope.path = QDir::cleanPath(scope.path);
+            if (!folder.recursive) {
+                if (scope.path != cleanFolderPath)
+                    continue;
+                scope.recursive = false;
+            } else if (scope.path != cleanFolderPath && !isSubpathOf(scope.path, cleanFolderPath)) {
+                continue;
+            }
+        }
+        mergeScope(resolved, std::move(scope));
+    }
+
+    initProgress(resolved.size(), -1);
+
+    QSet<QString> unavailableRoots;
+
+    bool interrupted = false;
+    for (const IndexScope& scope : resolved) {
+        const FolderRow& folder = activeById.value(scope.folderId);
+        const QString cleanFolderPath = QDir::cleanPath(folder.path);
+        const bool isFullFolder = (scope.path == cleanFolderPath && scope.recursive == folder.recursive);
+        m_pCurrentFolder = scope.path;
+        reportProgress(counts.seen);
+        if (reconcileScope(folder, scope.path, scope.recursive, isFullFolder,
+                           mode, runId, counts, unavailableRoots))
+            interrupted = true;
+        ++m_pFoldersDone;
+        if (m_pFoldersDone >= m_pFoldersTotal) {
+            m_pFilesTotal = m_pFilesDiscovered;
+            m_pFilesTotalFinal = true;
+        }
+        reportProgress(counts.seen);
+    }
+
+    finishPass(runId, interrupted, counts);
+    return runId;
+}
+
+void Indexer::initProgress(int foldersTotal, qint64 initialFilesTotal) {
+    m_pFoldersTotal    = foldersTotal;
+    m_pFoldersDone     = 0;
+    m_pCurrentFolder.clear();
+    m_pFilesDiscovered = 0;
+    m_pFilesTotalFinal = false;
+    m_pPhase           = QStringLiteral("indexing");
+    m_pFilesTotal      = initialFilesTotal;
+    reportProgress(0);
+    if (m_pFoldersTotal == 0) {
+        m_pFilesTotal = 0;
+        m_pFilesTotalFinal = true;
+        reportProgress(0);
+    }
+}
+
+void Indexer::finishPass(int runId, bool interrupted, const RunCounts& counts) {
     // Une passe qui a perdu au moins une source n'est PAS une passe normale : le
     // dire pour que /status distingue « terminée » de « interrompue ».
     const QString finalState = interrupted ? QStringLiteral("interrupted")
@@ -123,11 +199,20 @@ int Indexer::run(IndexMode mode, const QVector<int>& folderIds, const QString& t
         m_lastError.clear();
     }
     m_runMutex.unlock();
-    return runId;
 }
 
 bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId,
                               RunCounts& counts, QSet<QString>& unavailableRoots) {
+    return reconcileScope(folder, QDir::cleanPath(folder.path), folder.recursive,
+                          /*isFullFolder=*/true, mode, runId, counts, unavailableRoots);
+}
+
+bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, bool scopeRecursive,
+                             bool isFullFolder, IndexMode mode, int runId,
+                             RunCounts& counts, QSet<QString>& unavailableRoots) {
+    const QString cleanFolderPath = QDir::cleanPath(folder.path);
+    const QString cleanScopePath  = QDir::cleanPath(scopePath);
+
     // Garde-fou : la sélection doit rester sous sa propre racine autorisée.
     if (!isWithinRoots(folder.path, {folder.rootPath})) {
         m_repo->logError(runId, folder.path, QStringLiteral("scan"),
@@ -135,6 +220,18 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
                          nowIso());
         ++counts.errors;
         return false;
+    }
+    if (!isFullFolder) {
+        const bool lexicalOk = (cleanScopePath == cleanFolderPath)
+                            || isSubpathOf(cleanScopePath, cleanFolderPath);
+        if (!lexicalOk || (QFileInfo::exists(cleanScopePath)
+                           && !isWithinRoots(cleanScopePath, {folder.rootPath}))) {
+            m_repo->logError(runId, cleanScopePath, QStringLiteral("scan"),
+                             QStringLiteral("portee hors de sa racine autorisee, ignoree"),
+                             nowIso());
+            ++counts.errors;
+            return false;
+        }
     }
 
     // Racine déjà déclarée indisponible plus tôt dans la passe : sauter tout de
@@ -157,52 +254,65 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
         return true;
     }
 
-    const KnownFiles known = m_repo->existingFilesInFolder(folder.id);
-    const QHash<int, QString> fingerprints = m_library ? m_repo->libraryFingerprints(folder.id)
-                                                       : QHash<int, QString>();
+    const KnownFiles known = isFullFolder
+        ? m_repo->existingFilesInFolder(folder.id)
+        : m_repo->existingFilesInScope(folder.id, cleanScopePath, scopeRecursive);
+    const QHash<int, QString> fingerprints = m_library
+        ? (isFullFolder
+               ? m_repo->libraryFingerprints(folder.id)
+               : m_repo->libraryFingerprintsInScope(folder.id, cleanScopePath, scopeRecursive))
+        : QHash<int, QString>();
     QSet<QString> seen;
     QSet<QString> dirs;   // répertoires distincts vus, pour la découverte de contexte
 
     // Scan interruptible : la closure re-sonde la racine périodiquement. Si la
     // source meurt en plein parcours, le scan s'arrête et signale l'incomplétude.
-    const ScanResult scan = scanFolder(
-        folder.path, folder.recursive,
-        [this, &folder]() { return probeAccessible(folder.rootPath, m_probeTimeoutMs); },
-        m_library);
+    // Si une sous-portée n'existe plus sur disque alors que la racine répond, le
+    // sous-répertoire a été supprimé ou déplacé hors portée : scan vide complet.
+    ScanResult scan;
+    if (!isFullFolder && !QFileInfo(cleanScopePath).exists()) {
+        scan.completed = true;
+    } else {
+        scan = scanFolder(
+            cleanScopePath, scopeRecursive,
+            [this, &folder]() { return probeAccessible(folder.rootPath, m_probeTimeoutMs); },
+            m_library);
+    }
+
+    // Défense en profondeur : filtrer une seule fois hors des racines globales.
+    QVector<const FileInfo*> allowedFiles;
+    allowedFiles.reserve(scan.files.size());
+    for (const FileInfo& info : scan.files) {
+        if (isWithinRoots(info.path, m_roots))
+            allowedFiles.push_back(&info);
+    }
 
     // Total « connu pour l'instant » = fichiers déjà listés. Ça grandit dossier
     // après dossier ; le pourcentage se recalcule sans second parcours.
-    qint64 nThis = 0;
-    for (const FileInfo& info : scan.files) {
-        if (isWithinRoots(info.path, m_roots))
-            ++nThis;
-    }
-    m_pFilesDiscovered += nThis;
+    m_pFilesDiscovered += allowedFiles.size();
     if (m_pFilesTotal < 0 || m_pFilesDiscovered > m_pFilesTotal)
         m_pFilesTotal = m_pFilesDiscovered;
     reportProgress(counts.seen);
 
     constexpr qsizetype kExifBatchSize = 64;
     QHash<QString, QPair<ExifData, QString>> exifBatch;
-    for (qsizetype i = 0; i < scan.files.size(); ++i) {
+    QVector<int> touchedIds;
+    for (qsizetype i = 0; i < allowedFiles.size(); ++i) {
         if (m_exifWorkers > 1 && m_extractor && i % kExifBatchSize == 0) {
             QStringList paths;
-            const qsizetype end = qMin(i + kExifBatchSize, scan.files.size());
+            const qsizetype end = qMin(i + kExifBatchSize, allowedFiles.size());
             for (qsizetype j = i; j < end; ++j) {
-                const FileInfo& candidate = scan.files.at(j);
+                const FileInfo& candidate = *allowedFiles.at(j);
                 const auto previous = known.constFind(candidate.path);
                 const bool needsExif = previous == known.constEnd() || mode == IndexMode::Full ||
                     previous->size != candidate.size || previous->mtime != candidate.mtime ||
                     (m_library && !fingerprints.contains(previous->id));
-                if (needsExif && isWithinRoots(candidate.path, m_roots))
+                if (needsExif)
                     paths.append(candidate.path);
             }
             exifBatch = m_extractor->extractBatch(paths, m_exifWorkers);
         }
-        const FileInfo& info = scan.files.at(i);
-        // Défense en profondeur : ne jamais rien indexer hors des racines globales.
-        if (!isWithinRoots(info.path, m_roots))
-            continue;
+        const FileInfo& info = *allowedFiles.at(i);
         ++counts.seen;
         seen.insert(info.path);
         dirs.insert(info.directory);
@@ -228,24 +338,28 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
                 applyLibrary(it->id, info, runId, counts);
             ++counts.updated;
         } else {
-            m_repo->touchSeen(it->id, nowIso());
+            bool updatedFile = false;
             if (m_library) {
-                const auto known = fingerprints.constFind(it->id);
-                if (known == fingerprints.constEnd()) {
+                const auto fp = fingerprints.constFind(it->id);
+                if (fp == fingerprints.constEnd()) {
                     // Indexee avant l'activation : il manque les champs demandes a ExifTool.
                     ExifData exif;
                     const bool ok = extract(runId, info.path, counts, exif, exifBatch);
                     m_repo->updateFile(it->id, info, exif, ok, nowIso());
                     applyLibrary(it->id, info, runId, counts);
                     ++counts.updated;
-                } else if (*known != info.sidecarFingerprint) {
+                    updatedFile = true;
+                } else if (*fp != info.sidecarFingerprint) {
                     // Seul le sidecar a change : inutile de relire l'image.
                     applyLibrary(it->id, info, runId, counts);
                     ++counts.updated;
                 }
             }
+            if (!updatedFile)
+                touchedIds.push_back(it->id);
         }
     }
+    m_repo->touchSeen(touchedIds, nowIso());
 
     // Point crucial : le verdict de disparition n'est FIABLE que si la racine a été
     // parcourue entièrement ET qu'elle répond toujours à la fin. Un scan incomplet
@@ -265,6 +379,12 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
     // Ici seulement : disque présent ET scan complet. Rafraîchir le CONTEXTE des
     // répertoires vus est alors sûr (on ne supprimera pas un contexte parce qu'une
     // source était momentanément muette). Vaut aussi pour un support amovible présent.
+    dirs.insert(cleanScopePath);
+    for (auto it = m_ctxMtimes.constBegin(); it != m_ctxMtimes.constEnd(); ++it) {
+        const QString& dir = it.key();
+        if (dir == cleanScopePath || (scopeRecursive && isSubpathOf(dir, cleanScopePath)))
+            dirs.insert(dir);
+    }
     refreshContexts(dirs, runId, counts);
 
     // Support amovible (CD/DVD, disque d'archive) : l'absence est NORMALE. Même un
@@ -287,7 +407,8 @@ bool Indexer::reconcileFolder(const FolderRow& folder, IndexMode mode, int runId
         }
     }
 
-    m_repo->setFolderScanned(folder.id, nowIso());
+    if (isFullFolder)
+        m_repo->setFolderScanned(folder.id, nowIso());
     return false;
 }
 

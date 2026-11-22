@@ -70,6 +70,8 @@ FolderWatcher::FolderWatcher(int debounceMs, int probeTimeoutMs, QObject* parent
       m_probeTimeoutMs(probeTimeoutMs),
       m_debounce(new QTimer(this)),
       m_rearm(new QTimer(this)) {
+    qRegisterMetaType<morfphoto::IndexScope>();
+    qRegisterMetaType<QVector<morfphoto::IndexScope>>();
     m_debounce->setSingleShot(true);
     connect(m_debounce, &QTimer::timeout, this, &FolderWatcher::flush);
     m_rearm->setInterval(kRearmIntervalMs);
@@ -230,9 +232,10 @@ void FolderWatcher::onReadable() {
 void FolderWatcher::handleEvent(int wd, quint32 mask, const QString& name) {
     if (mask & IN_Q_OVERFLOW) {
         // Des evenements sont perdus : seule une passe sur tout le perimetre est sure.
-        QVector<int> all;
+        QVector<IndexScope> all;
+        all.reserve(m_targets.size());
         for (const WatchTarget& target : std::as_const(m_targets))
-            all << target.folderId;
+            all.push_back({target.folderId, target.path, target.recursive});
         markDirty(all);
         return;
     }
@@ -259,20 +262,31 @@ void FolderWatcher::handleEvent(int wd, quint32 mask, const QString& name) {
 
     if (mask & IN_ISDIR) {
         const QVector<int> folders = foldersFor(directory, /*recursiveOnly=*/true);
-        if (folders.isEmpty())
+        if (folders.isEmpty() || name.isEmpty())
             return;
-        const QString path = directory + QLatin1Char('/') + name;
-        if (mask & IN_MOVED_FROM)
+        const QString path = directory == QLatin1String("/")
+            ? (QLatin1Char('/') + name)
+            : (directory + QLatin1Char('/') + name);
+        if (mask & (IN_MOVED_FROM | IN_DELETE))
             removeTree(path);
         else if (mask & (IN_CREATE | IN_MOVED_TO))
             addTree(path, true);
-        markDirty(folders);
+        QVector<IndexScope> scopes;
+        scopes.reserve(folders.size());
+        for (int id : folders)
+            scopes.push_back({id, path, /*recursive=*/true});
+        markDirty(scopes);
         return;
     }
 
     if ((mask & IN_CREATE) || !isRelevantFile(name))
         return;
-    markDirty(foldersFor(directory, /*recursiveOnly=*/false));
+    const QVector<int> folders = foldersFor(directory, /*recursiveOnly=*/false);
+    QVector<IndexScope> scopes;
+    scopes.reserve(folders.size());
+    for (int id : folders)
+        scopes.push_back({id, directory, /*recursive=*/false});
+    markDirty(scopes);
 }
 
 #else
@@ -299,11 +313,11 @@ QVector<int> FolderWatcher::foldersFor(const QString& directory, bool recursiveO
     return ids;
 }
 
-void FolderWatcher::markDirty(const QVector<int>& folderIds) {
-    if (folderIds.isEmpty())
+void FolderWatcher::markDirty(const QVector<IndexScope>& scopes) {
+    if (scopes.isEmpty())
         return;
-    for (int id : folderIds)
-        m_dirty.insert(id);
+    for (const IndexScope& scope : scopes)
+        mergeScope(m_dirty, scope);
     if (!m_firstDirty.isValid())
         m_firstDirty.start();
     if (m_firstDirty.elapsed() >= qint64(m_debounceMs) * kMaxDebounceFactor)
@@ -317,9 +331,9 @@ void FolderWatcher::flush() {
     m_firstDirty.invalidate();
     if (m_dirty.isEmpty())
         return;
-    const QVector<int> ids(m_dirty.cbegin(), m_dirty.cend());
+    const QVector<IndexScope> scopes = m_dirty;
     m_dirty.clear();
-    emit foldersChanged(ids);
+    emit scopesChanged(scopes);
 }
 
 } // namespace morfphoto

@@ -483,18 +483,18 @@ int main(int argc, char** argv) {
     }
 
 #ifdef Q_OS_LINUX
-    // --- 9) Surveillance inotify : seuls les changements utiles signalent la selection ---
+    // --- 9) Surveillance inotify : portees ciblees par repertoire / sous-arbre ---
     {
-        const QString wdir = base + QStringLiteral("/watch");
-        const QString flat = base + QStringLiteral("/watch-flat");
+        const QString wdir = QDir::cleanPath(base + QStringLiteral("/watch"));
+        const QString flat = QDir::cleanPath(base + QStringLiteral("/watch-flat"));
         QDir().mkpath(wdir + QStringLiteral("/old"));
         QDir().mkpath(flat + QStringLiteral("/sub"));
         FolderWatcher watcher(50, 1000);
-        QVector<int> changed;
+        QVector<IndexScope> changed;
         QEventLoop loop;
-        QObject::connect(&watcher, &FolderWatcher::foldersChanged, &loop,
-                         [&](const QVector<int>& ids) { changed = ids; loop.quit(); });
-        // Attend un signal (ou le delai) puis rend les selections signalees.
+        QObject::connect(&watcher, &FolderWatcher::scopesChanged, &loop,
+                         [&](const QVector<IndexScope>& scopes) { changed = scopes; loop.quit(); });
+        // Attend un signal (ou le delai) puis rend les portees signalees.
         auto waitChange = [&](int ms) {
             changed.clear();
             QTimer::singleShot(ms, &loop, &QEventLoop::quit);
@@ -506,27 +506,44 @@ int main(int argc, char** argv) {
               "inotify: surveillance active");
 
         writeBytes(wdir + QStringLiteral("/n.jpg"), 10);
-        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: nouvelle photo -> selection signalee");
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{7, wdir, false}}),
+              "inotify: nouvelle photo -> portee non recursive du dossier");
         writeBytes(wdir + QStringLiteral("/notes.txt"), 10);
         CHECK(waitChange(300).isEmpty(), "inotify: fichier non image ignore");
         QFile::rename(wdir + QStringLiteral("/n.jpg"), wdir + QStringLiteral("/m.jpg"));
-        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: renommage signale");
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{7, wdir, false}}),
+              "inotify: renommage -> portee du dossier");
         QFile::remove(wdir + QStringLiteral("/m.jpg"));
-        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: suppression signalee");
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{7, wdir, false}}),
+              "inotify: suppression -> portee du dossier");
 
         QDir().mkpath(wdir + QStringLiteral("/new"));
-        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: nouveau dossier signale");
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{7, wdir + QStringLiteral("/new"), true}}),
+              "inotify: nouveau dossier -> portee recursive du sous-dossier");
         writeBytes(wdir + QStringLiteral("/new/p.jpg"), 10);
-        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: photo dans un nouveau dossier signalee");
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{7, wdir + QStringLiteral("/new"), false}}),
+              "inotify: photo dans un nouveau dossier -> portee du sous-dossier");
+
         QDir(wdir).rename(QStringLiteral("old"), QStringLiteral("renamed"));
-        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: dossier renomme signale");
+        const QVector<IndexScope> renameScopes = waitChange(2000);
+        CHECK(renameScopes.size() == 2
+              && renameScopes.contains(IndexScope{7, wdir + QStringLiteral("/old"), true})
+              && renameScopes.contains(IndexScope{7, wdir + QStringLiteral("/renamed"), true}),
+              "inotify: dossier renomme -> ancienne et nouvelle portees recursives");
         writeBytes(wdir + QStringLiteral("/renamed/q.jpg"), 10);
-        CHECK(waitChange(2000) == QVector<int>{7}, "inotify: photo dans un dossier renomme signalee");
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{7, wdir + QStringLiteral("/renamed"), false}}),
+              "inotify: photo dans un dossier renomme -> portee du sous-dossier");
+
+        QFile::remove(wdir + QStringLiteral("/renamed/q.jpg"));
+        QDir(wdir).rmdir(QStringLiteral("renamed"));
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{7, wdir + QStringLiteral("/renamed"), true}}),
+              "inotify: sous-dossier supprime -> portee recursive du sous-dossier");
 
         writeBytes(flat + QStringLiteral("/sub/x.jpg"), 10);
         CHECK(waitChange(300).isEmpty(), "inotify: selection non recursive ignore ses sous-dossiers");
         writeBytes(flat + QStringLiteral("/y.jpg"), 10);
-        CHECK(waitChange(2000) == QVector<int>{8}, "inotify: selection non recursive voit son dossier");
+        CHECK(waitChange(2000) == (QVector<IndexScope>{{8, flat, false}}),
+              "inotify: selection non recursive voit son dossier");
     }
 #endif
 
@@ -751,6 +768,173 @@ int main(int argc, char** argv) {
         const QImage thumbnail = QImage::fromData(photos.thumbnailReader(false)(jpegPath), "JPEG");
         CHECK(thumbnail.size() == QSize(400, 300),
               "thumbnail: scale the original JPEG without ExifTool and preserve its aspect ratio");
+    }
+
+    // --- 11) Fusion de portees et indexation ciblee (runScopes) ---
+    {
+        // 11a) Coalescence de mergeScope.
+        {
+            QVector<IndexScope> scopes;
+            mergeScope(scopes, {1, QStringLiteral("/a"), false});
+            mergeScope(scopes, {1, QStringLiteral("/a"), false});
+            CHECK(scopes == (QVector<IndexScope>{{1, QStringLiteral("/a"), false}}),
+                  "mergeScope: doublon exact ignore");
+
+            mergeScope(scopes, {1, QStringLiteral("/a"), true});
+            CHECK(scopes == (QVector<IndexScope>{{1, QStringLiteral("/a"), true}}),
+                  "mergeScope: non recursif promu en recursif");
+
+            mergeScope(scopes, {1, QStringLiteral("/a/b"), false});
+            mergeScope(scopes, {1, QStringLiteral("/a/b/c"), true});
+            CHECK(scopes == (QVector<IndexScope>{{1, QStringLiteral("/a"), true}}),
+                  "mergeScope: ancetre recursif absorbe les descendants ajoutes ensuite");
+
+            QVector<IndexScope> reverse;
+            mergeScope(reverse, {1, QStringLiteral("/a/b"), false});
+            mergeScope(reverse, {1, QStringLiteral("/a/b/c"), true});
+            mergeScope(reverse, {1, QStringLiteral("/a"), true});
+            CHECK(reverse == (QVector<IndexScope>{{1, QStringLiteral("/a"), true}}),
+                  "mergeScope: ancetre recursif absorbe les descendants deja presents");
+
+            mergeScope(reverse, {2, QStringLiteral("/a/b"), false});
+            CHECK(reverse.size() == 2
+                  && reverse.contains(IndexScope{1, QStringLiteral("/a"), true})
+                  && reverse.contains(IndexScope{2, QStringLiteral("/a/b"), false}),
+                  "mergeScope: folderId differents jamais fusionnes");
+        }
+
+        // 11b) Indexation ciblee + existingFilesInScope + contextes + lots > 500.
+        const QString sroot = QDir::cleanPath(base + QStringLiteral("/scoped"));
+        const QString subA = sroot + QStringLiteral("/subA");
+        const QString subB = sroot + QStringLiteral("/subB");
+        const QString subC = sroot + QStringLiteral("/subC");
+        const QString subCNested = subC + QStringLiteral("/nested");
+        QDir().mkpath(subA);
+        QDir().mkpath(subB);
+        QDir().mkpath(subCNested);
+
+        writeBytes(subA + QStringLiteral("/a1.jpg"), 100);
+        writeBytes(subA + QStringLiteral("/a2.jpg"), 120);
+        writeBytes(subB + QStringLiteral("/b1.jpg"), 100);
+        writeBytes(subC + QStringLiteral("/c1.jpg"), 100);
+        writeBytes(subCNested + QStringLiteral("/cn1.jpg"), 100);
+
+        auto writeCtx = [](const QString& dir, const QByteArray& json) {
+            QFile f(dir + QStringLiteral("/.morfphoto.json"));
+            if (f.open(QIODevice::WriteOnly)) {
+                f.write(json);
+                f.close();
+            }
+        };
+        writeCtx(subA, "{\"schema\":2,\"context\":\"EVENEMENT\",\"subject\":\"PERSONNES\"}");
+        writeCtx(subC, "{\"schema\":2,\"context\":\"DECOUVERTE\",\"subject\":\"PAYSAGE\"}");
+
+        PhotoRepository srepo(QStringLiteral("smoke:scoped"));
+        CHECK(srepo.open(sroot + QStringLiteral("/db.sqlite")), "scoped: base ouverte");
+        const int folderId = srepo.addFolder(sroot, sroot, QVariant(), true, false, QVariant(), nowIso());
+        Indexer sidx(&srepo, nullptr, {sroot});
+        sidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+
+        CHECK(srepo.summary().value(QStringLiteral("files_present")).toInt() == 5,
+              "scoped: passe complete -> 5 photos presentes");
+        CHECK(srepo.getContext(subA).value(QStringLiteral("status")).toString() == QLatin1String("qualified")
+              && srepo.getContext(subC).value(QStringLiteral("status")).toString() == QLatin1String("qualified"),
+              "scoped: contextes subA et subC qualifies");
+
+        const KnownFiles cFlat = srepo.existingFilesInScope(folderId, subC, false);
+        const KnownFiles cRec = srepo.existingFilesInScope(folderId, subC, true);
+        const KnownFiles cNest = srepo.existingFilesInScope(folderId, subCNested, false);
+        CHECK(cFlat.size() == 1 && cFlat.contains(subC + QStringLiteral("/c1.jpg"))
+              && cRec.size() == 2 && cRec.contains(subCNested + QStringLiteral("/cn1.jpg"))
+              && cNest.size() == 1 && cNest.contains(subCNested + QStringLiteral("/cn1.jpg")),
+              "scoped: existingFilesInScope distingue non-recursif, recursif et sous-dossier");
+
+        const QString sentinelScanAt = QStringLiteral("2020-01-01T00:00:00Z");
+        srepo.setFolderScanned(folderId, sentinelScanAt);
+
+        // Mutations dans subA + ajout silencieux dans subB (ne doit pas etre vu).
+        writeBytes(subA + QStringLiteral("/a3.jpg"), 140);
+        writeBytes(subA + QStringLiteral("/a1.jpg"), 250);
+        QFile::remove(subA + QStringLiteral("/a2.jpg"));
+        writeBytes(subB + QStringLiteral("/b2.jpg"), 110);
+
+        sidx.runScopes(IndexMode::Incremental, {{folderId, subA, false}}, QStringLiteral("inotify"));
+        CHECK(lastRunInt(srepo, "files_seen") == 2,
+              "scoped: runScopes(subA) ne scanne que les 2 fichiers de subA");
+        const KnownFiles afterA = srepo.existingFilesInFolder(folderId);
+        CHECK(afterA.value(subA + QStringLiteral("/a3.jpg")).state == QLatin1String("present")
+              && afterA.value(subA + QStringLiteral("/a1.jpg")).size == 250
+              && afterA.value(subA + QStringLiteral("/a2.jpg")).state == QLatin1String("missing"),
+              "scoped: subA ajoute, modifie et marque disparu");
+        CHECK(!afterA.contains(subB + QStringLiteral("/b2.jpg"))
+              && afterA.value(subB + QStringLiteral("/b1.jpg")).state == QLatin1String("present")
+              && afterA.value(subC + QStringLiteral("/c1.jpg")).state == QLatin1String("present")
+              && afterA.value(subCNested + QStringLiteral("/cn1.jpg")).state == QLatin1String("present"),
+              "scoped: subB et subC intacts hors portee");
+
+        QString recordedScanAt;
+        const QJsonArray folderDetails = srepo.listFoldersDetail();
+        for (const QJsonValue& val : folderDetails) {
+            const QJsonObject obj = val.toObject();
+            if (obj.value(QStringLiteral("id")).toInt() == folderId)
+                recordedScanAt = obj.value(QStringLiteral("last_scan_at")).toString();
+        }
+        CHECK(recordedScanAt == sentinelScanAt,
+              "scoped: passe partielle ne modifie pas folders.last_scan_at");
+
+        QFile::remove(subA + QStringLiteral("/.morfphoto.json"));
+        sidx.runScopes(IndexMode::Incremental, {{folderId, subA, false}}, QStringLiteral("inotify"));
+        CHECK(srepo.getContext(subA).value(QStringLiteral("status")).toString() == QLatin1String("unqualified"),
+              "scoped: retrait de .morfphoto.json dans subA -> unqualified");
+
+        QDir(subC).removeRecursively();
+        sidx.runScopes(IndexMode::Incremental, {{folderId, subC, true}}, QStringLiteral("inotify"));
+        const KnownFiles afterC = srepo.existingFilesInFolder(folderId);
+        CHECK(afterC.value(subC + QStringLiteral("/c1.jpg")).state == QLatin1String("missing")
+              && afterC.value(subCNested + QStringLiteral("/cn1.jpg")).state == QLatin1String("missing"),
+              "scoped: suppression recursive de subC marque subC et subC/nested missing");
+        CHECK(srepo.getContext(subC).value(QStringLiteral("status")).toString() == QLatin1String("unqualified"),
+              "scoped: contexte de subC supprime -> unqualified");
+        CHECK(afterC.value(subA + QStringLiteral("/a1.jpg")).state == QLatin1String("present")
+              && afterC.value(subA + QStringLiteral("/a3.jpg")).state == QLatin1String("present")
+              && afterC.value(subB + QStringLiteral("/b1.jpg")).state == QLatin1String("present"),
+              "scoped: fichiers de subA et subB toujours present");
+
+        // 11c) Mise a jour par lots (> 500 IDs) pour markMissing et touchSeen.
+        const QString batchDir = sroot + QStringLiteral("/batch");
+        const int batchFolder = srepo.addFolder(batchDir, sroot, QVariant(), true, false, QVariant(), nowIso());
+        QVector<int> batchIds;
+        batchIds.reserve(550);
+        const ExifData emptyExif;
+        const QString ts0 = nowIso();
+        for (int i = 0; i < 550; ++i) {
+            FileInfo fi;
+            fi.path = QStringLiteral("%1/img_%2.jpg").arg(batchDir).arg(i);
+            fi.directory = batchDir;
+            fi.filename = QStringLiteral("img_%1.jpg").arg(i);
+            fi.extension = QStringLiteral(".jpg");
+            fi.fileType = QStringLiteral("jpeg");
+            fi.size = 100;
+            fi.mtime = 1700000000;
+            batchIds.push_back(srepo.insertFile(batchFolder, fi, emptyExif, false, ts0));
+        }
+        srepo.markMissing(batchIds, QStringLiteral("2026-01-01T00:00:00Z"));
+        const KnownFiles afterMissing = srepo.existingFilesInFolder(batchFolder);
+        int nMissing = 0;
+        for (auto it = afterMissing.constBegin(); it != afterMissing.constEnd(); ++it)
+            if (it->state == QLatin1String("missing"))
+                ++nMissing;
+        CHECK(nMissing == 550, "batch: markMissing sur 550 IDs (>500)");
+
+        srepo.touchSeen(batchIds, QStringLiteral("2026-01-02T00:00:00Z"));
+        const KnownFiles afterTouch = srepo.existingFilesInFolder(batchFolder);
+        int nPresent = 0;
+        for (auto it = afterTouch.constBegin(); it != afterTouch.constEnd(); ++it)
+            if (it->state == QLatin1String("present"))
+                ++nPresent;
+        CHECK(nPresent == 550, "batch: touchSeen sur 550 IDs (>500)");
+
+        srepo.close();
     }
     QDir(base).removeRecursively();
 

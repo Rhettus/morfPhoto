@@ -5,6 +5,8 @@
  */
 
 #pragma once
+#include "morfphoto/PhotoTypes.h"
+
 #include <QObject>
 #include <QElapsedTimer>
 #include <QHash>
@@ -54,7 +56,7 @@ public:
     QJsonObject statusJson() const;
 
 signals:
-    void foldersChanged(const QVector<int>& folderIds);
+    void scopesChanged(const QVector<IndexScope>& scopes);
 
 private:
     void onReadable();
@@ -65,7 +67,7 @@ private:
     bool addWatch(const QString& path);
     void removeTree(const QString& path);
     QVector<int> foldersFor(const QString& directory, bool recursiveOnly) const;
-    void markDirty(const QVector<int>& folderIds);
+    void markDirty(const QVector<IndexScope>& scopes);
     void flush();
     void publishStatus();
 
@@ -85,7 +87,7 @@ private:
     QSet<QString>         m_skipped;                     // montages reseau : inotify n'y voit rien
     bool                  m_limitReached = false;
 
-    QSet<int>     m_dirty;
+    QVector<IndexScope> m_dirty;
     QElapsedTimer m_firstDirty;
 
     mutable QMutex m_statusMutex;

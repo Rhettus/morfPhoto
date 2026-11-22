@@ -117,6 +117,60 @@ QString filterColumn(const QString& key) {
     return {};
 }
 
+// Construit le prédicat WHERE d'une portée sur `files` (avec préfixe de table
+// optionnel, ex. "f.") et remplit `binds`.
+QString scopePredicate(int folderId, const QString& path, bool recursive,
+                       const QString& prefix, QVariantList& binds) {
+    const QString clean = QDir::cleanPath(path);
+    binds.clear();
+    binds << folderId;
+    if (!recursive) {
+        binds << clean;
+        return QStringLiteral("%1folder_id = ? AND %1directory = ?").arg(prefix);
+    }
+    if (clean == QLatin1String("/"))
+        return QStringLiteral("%1folder_id = ?").arg(prefix);
+    binds << clean << clean + QLatin1Char('/') << clean + QLatin1Char('0');
+    return QStringLiteral("%1folder_id = ? AND (%1directory = ? OR (%1directory >= ? AND %1directory < ?))")
+        .arg(prefix);
+}
+
+// Exécute une mise à jour par lots de 500 identifiants dans une transaction unique
+// pour rester sous SQLITE_MAX_VARIABLE_NUMBER.
+void runBatchedFileUpdate(QSqlDatabase database, const QString& sqlTemplate,
+                          const QVector<int>& fileIds, const QString& now) {
+    if (fileIds.isEmpty())
+        return;
+    constexpr qsizetype kBatchSize = 500;
+    const bool inTransaction = database.transaction();
+    bool ok = true;
+    {
+        for (qsizetype offset = 0; offset < fileIds.size(); offset += kBatchSize) {
+            const qsizetype count = qMin(kBatchSize, fileIds.size() - offset);
+            QStringList holders;
+            holders.reserve(count);
+            QVariantList binds;
+            binds.reserve(count + 1);
+            binds << now;
+            for (qsizetype i = 0; i < count; ++i) {
+                holders << QStringLiteral("?");
+                binds << fileIds.at(offset + i);
+            }
+            QSqlQuery q(database);
+            if (!run(q, sqlTemplate.arg(holders.join(QLatin1Char(','))), binds)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (inTransaction) {
+        if (ok)
+            database.commit();
+        else
+            database.rollback();
+    }
+}
+
 } // namespace
 
 PhotoRepository::PhotoRepository(QString connectionName)
@@ -358,6 +412,19 @@ KnownFiles PhotoRepository::existingFilesInFolder(int folderId) {
     return map;
 }
 
+KnownFiles PhotoRepository::existingFilesInScope(int folderId, const QString& path, bool recursive) {
+    QVariantList binds;
+    const QString where = scopePredicate(folderId, path, recursive, QString(), binds);
+    KnownFiles map;
+    QSqlQuery q(db());
+    run(q, QStringLiteral("SELECT id, path, size, mtime, state FROM files WHERE ") + where, binds);
+    while (q.next())
+        map.insert(q.value(1).toString(),
+                   {q.value(0).toInt(), q.value(2).toLongLong(),
+                    q.value(3).toLongLong(), q.value(4).toString()});
+    return map;
+}
+
 int PhotoRepository::insertFile(int folderId, const FileInfo& info, const ExifData& exif,
                                 bool exifOk, const QString& now) {
     QSqlQuery q(db());
@@ -413,16 +480,20 @@ void PhotoRepository::touchSeen(int fileId, const QString& now) {
                           "disappeared_at = NULL WHERE id = ?"), {now, fileId});
 }
 
+void PhotoRepository::touchSeen(const QVector<int>& fileIds, const QString& now) {
+    runBatchedFileUpdate(
+        db(),
+        QStringLiteral("UPDATE files SET last_seen_at = ?, state = 'present', "
+                       "disappeared_at = NULL WHERE id IN (%1)"),
+        fileIds, now);
+}
+
 void PhotoRepository::markMissing(const QVector<int>& fileIds, const QString& now) {
-    if (fileIds.isEmpty())
-        return;
-    QStringList holders;
-    QVariantList binds = {now};
-    for (int id : fileIds) { holders << QStringLiteral("?"); binds << id; }
-    QSqlQuery q(db());
-    run(q, QStringLiteral("UPDATE files SET state = 'missing', disappeared_at = ? "
-                          "WHERE id IN (%1) AND state != 'missing'").arg(holders.join(',')),
-        binds);
+    runBatchedFileUpdate(
+        db(),
+        QStringLiteral("UPDATE files SET state = 'missing', disappeared_at = ? "
+                       "WHERE id IN (%1) AND state != 'missing'"),
+        fileIds, now);
 }
 
 // --- Bibliothèque -----------------------------------------------------------
@@ -510,6 +581,19 @@ QHash<int, QString> PhotoRepository::libraryFingerprints(int folderId) {
     QSqlQuery q(db());
     run(q, QStringLiteral("SELECT lf.file_id, lf.fingerprint FROM library_files lf "
                           "JOIN files f ON f.id = lf.file_id WHERE f.folder_id = ?"), {folderId});
+    while (q.next())
+        out.insert(q.value(0).toInt(), q.value(1).toString());
+    return out;
+}
+
+QHash<int, QString> PhotoRepository::libraryFingerprintsInScope(int folderId, const QString& path,
+                                                                 bool recursive) {
+    QVariantList binds;
+    const QString where = scopePredicate(folderId, path, recursive, QStringLiteral("f."), binds);
+    QHash<int, QString> out;
+    QSqlQuery q(db());
+    run(q, QStringLiteral("SELECT lf.file_id, lf.fingerprint FROM library_files lf "
+                          "JOIN files f ON f.id = lf.file_id WHERE ") + where, binds);
     while (q.next())
         out.insert(q.value(0).toInt(), q.value(1).toString());
     return out;

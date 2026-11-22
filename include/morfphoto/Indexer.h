@@ -76,6 +76,10 @@ public:
     // déjà. `folderIds` vide = tous les dossiers actifs. `trigger` : watch|api|cli.
     int run(IndexMode mode, const QVector<int>& folderIds, const QString& trigger);
 
+    // Lance une passe ciblée sur des portées normalisées et fusionnées. Retourne
+    // l'identifiant de run, ou -1 si une passe tourne déjà.
+    int runScopes(IndexMode mode, const QVector<IndexScope>& scopes, const QString& trigger);
+
     // État observable : { state: idle|indexing, started_at, last_error }.
     QJsonObject state() const;
 
@@ -96,6 +100,11 @@ private:
     // (avant ou pendant le scan) : la passe sera alors close en 'interrupted'.
     bool reconcileFolder(const FolderRow& folder, IndexMode mode, int runId,
                          RunCounts& counts, QSet<QString>& unavailableRoots);
+    bool reconcileScope(const FolderRow& folder, const QString& scopePath, bool scopeRecursive,
+                        bool isFullFolder, IndexMode mode, int runId,
+                        RunCounts& counts, QSet<QString>& unavailableRoots);
+    void initProgress(int foldersTotal, qint64 initialFilesTotal);
+    void finishPass(int runId, bool interrupted, const RunCounts& counts);
     bool extract(int runId, const QString& path, RunCounts& counts, ExifData& out,
                  QHash<QString, QPair<ExifData, QString>>& batch);
     void applyLibrary(int fileId, const FileInfo& info, int runId, RunCounts& counts);

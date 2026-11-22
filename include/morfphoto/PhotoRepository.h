@@ -64,11 +64,13 @@ public:
 
     // --- Fichiers : verdict et écritures d'indexation ---
     KnownFiles existingFilesInFolder(int folderId);
+    KnownFiles existingFilesInScope(int folderId, const QString& path, bool recursive);
     int  insertFile(int folderId, const FileInfo& info, const ExifData& exif,
                     bool exifOk, const QString& now);   // id de la ligne créée
     void updateFile(int fileId, const FileInfo& info, const ExifData& exif,
                     bool exifOk, const QString& now);
     void touchSeen(int fileId, const QString& now);
+    void touchSeen(const QVector<int>& fileIds, const QString& now);
     void markMissing(const QVector<int>& fileIds, const QString& now);
 
     // --- Contexte photographique par répertoire (morfphoto-context/2) ---
@@ -92,6 +94,7 @@ public:
 
     // --- Bibliothèque (EXIF + XMP réunis, voir LibraryMetadata.h) ---
     QHash<int, QString> libraryFingerprints(int folderId);   // id de fichier -> empreinte
+    QHash<int, QString> libraryFingerprintsInScope(int folderId, const QString& path, bool recursive);
     ExifData libraryBase(int fileId);                        // ce que l'image elle-même contient
     void storeLibrary(int fileId, const QString& fingerprint, const LibraryFileLabels& labels,
                       const QVector<LibraryVersion>& versions);

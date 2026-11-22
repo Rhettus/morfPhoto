@@ -155,6 +155,9 @@ private:
     void stopWatcher();
     void refreshWatcher();
     void submitRealtime();
+    QJsonObject triggerIndexScopes(IndexMode mode, const QVector<IndexScope>& scopes, const QString& trigger);
+    QJsonObject startPass(IndexMode mode, const QVector<int>& folderIds,
+                          const QVector<IndexScope>& scopes, const QString& trigger);
     void warmThumbnails();
 
     struct ThumbnailWarmBatch {
@@ -164,7 +167,7 @@ private:
     };
 
     void reconcileRoots();
-    void doPass(IndexMode mode, QVector<int> folderIds, QString trigger); // thread du pool
+    void doPass(IndexMode mode, QVector<int> folderIds, QVector<IndexScope> scopes, QString trigger); // thread du pool
     QString matchingRoot(const QString& path) const;
     QJsonObject observableState() const;
     // Declare une indexation TERMINEE a morfAnalytics (historique), best-effort et
@@ -219,7 +222,7 @@ private:
     QThread*       m_watcherThread = nullptr;
     FolderWatcher* m_watcher = nullptr;
     QTimer*        m_realtimeRetry = nullptr;
-    QSet<int>      m_pendingRealtime;      // selections en attente d'une passe
+    QVector<IndexScope> m_pendingRealtime; // portees en attente d'une passe
 
     // Cache du resume (thread HTTP uniquement) : voir PhotoModule::summary().
     mutable QJsonObject m_summaryCache;
