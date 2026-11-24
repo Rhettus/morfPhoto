@@ -152,41 +152,67 @@ QString scopePredicate(int folderId, const QString& path, bool recursive,
         .arg(prefix);
 }
 
-// Exécute une mise à jour par lots de 500 identifiants dans une transaction unique
-// pour rester sous SQLITE_MAX_VARIABLE_NUMBER.
-void runBatchedFileUpdate(QSqlDatabase database, const QString& sqlTemplate,
-                          const QVector<int>& fileIds, const QString& now,
-                          bool outerTransaction) {
+// Expression SQL : le dernier numero de changement attribue (compteur persistant).
+const char* const kSeqNow = "(SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'change_seq')";
+
+const char* const kBumpSeq =
+    "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'change_seq'";
+
+// Prend le numero suivant du compteur persistant. Le numero vaut ce que la
+// transaction ECRIVANT la ligne l'a pris : l'appelant est donc dans cette transaction
+// (voir PhotoRepository::beginOwn), sinon l'ordre des numeros ne suivrait plus celui
+// des commits et un lecteur du flux pourrait sauter un changement.
+bool bumpChangeSeq(QSqlDatabase database) {
+    QSqlQuery q(database);
+    return run(q, QString::fromLatin1(kBumpSeq));
+}
+
+// Numerote les lignes de `files` qui satisfont `where`, et seulement elles : un
+// parcours inchange ne doit rien numeroter (sinon le miroir se retelechargerait a
+// chaque passe). A appeler AVANT l'ecriture qui change l'etat dont `where` depend.
+bool stampFilesWhere(QSqlDatabase database, const QString& where, const QVariantList& binds) {
+    QSqlQuery bump(database);
+    if (!run(bump, QString::fromLatin1(kBumpSeq)
+                       + QStringLiteral(" AND EXISTS (SELECT 1 FROM files WHERE %1)").arg(where), binds))
+        return false;
+    if (bump.numRowsAffected() < 1)
+        return true;   // aucune ligne ne change : aucun numero consomme
+    QSqlQuery stamp(database);
+    return run(stamp, QStringLiteral("UPDATE files SET change_seq = %1 WHERE %2")
+                          .arg(QString::fromLatin1(kSeqNow), where), binds);
+}
+
+// Exécute une mise à jour par lots de 500 identifiants pour rester sous
+// SQLITE_MAX_VARIABLE_NUMBER. `stampWhere` (avec %1 pour la liste d'identifiants) numerote
+// avant la mise a jour les lignes dont l'etat va reellement changer. L'appelant fournit la
+// transaction.
+bool runBatchedFileUpdate(QSqlDatabase database, const QString& sqlTemplate,
+                          const QString& stampWhere, const QVector<int>& fileIds,
+                          const QString& now) {
     if (fileIds.isEmpty())
-        return;
+        return true;
     constexpr qsizetype kBatchSize = 500;
-    const bool ownTx = !outerTransaction && database.transaction();
-    bool ok = true;
-    {
-        for (qsizetype offset = 0; offset < fileIds.size(); offset += kBatchSize) {
-            const qsizetype count = qMin(kBatchSize, fileIds.size() - offset);
-            QStringList holders;
-            holders.reserve(count);
-            QVariantList binds;
-            binds.reserve(count + 1);
-            binds << now;
-            for (qsizetype i = 0; i < count; ++i) {
-                holders << QStringLiteral("?");
-                binds << fileIds.at(offset + i);
-            }
-            QSqlQuery q(database);
-            if (!run(q, sqlTemplate.arg(holders.join(QLatin1Char(','))), binds)) {
-                ok = false;
-                break;
-            }
+    for (qsizetype offset = 0; offset < fileIds.size(); offset += kBatchSize) {
+        const qsizetype count = qMin(kBatchSize, fileIds.size() - offset);
+        QStringList holders;
+        holders.reserve(count);
+        QVariantList ids;
+        ids.reserve(count);
+        for (qsizetype i = 0; i < count; ++i) {
+            holders << QStringLiteral("?");
+            ids << fileIds.at(offset + i);
         }
+        const QString list = holders.join(QLatin1Char(','));
+        if (!stampWhere.isEmpty() && !stampFilesWhere(database, stampWhere.arg(list), ids))
+            return false;
+        QVariantList binds;
+        binds << now;
+        binds += ids;
+        QSqlQuery q(database);
+        if (!run(q, sqlTemplate.arg(list), binds))
+            return false;
     }
-    if (ownTx) {
-        if (ok)
-            database.commit();
-        else
-            database.rollback();
-    }
+    return true;
 }
 
 } // namespace
@@ -316,10 +342,32 @@ QString PhotoRepository::catalogRevision() {
         QCryptographicHash::hash(sig, QCryptographicHash::Sha256).toHex().left(16));
 }
 
+bool PhotoRepository::beginImmediate() {
+    // BEGIN IMMEDIATE : le verrou d'ecriture est pris d'emblee, donc le premier numero de
+    // changement vient d'une transaction qui ecrit vraiment (pas d'echec « snapshot » apres
+    // une lecture). COMMIT/ROLLBACK de Qt restent valables.
+    QSqlQuery q(db());
+    return q.exec(QStringLiteral("BEGIN IMMEDIATE"));
+}
+
+PhotoRepository::Own PhotoRepository::beginOwn() {
+    if (m_inTransaction)
+        return Own::Outer;
+    return beginImmediate() ? Own::Began : Own::Failed;
+}
+
+void PhotoRepository::endOwn(Own own, bool ok) {
+    if (own != Own::Began)
+        return;
+    if (ok && db().commit())
+        return;
+    db().rollback();
+}
+
 bool PhotoRepository::beginTransaction() {
     if (m_inTransaction)
         return false;
-    const bool ok = db().transaction();
+    const bool ok = beginImmediate();
     m_inTransaction = ok;
     return ok;
 }
@@ -482,12 +530,20 @@ void PhotoRepository::softDeleteFolder(int folderId, const QString& now) {
     // Retrait DOUX : les fichiers passent 'deleted' (conservés), la sélection est
     // désactivée et horodatée. La donnée n'est jamais supprimée physiquement ;
     // `deleted_at` la classe comme retirée (fenêtre séparée dans PhotoHub).
+    const Own own = beginOwn();
+    if (own == Own::Failed) {
+        qWarning() << "morfPhoto: transaction impossible, softDeleteFolder abandonne";
+        return;
+    }
+    // Numeroter les fichiers dont l'etat change (le flux les donne « missing »).
+    bool ok = stampFilesWhere(db(), QStringLiteral("folder_id = ? AND state != 'deleted'"), {folderId});
     QSqlQuery q1(db());
-    run(q1, QStringLiteral("UPDATE files SET state = 'deleted', disappeared_at = ? "
-                           "WHERE folder_id = ? AND state != 'deleted'"), {now, folderId});
+    ok = run(q1, QStringLiteral("UPDATE files SET state = 'deleted', disappeared_at = ? "
+                                "WHERE folder_id = ? AND state != 'deleted'"), {now, folderId}) && ok;
     QSqlQuery q2(db());
-    run(q2, QStringLiteral("UPDATE folders SET enabled = 0, deleted_at = ? WHERE id = ?"),
-        {now, folderId});
+    ok = run(q2, QStringLiteral("UPDATE folders SET enabled = 0, deleted_at = ? WHERE id = ?"),
+             {now, folderId}) && ok;
+    endOwn(own, ok);
 }
 
 void PhotoRepository::restoreFolder(int folderId) {
@@ -539,21 +595,30 @@ KnownFiles PhotoRepository::existingFilesInScope(int folderId, const QString& pa
 
 int PhotoRepository::insertFile(int folderId, const FileInfo& info, const ExifData& exif,
                                 bool exifOk, const QString& now) {
+    const Own own = beginOwn();
+    if (own == Own::Failed) {
+        qWarning() << "morfPhoto: transaction impossible, insertFile abandonne";
+        return -1;
+    }
+    const bool bumped = bumpChangeSeq(db());
     QSqlQuery q(db());
-    const bool inserted = run(q, QStringLiteral(
+    const bool inserted = bumped && run(q, QStringLiteral(
              "INSERT INTO files (folder_id, path, directory, filename, extension, file_type, "
              "size, mtime, state, exif_ok, first_seen_at, last_seen_at, last_indexed_at, "
              "taken_at, make, camera_model, lens, focal_length, focal_length_35mm, aperture, "
              "shutter_speed, shutter_speed_s, iso, exposure_compensation, rating, latitude, "
-             "longitude, raw_exif) VALUES "
-             "(?,?,?,?,?,?,?,?,'present',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+             "longitude, raw_exif, change_seq) VALUES "
+             "(?,?,?,?,?,?,?,?,'present',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,%1)")
+             .arg(QString::fromLatin1(kSeqNow)),
         {folderId, info.path, info.directory, info.filename, info.extension, info.fileType,
          info.size, info.mtime, exifOk ? 1 : 0, now, now, now,
          exif.takenAt, exif.make, exif.cameraModel, exif.lens, exif.focalLength,
          exif.focalLength35mm, exif.aperture, exif.shutterSpeed, exif.shutterSpeedS,
          exif.iso, exif.exposureCompensation, exif.rating, exif.latitude, exif.longitude,
          rawExifVariant(exif)});
-    return inserted ? q.lastInsertId().toInt() : -1;
+    const int id = inserted ? q.lastInsertId().toInt() : -1;
+    endOwn(own, inserted);
+    return id;
 }
 
 void PhotoRepository::updateFile(int fileId, const FileInfo& info, const ExifData& exif,
@@ -564,7 +629,8 @@ void PhotoRepository::updateFile(int fileId, const FileInfo& info, const ExifDat
     QString sql = QStringLiteral(
         "UPDATE files SET directory = ?, filename = ?, extension = ?, file_type = ?, "
         "size = ?, mtime = ?, exif_ok = ?, last_seen_at = ?, last_indexed_at = ?, "
-        "state = 'present', disappeared_at = NULL");
+        "state = 'present', disappeared_at = NULL, change_seq = %1")
+        .arg(QString::fromLatin1(kSeqNow));
     QVariantList binds = {info.directory, info.filename, info.extension, info.fileType,
                           info.size, info.mtime, exifOk ? 1 : 0, now, now};
     if (exifOk) {
@@ -581,31 +647,52 @@ void PhotoRepository::updateFile(int fileId, const FileInfo& info, const ExifDat
     }
     sql += QStringLiteral(" WHERE id = ?");
     binds += fileId;
+    const Own own = beginOwn();
+    if (own == Own::Failed) {
+        qWarning() << "morfPhoto: transaction impossible, updateFile abandonne";
+        return;
+    }
+    bool ok = bumpChangeSeq(db());
     QSqlQuery q(db());
-    run(q, sql, binds);
+    ok = ok && run(q, sql, binds);
+    endOwn(own, ok);
 }
 
 void PhotoRepository::touchSeen(int fileId, const QString& now) {
-    // Fichier inchangé : noter qu'il est toujours là. Ravive un 'missing' réapparu.
-    QSqlQuery q(db());
-    run(q, QStringLiteral("UPDATE files SET last_seen_at = ?, state = 'present', "
-                          "disappeared_at = NULL WHERE id = ?"), {now, fileId});
+    touchSeen(QVector<int>{fileId}, now);
 }
 
 void PhotoRepository::touchSeen(const QVector<int>& fileIds, const QString& now) {
-    runBatchedFileUpdate(
+    // Fichier inchangé : noter qu'il est toujours là. Ravive un 'missing' réapparu ;
+    // seul ce changement d'etat est numerote dans le flux (un fichier deja present ne
+    // produit aucun changement).
+    const Own own = beginOwn();
+    if (own == Own::Failed) {
+        qWarning() << "morfPhoto: transaction impossible, touchSeen abandonne";
+        return;
+    }
+    const bool ok = runBatchedFileUpdate(
         db(),
         QStringLiteral("UPDATE files SET last_seen_at = ?, state = 'present', "
                        "disappeared_at = NULL WHERE id IN (%1)"),
-        fileIds, now, m_inTransaction);
+        QStringLiteral("id IN (%1) AND state != 'present'"),
+        fileIds, now);
+    endOwn(own, ok);
 }
 
 void PhotoRepository::markMissing(const QVector<int>& fileIds, const QString& now) {
-    runBatchedFileUpdate(
+    const Own own = beginOwn();
+    if (own == Own::Failed) {
+        qWarning() << "morfPhoto: transaction impossible, markMissing abandonne";
+        return;
+    }
+    const bool ok = runBatchedFileUpdate(
         db(),
         QStringLiteral("UPDATE files SET state = 'missing', disappeared_at = ? "
                        "WHERE id IN (%1) AND state != 'missing'"),
-        fileIds, now, m_inTransaction);
+        QStringLiteral("id IN (%1) AND state != 'missing'"),
+        fileIds, now);
+    endOwn(own, ok);
 }
 
 // --- Bibliothèque -----------------------------------------------------------
@@ -845,8 +932,18 @@ ExifData PhotoRepository::libraryBase(int fileId) {
 void PhotoRepository::storeLibrary(int fileId, const QString& fingerprint, const LibraryFileLabels& l,
                                    const QVector<LibraryVersion>& versions) {
     QSqlDatabase database = db();
-    const bool ownTransaction = !m_inTransaction && database.transaction();
+    const Own ownTransaction = beginOwn();
+    if (ownTransaction == Own::Failed) {
+        qWarning() << "morfPhoto: transaction impossible, storeLibrary abandonne";
+        return;
+    }
     {
+        // Toute modification de versions, mots-cles ou sidecar change le fichier pour
+        // le flux : l'appelant n'ecrit ici que lorsque l'empreinte a vraiment change.
+        bumpChangeSeq(database);
+        QSqlQuery stamp(database);
+        run(stamp, QStringLiteral("UPDATE files SET change_seq = %1 WHERE id = ?")
+                       .arg(QString::fromLatin1(kSeqNow)), {fileId});
         QSqlQuery del(database);
         run(del, QStringLiteral("DELETE FROM library_versions WHERE file_id = ?"), {fileId});
         QSqlQuery file(database);
@@ -892,8 +989,7 @@ void PhotoRepository::storeLibrary(int fileId, const QString& fingerprint, const
             }
         }
     }
-    if (ownTransaction)
-        database.commit();
+    endOwn(ownTransaction, true);
 }
 
 QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHash<int, QString>& matched,
@@ -1292,6 +1388,154 @@ QJsonObject PhotoRepository::libraryPhoto(int fileId, bool* found) {
 
 QJsonArray PhotoRepository::libraryPhotos(const QVector<int>& fileIds, bool withRaw) {
     return libraryItems(fileIds, {}, withRaw);
+}
+
+// --- Flux de changements ----------------------------------------------------
+
+bool PhotoRepository::changeState(QString* catalogId, qint64* highWater) {
+    QSqlDatabase database = db();
+    const bool own = !m_inTransaction && database.transaction();   // lecture : un instantane
+    QSqlQuery q(database);
+    const bool ok = run(q, QStringLiteral(
+        "SELECT (SELECT value FROM meta WHERE key = 'catalog_id'), "
+        "       (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'change_seq')"))
+        && q.next();
+    if (ok) {
+        if (catalogId) *catalogId = q.value(0).toString();
+        if (highWater) *highWater = q.value(1).toLongLong();
+    }
+    q.finish();
+    if (own)
+        database.commit();
+    return ok;
+}
+
+QJsonObject PhotoRepository::libraryChanges(qint64 afterSeq, qint64 afterId, int limit) {
+    QSqlDatabase database = db();
+    // Tout dans UNE transaction de lecture : identite, plus haut numero et lignes
+    // viennent du meme instantane (WAL), meme si l'indexation ecrit pendant ce temps.
+    const bool own = !m_inTransaction && database.transaction();
+
+    struct Change {
+        qint64 seq = 0;
+        qint64 id = 0;
+        int kind = 0;        // 0 = present, 1 = missing, 2 = deleted
+        QString path;
+    };
+    QVector<Change> rows;
+    QString catalogId;
+    qint64 highWater = 0;
+    bool ok = false;
+    bool more = false;
+    {
+        QSqlQuery st(database);
+        if (run(st, QStringLiteral(
+                "SELECT (SELECT value FROM meta WHERE key = 'catalog_id'), "
+                "       (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'change_seq')"))
+            && st.next()) {
+            catalogId = st.value(0).toString();
+            highWater = st.value(1).toLongLong();
+            ok = true;
+        }
+    }
+    if (ok) {
+        // Deux sources ordonnees par (change_seq, id), fusionnees : un id n'est jamais
+        // dans les deux (le trigger d'insertion retire la pierre tombale).
+        QVector<Change> files;
+        QVector<Change> tombs;
+        {
+            QSqlQuery q(database);
+            ok = run(q, QStringLiteral(
+                     "SELECT id, change_seq, state, path FROM files "
+                     "WHERE (change_seq, id) > (?, ?) ORDER BY change_seq, id LIMIT ?"),
+                     {afterSeq, afterId, limit + 1});
+            while (ok && q.next()) {
+                Change c;
+                c.id = q.value(0).toLongLong();
+                c.seq = q.value(1).toLongLong();
+                c.kind = q.value(2).toString() == QLatin1String("present") ? 0 : 1;
+                c.path = q.value(3).toString();
+                files.push_back(std::move(c));
+            }
+        }
+        if (ok) {
+            QSqlQuery q(database);
+            ok = run(q, QStringLiteral(
+                     "SELECT id, change_seq, path FROM deleted_files "
+                     "WHERE (change_seq, id) > (?, ?) ORDER BY change_seq, id LIMIT ?"),
+                     {afterSeq, afterId, limit + 1});
+            while (ok && q.next()) {
+                Change c;
+                c.id = q.value(0).toLongLong();
+                c.seq = q.value(1).toLongLong();
+                c.kind = 2;
+                c.path = q.value(2).toString();
+                tombs.push_back(std::move(c));
+            }
+        }
+        qsizetype fi = 0, ti = 0;
+        while (ok && (fi < files.size() || ti < tombs.size())) {
+            const bool takeFile = ti >= tombs.size()
+                || (fi < files.size()
+                    && (files[fi].seq < tombs[ti].seq
+                        || (files[fi].seq == tombs[ti].seq && files[fi].id < tombs[ti].id)));
+            if (rows.size() >= limit) {
+                more = true;
+                break;
+            }
+            rows.push_back(takeFile ? files[fi++] : tombs[ti++]);
+        }
+    }
+
+    QJsonArray items;
+    if (ok) {
+        // Fiches completes des fichiers presents, via la serialisation de /library
+        // (toutes les versions courantes, jamais un delta de versions).
+        QVector<int> presentIds;
+        for (const Change& c : rows)
+            if (c.kind == 0)
+                presentIds.push_back(static_cast<int>(c.id));
+        QHash<qint64, QJsonObject> full;
+        const QJsonArray fullItems = libraryItems(presentIds, {}, false);
+        for (const QJsonValue& v : fullItems) {
+            const QJsonObject o = v.toObject();
+            full.insert(o.value(QStringLiteral("id")).toInteger(), o);
+        }
+        static const char* const kStates[] = {"present", "missing", "deleted"};
+        for (const Change& c : rows) {
+            QJsonObject o;
+            if (c.kind == 0) {
+                const auto it = full.constFind(c.id);
+                if (it == full.constEnd())
+                    continue;   // sans fiche bibliotheque : le prochain storeLibrary le renumerotera
+                o = it.value();
+            } else {
+                o.insert(QStringLiteral("id"), c.id);
+                o.insert(QStringLiteral("path"), c.path);
+            }
+            o.insert(QStringLiteral("seq"), c.seq);
+            o.insert(QStringLiteral("state"), QString::fromLatin1(kStates[c.kind]));
+            items.append(o);
+        }
+    }
+    if (own)
+        database.commit();
+    if (!ok)
+        return {};
+
+    QJsonObject out;
+    out.insert(QStringLiteral("catalog_id"), catalogId);
+    out.insert(QStringLiteral("high_water"), highWater);
+    if (more && !rows.isEmpty()) {
+        QJsonObject next;
+        next.insert(QStringLiteral("seq"), rows.last().seq);
+        next.insert(QStringLiteral("id"), rows.last().id);
+        out.insert(QStringLiteral("next"), next);
+    } else {
+        out.insert(QStringLiteral("next"), QJsonValue(QJsonValue::Null));
+    }
+    out.insert(QStringLiteral("items"), items);
+    return out;
 }
 
 QJsonObject PhotoRepository::libraryFacets(const LibraryFilter& filter) {
@@ -2149,13 +2393,26 @@ int PhotoRepository::purgeAll() {
     // Remise à zéro complète du domaine : fichiers, sélections et historique des
     // passes. L'ordre respecte les clés étrangères (enfants d'abord). La base et son
     // schéma restent en place (aucune migration à rejouer), seulement vidés.
+    // Le catalogue change d'identite : un miroir qui connaissait l'ancien catalog_id
+    // repart de zero au lieu de croire que les pierres tombales le couvrent. Le
+    // compteur change_seq, lui, ne revient jamais en arriere.
+    const Own own = beginOwn();
+    if (own == Own::Failed) {
+        qWarning() << "morfPhoto: transaction impossible, purgeAll abandonne";
+        return 0;
+    }
     QSqlQuery qc(db());
     run(qc, QStringLiteral("SELECT COUNT(*) FROM files"));
     const int n = qc.next() ? qc.value(0).toInt() : 0;
     QSqlQuery q1(db()); run(q1, QStringLiteral("DELETE FROM index_errors"));
     QSqlQuery q2(db()); run(q2, QStringLiteral("DELETE FROM files"));
+    QSqlQuery q2b(db()); run(q2b, QStringLiteral("DELETE FROM deleted_files"));
     QSqlQuery q3(db()); run(q3, QStringLiteral("DELETE FROM index_runs"));
     QSqlQuery q4(db()); run(q4, QStringLiteral("DELETE FROM folders"));
+    QSqlQuery q5(db());
+    const bool ok = run(q5, QStringLiteral(
+        "UPDATE meta SET value = lower(hex(randomblob(8))) WHERE key = 'catalog_id'"));
+    endOwn(own, ok);
     return n;
 }
 

@@ -12,6 +12,14 @@
  */
 
 #include <cstdio>
+#include <algorithm>
+#include <functional>
+#include <QRegularExpression>
+#include <QSet>
+#include <limits>
+#include <QMap>
+#include <QSqlDatabase>
+#include <QSqlQuery>
 
 #include <QCoreApplication>
 #include <QDir>
@@ -35,6 +43,7 @@
 #include "morfphoto/ModuleRegistry.h"
 #include "morfphoto/FolderWatcher.h"
 #include "morfphoto/PhotoRepository.h"
+#include "morfphoto/PhotoSchema.h"
 #include "morfphoto/ExifExtractor.h"
 #include "morfphoto/LibraryMetadata.h"
 #include "morfphoto/Indexer.h"
@@ -61,6 +70,49 @@ static void writeBytes(const QString& path, int n) {
 
 static int lastRunInt(PhotoRepository& repo, const char* key) {
     return repo.latestRun(nullptr).value(QLatin1String(key)).toInt();
+}
+
+// Flux de changements : curseur apres tout ce qu'un instantane a livre (voir README).
+static constexpr qint64 kAfterAll = std::numeric_limits<qint64>::max();
+
+static qint64 feedHighWater(PhotoRepository& repo) {
+    QString id;
+    qint64 hw = -1;
+    repo.changeState(&id, &hw);
+    return hw;
+}
+
+// Lit tout le flux page par page depuis un curseur ; `between` est appele apres chaque
+// page (pour ecrire pendant la lecture). Renvoie id -> {seq, state} appliques dans l'ordre.
+struct FeedEntry { qint64 seq = 0; QString state; QString path; };
+static QMap<qint64, FeedEntry> drainFeed(PhotoRepository& repo, qint64 seq, qint64 id, int limit,
+                                         const std::function<void()>& between = {},
+                                         int* pages = nullptr, bool* orderOk = nullptr,
+                                         QJsonObject* last = nullptr) {
+    QMap<qint64, FeedEntry> out;
+    qint64 prevSeq = seq, prevId = id;
+    if (pages) *pages = 0;
+    if (orderOk) *orderOk = true;
+    for (int guard = 0; guard < 1000; ++guard) {
+        const QJsonObject page = repo.libraryChanges(seq, id, limit);
+        if (pages) ++*pages;
+        if (last) *last = page;
+        for (const QJsonValue& v : page.value(QStringLiteral("items")).toArray()) {
+            const QJsonObject o = v.toObject();
+            const qint64 s = o.value(QStringLiteral("seq")).toInteger();
+            const qint64 i = o.value(QStringLiteral("id")).toInteger();
+            if (orderOk && (s < prevSeq || (s == prevSeq && i <= prevId))) *orderOk = false;
+            prevSeq = s; prevId = i;
+            out[i] = {s, o.value(QStringLiteral("state")).toString(), o.value(QStringLiteral("path")).toString()};
+        }
+        if (between) between();
+        const QJsonValue next = page.value(QStringLiteral("next"));
+        if (!next.isObject())
+            break;
+        seq = next.toObject().value(QStringLiteral("seq")).toInteger();
+        id = next.toObject().value(QStringLiteral("id")).toInteger();
+    }
+    return out;
 }
 
 int main(int argc, char** argv) {
@@ -763,6 +815,290 @@ int main(int argc, char** argv) {
         lrepo.close();
     }
 
+    // Flux de changements (migration 11) : numerotation persistante, pierres tombales, curseur.
+    {
+        const QString cf = base + QStringLiteral("/changefeed");
+        QDir().mkpath(cf + QStringLiteral("/2024"));
+        QFile::remove(cf + QStringLiteral("/db.sqlite"));
+        auto put = [](const QString& path, const QByteArray& bytes) {
+            QFile f(path);
+            if (f.open(QIODevice::WriteOnly)) f.write(bytes);
+        };
+        auto xmpWith = [](int rating, const QByteArray& keyword) {
+            return QByteArray("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" "
+                              "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" "
+                              "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+                              "xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+                              "<rdf:RDF><rdf:Description rdf:about=\"\" xmp:Rating=\"")
+                + QByteArray::number(rating) + "\"><dc:subject><rdf:Bag><rdf:li>" + keyword
+                + "</rdf:li></rdf:Bag></dc:subject></rdf:Description></rdf:RDF></x:xmpmeta>";
+        };
+        for (int i = 1; i <= 7; ++i)
+            writeBytes(cf + QStringLiteral("/2024/p%1.jpg").arg(i), 100 + i);
+        put(cf + QStringLiteral("/2024/p1.jpg.xmp"), xmpWith(3, "alpha"));
+
+        PhotoRepository cr(QStringLiteral("smoke:changes"));
+        CHECK(cr.open(cf + QStringLiteral("/db.sqlite")), "changes: base ouverte (migration 11)");
+        const int cfFolder = cr.addFolder(cf, cf, QVariant(), true, false, QVariant(), nowIso());
+        Indexer cidx(&cr, nullptr, {cf});
+        cidx.setLibraryEnabled(true);
+        cidx.run(IndexMode::Full, {}, QStringLiteral("cli"));
+
+        QString catalogId;
+        qint64 hw0 = 0;
+        CHECK(cr.changeState(&catalogId, &hw0) && hw0 >= 7, "changes: high_water depasse les 7 fichiers indexes");
+        CHECK(QRegularExpression(QStringLiteral("^[0-9a-f]{16}$")).match(catalogId).hasMatch(),
+              "changes: catalog_id = 16 hex");
+        QMap<qint64, FeedEntry> mirror = drainFeed(cr, 0, 0, 500);
+        CHECK(mirror.size() == 7, "changes: premiere lecture = 7 fichiers");
+        bool allPresent = true;
+        for (const FeedEntry& e : mirror) allPresent = allPresent && e.state == QLatin1String("present");
+        CHECK(allPresent, "changes: tous presents");
+        const QJsonObject firstPage = cr.libraryChanges(0, 0, 500);
+        const QJsonObject firstItem = firstPage.value(QStringLiteral("items")).toArray().at(0).toObject();
+        CHECK(firstItem.contains(QStringLiteral("versions")) && firstItem.contains(QStringLiteral("relative_path"))
+              && firstItem.contains(QStringLiteral("camera")) && firstItem.contains(QStringLiteral("seq")),
+              "changes: un element present porte les champs de /library et versions");
+        CHECK(firstPage.value(QStringLiteral("next")).isNull()
+              && firstPage.value(QStringLiteral("high_water")).toInteger() == hw0,
+              "changes: next null a la fin, high_water du compteur");
+
+        // Passe inchangee : rien n'est numerote.
+        const QMap<qint64, FeedEntry> before = mirror;
+        cidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        cidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        CHECK(feedHighWater(cr) == hw0, "changes: passes inchangees -> high_water identique");
+        bool same = true;
+        const QMap<qint64, FeedEntry> again = drainFeed(cr, 0, 0, 500);
+        for (auto it = before.begin(); it != before.end(); ++it)
+            same = same && again.value(it.key()).seq == it->seq;
+        CHECK(same && drainFeed(cr, hw0, kAfterAll, 500).isEmpty(),
+              "changes: passes inchangees -> aucun seq modifie, rien apres le curseur");
+
+        // Sidecar seul : change le fichier et sa liste de versions.
+        put(cf + QStringLiteral("/2024/p1.jpg.xmp"), xmpWith(5, "beta"));
+        cidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        QJsonObject lastPage;
+        const QMap<qint64, FeedEntry> side = drainFeed(cr, hw0, kAfterAll, 500, {}, nullptr, nullptr, &lastPage);
+        CHECK(side.size() == 1 && side.begin()->state == QLatin1String("present") && feedHighWater(cr) > hw0,
+              "changes: sidecar modifie -> un seul element, numerote");
+        const QJsonObject sideItem = cr.libraryChanges(hw0, kAfterAll, 500).value(QStringLiteral("items")).toArray().at(0).toObject();
+        CHECK(sideItem.value(QStringLiteral("versions")).toArray().at(0).toObject()
+                  .value(QStringLiteral("rating")).toInt() == 5,
+              "changes: la liste de versions est la liste complete courante");
+        qint64 hw1 = feedHighWater(cr);
+
+        // Disparu puis revenu.
+        const QString gone = cf + QStringLiteral("/2024/p7.jpg");
+        QFile::remove(gone);
+        cidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        const QMap<qint64, FeedEntry> miss = drainFeed(cr, hw1, kAfterAll, 500);
+        CHECK(miss.size() == 1 && miss.begin()->state == QLatin1String("missing")
+                  && miss.begin()->path == gone,
+              "changes: fichier disparu -> missing (id, seq, state, path)");
+        cidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        CHECK(drainFeed(cr, feedHighWater(cr), kAfterAll, 500).isEmpty() && feedHighWater(cr) == hw1 + 1,
+              "changes: passe suivante sans changement -> rien de plus");
+        hw1 = feedHighWater(cr);
+        writeBytes(gone, 107);   // meme taille et meme mtime a la seconde : connu, donc touchSeen
+        cidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        const QMap<qint64, FeedEntry> back = drainFeed(cr, hw1, kAfterAll, 500);
+        CHECK(back.size() == 1 && back.begin()->state == QLatin1String("present"),
+              "changes: fichier revenu -> present numerote");
+        hw1 = feedHighWater(cr);
+
+        // Retrait doux : tous les fichiers du dossier passent missing, par UN seul numero.
+        cr.softDeleteFolder(cfFolder, nowIso());
+        const qint64 hw2 = feedHighWater(cr);
+        int pages = 0;
+        bool orderOk = true;
+        const QMap<qint64, FeedEntry> soft = drainFeed(cr, hw1, kAfterAll, 3, {}, &pages, &orderOk);
+        bool allMissing = soft.size() == 7;
+        qint64 sharedSeq = soft.isEmpty() ? -1 : soft.begin()->seq;
+        bool oneSeq = true;
+        for (const FeedEntry& e : soft) { allMissing = allMissing && e.state == QLatin1String("missing"); oneSeq = oneSeq && e.seq == sharedSeq; }
+        CHECK(allMissing && hw2 == hw1 + 1, "changes: dossier retire -> ses 7 fichiers en missing");
+        CHECK(oneSeq && pages == 3 && orderOk,
+              "changes: 7 lignes d'un meme seq, pages de 3 -> aucune sautee ni doublee (curseur composite)");
+
+        // Pagination pendant qu'une autre connexion ecrit (marquage, puis passe d'indexation).
+        cr.restoreFolder(cfFolder);
+        cidx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+        QMap<qint64, FeedEntry> live = drainFeed(cr, 0, 0, 500);
+        CHECK(live.size() == 7, "changes: dossier restaure -> 7 fichiers a nouveau");
+        const qint64 hwStart = feedHighWater(cr);
+        PhotoRepository other(QStringLiteral("smoke:changes-writer"));
+        CHECK(other.open(cf + QStringLiteral("/db.sqlite")), "changes: seconde connexion ecrivante");
+        Indexer otherIdx(&other, nullptr, {cf});
+        otherIdx.setLibraryEnabled(true);
+        QMap<qint64, FeedEntry> mirror2;
+        {
+            qint64 seq = 0, id = 0;
+            int step = 0;
+            for (int guard = 0; guard < 100; ++guard) {
+                const QJsonObject page = cr.libraryChanges(seq, id, 2);
+                for (const QJsonValue& v : page.value(QStringLiteral("items")).toArray()) {
+                    const QJsonObject o = v.toObject();
+                    mirror2[o.value(QStringLiteral("id")).toInteger()] =
+                        {o.value(QStringLiteral("seq")).toInteger(), o.value(QStringLiteral("state")).toString(), {}};
+                }
+                if (step == 0) {
+                    other.markMissing({static_cast<int>(live.firstKey())}, nowIso());
+                } else if (step == 1) {
+                    put(cf + QStringLiteral("/2024/p8.jpg"), QByteArray(108, 'x'));
+                    otherIdx.run(IndexMode::Incremental, {}, QStringLiteral("cli"));
+                }
+                ++step;
+                const QJsonValue next = page.value(QStringLiteral("next"));
+                if (!next.isObject())
+                    break;
+                seq = next.toObject().value(QStringLiteral("seq")).toInteger();
+                id = next.toObject().value(QStringLiteral("id")).toInteger();
+            }
+            // Rattrapage depuis le dernier high_water lu : le miroir doit egaler une lecture neuve.
+            const QJsonObject tail = cr.libraryChanges(seq, id, 500);
+            for (const QJsonValue& v : tail.value(QStringLiteral("items")).toArray()) {
+                const QJsonObject o = v.toObject();
+                mirror2[o.value(QStringLiteral("id")).toInteger()] =
+                    {o.value(QStringLiteral("seq")).toInteger(), o.value(QStringLiteral("state")).toString(), {}};
+            }
+            const QMap<qint64, FeedEntry> fresh = drainFeed(cr, 0, 0, 500);
+            bool equal = fresh.size() == mirror2.size() && fresh.size() == 8;
+            for (auto it = fresh.begin(); equal && it != fresh.end(); ++it)
+                equal = mirror2.value(it.key()).state == it->state && mirror2.value(it.key()).seq == it->seq;
+            CHECK(equal && feedHighWater(cr) > hwStart,
+                  "changes: lecture paginee pendant des ecritures concurrentes -> miroir identique a une lecture neuve");
+        }
+        other.close();
+
+        // Purge : pierres tombales, puis id recree.
+        QMap<qint64, FeedEntry> beforePurge = drainFeed(cr, 0, 0, 500);
+        const qint64 hwBeforePurge = feedHighWater(cr);
+        CHECK(cr.purgeFolder(cfFolder) == 8, "changes: purge du dossier -> 8 fichiers");
+        const QMap<qint64, FeedEntry> tombs = drainFeed(cr, hwBeforePurge, kAfterAll, 500);
+        bool tombsOk = tombs.size() == 8;
+        for (auto it = tombs.begin(); tombsOk && it != tombs.end(); ++it)
+            tombsOk = it->state == QLatin1String("deleted") && !it->path.isEmpty()
+                      && beforePurge.contains(it.key()) && it->seq > hwBeforePurge;
+        CHECK(tombsOk, "changes: purge -> 8 elements deleted (id, seq, state, path)");
+        CHECK(cr.libraryChanges(0, 0, 500).value(QStringLiteral("items")).toArray().size() == 8,
+              "changes: seules les pierres tombales restent apres la purge");
+        const int cfFolder2 = cr.addFolder(cf, cf, QVariant(), true, false, QVariant(), nowIso());
+        Q_UNUSED(cfFolder2);
+        Indexer reidx(&cr, nullptr, {cf});
+        reidx.setLibraryEnabled(true);
+        reidx.run(IndexMode::Full, {}, QStringLiteral("cli"));
+        const QMap<qint64, FeedEntry> reborn = drainFeed(cr, 0, 0, 500);
+        int deletedLeft = 0, presentNow = 0;
+        QSet<qint64> presentIds;
+        for (auto it = reborn.begin(); it != reborn.end(); ++it) {
+            if (it->state == QLatin1String("deleted")) ++deletedLeft;
+            if (it->state == QLatin1String("present")) { ++presentNow; presentIds.insert(it.key()); }
+        }
+        bool noGhost = true;
+        for (auto it = reborn.begin(); it != reborn.end(); ++it)
+            if (it->state == QLatin1String("deleted") && presentIds.contains(it.key())) noGhost = false;
+        CHECK(presentNow == 8 && noGhost && deletedLeft == 0,
+              "changes: id recree apres suppression -> pierre tombale retiree");
+
+        // Verrou d'ecriture tenu ailleurs : une ecriture numerotee echoue sans rien ecrire
+        // (pas de repli en autocommit), puis reussit une fois le verrou libere.
+        {
+            const qint64 victim = presentIds.values().first();
+            QString idLock;
+            qint64 hwLock = 0;
+            cr.changeState(&idLock, &hwLock);
+            const QMap<qint64, FeedEntry> beforeLock = drainFeed(cr, 0, 0, 500);
+            QSqlDatabase mine = QSqlDatabase::database(QStringLiteral("smoke:changes"));
+            QSqlQuery(mine).exec(QStringLiteral("PRAGMA busy_timeout = 50"));
+            {
+                QSqlDatabase locker = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+                                                                QStringLiteral("smoke:locker"));
+                locker.setDatabaseName(cf + QStringLiteral("/db.sqlite"));
+                const bool opened = locker.open();
+                QSqlQuery lq(locker);
+                const bool locked = opened && lq.exec(QStringLiteral("BEGIN IMMEDIATE"));
+                CHECK(locked, "changes: verrou d'ecriture pris par une seconde connexion");
+                const int idBusy = cr.insertFile(0, FileInfo(), ExifData(), false, nowIso());
+                cr.markMissing({static_cast<int>(victim)}, nowIso());
+                QString idDuring;
+                qint64 hwDuring = 0;
+                cr.changeState(&idDuring, &hwDuring);
+                const QMap<qint64, FeedEntry> during = drainFeed(cr, 0, 0, 500);
+                bool same = during.size() == beforeLock.size();
+                for (auto it = beforeLock.begin(); same && it != beforeLock.end(); ++it)
+                    same = during.contains(it.key()) && during.value(it.key()).seq == it->seq
+                           && during.value(it.key()).state == it->state;
+                CHECK(idBusy == -1 && hwDuring == hwLock && same,
+                      "changes: base verrouillee -> ecriture refusee, change_seq et lignes inchanges");
+                lq.exec(QStringLiteral("ROLLBACK"));
+                locker.close();
+            }
+            QSqlDatabase::removeDatabase(QStringLiteral("smoke:locker"));
+            cr.markMissing({static_cast<int>(victim)}, nowIso());
+            QString idAfterLock;
+            qint64 hwAfterLock = 0;
+            cr.changeState(&idAfterLock, &hwAfterLock);
+            const QMap<qint64, FeedEntry> afterLock = drainFeed(cr, 0, 0, 500);
+            CHECK(hwAfterLock > hwLock && afterLock.value(victim).state == QLatin1String("missing"),
+                  "changes: verrou libere -> l'ecriture reussit et est numerotee");
+            QSqlQuery(mine).exec(QStringLiteral("PRAGMA busy_timeout = 5000"));
+        }
+
+        // ETag/high_water ne baissent jamais ; la remise a zero change le catalog_id.
+        QString idBefore;
+        qint64 hwBeforeReset = 0;
+        cr.changeState(&idBefore, &hwBeforeReset);
+        cr.purgeAll();
+        QString idAfter;
+        qint64 hwAfterReset = 0;
+        cr.changeState(&idAfter, &hwAfterReset);
+        CHECK(idAfter != idBefore && QRegularExpression(QStringLiteral("^[0-9a-f]{16}$")).match(idAfter).hasMatch(),
+              "changes: purgeAll fait tourner catalog_id");
+        CHECK(hwAfterReset >= hwBeforeReset && cr.libraryChanges(0, 0, 500).value(QStringLiteral("items")).toArray().isEmpty(),
+              "changes: purgeAll -> compteur jamais en arriere, flux vide");
+        cr.close();
+    }
+
+    // Migration 11 depuis une base v10 : numeros distincts croissants pour l'existant.
+    {
+        const QString v10 = base + QStringLiteral("/v10.sqlite");
+        {
+            QSqlDatabase raw = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("smoke:v10"));
+            raw.setDatabaseName(v10);
+            bool okRaw = raw.open();
+            for (int v = 1; okRaw && v <= 10; ++v)
+                for (const QString& st : migrationStatements(v)) {
+                    QSqlQuery q(raw);
+                    okRaw = q.exec(st) && okRaw;
+                }
+            QSqlQuery q(raw);
+            okRaw = q.exec(QStringLiteral("PRAGMA user_version = 10")) && okRaw;
+            okRaw = q.exec(QStringLiteral("INSERT INTO folders (id, path, root_path, added_at) VALUES (1, '/p', '/p', 'x')")) && okRaw;
+            for (int id : {5, 9, 12})
+                okRaw = QSqlQuery(raw).exec(QStringLiteral(
+                    "INSERT INTO files (id, folder_id, path, directory, filename, size, mtime, first_seen_at, "
+                    "last_seen_at, last_indexed_at) VALUES (%1, 1, '/p/%1.jpg', '/p', '%1.jpg', 1, 1, 'x', 'x', 'x')")
+                    .arg(id)) && okRaw;
+            for (int id : {5, 9, 12})   // fiches bibliotheque : sans elles un fichier n'est pas servi
+                okRaw = QSqlQuery(raw).exec(QStringLiteral(
+                    "INSERT INTO library_files VALUES (%1, '', 'JPEG', 'jpg', '', '', '', '', '', '', '')")
+                    .arg(id)) && okRaw;
+            CHECK(okRaw, "migration 11: base v10 fabriquee");
+            raw.close();
+        }
+        QSqlDatabase::removeDatabase(QStringLiteral("smoke:v10"));
+        PhotoRepository mig(QStringLiteral("smoke:v10repo"));
+        CHECK(mig.open(v10), "migration 11: base v10 migree");
+        const QMap<qint64, FeedEntry> m = drainFeed(mig, 0, 0, 500);
+        QSet<qint64> seqs;
+        for (const FeedEntry& e : m) seqs.insert(e.seq);
+        const qint64 hw = feedHighWater(mig);
+        CHECK(m.size() == 3 && seqs.size() == 3 && hw == 12 && *std::max_element(seqs.begin(), seqs.end()) <= hw,
+              "migration 11: lignes existantes numerotees distinctement, compteur apres elles");
+        mig.close();
+    }
+
     // Anti-CSRF : Origin different de Host sur une ecriture = refus.
     CHECK(!isCrossOriginWrite("POST", "", "pi:8791"), "sans Origin (client non navigateur): passe");
     CHECK(!isCrossOriginWrite("POST", "http://pi:8791", "pi:8791"), "meme origine: passe");
@@ -1177,6 +1513,47 @@ int main(int argc, char** argv) {
             const bool gotR2NotMod = readHttpResponse(client, r2NotMod);
             CHECK(gotR2NotMod && r2NotMod.startsWith("HTTP/1.1 304 Not Modified"),
                   "phase3: /api/v1/library avec If-None-Match renvoie 304 Not Modified");
+
+            // Flux de changements : ETag "chg-<catalog_id>-<high_water>", 304, status.
+            client.write("GET /api/v1/library/changes?limit=2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            client.flush();
+            QByteArray rChg;
+            const bool gotChg = readHttpResponse(client, rChg);
+            QByteArray chgEtag;
+            if (gotChg) {
+                for (const QByteArray& line : rChg.left(rChg.indexOf("\r\n\r\n")).split('\n')) {
+                    const QByteArray l = line.trimmed();
+                    if (l.toLower().startsWith("etag:"))
+                        chgEtag = l.mid(l.indexOf(':') + 1).trimmed();
+                }
+            }
+            const QJsonObject chgObj = gotChg
+                ? QJsonDocument::fromJson(rChg.mid(rChg.indexOf("\r\n\r\n") + 4)).object() : QJsonObject();
+            const QByteArray wantEtag = "\"chg-" + chgObj.value(QStringLiteral("catalog_id")).toString().toLatin1()
+                + "-" + QByteArray::number(chgObj.value(QStringLiteral("high_water")).toInteger()) + "\"";
+            CHECK(gotChg && rChg.startsWith("HTTP/1.1 200 OK") && chgEtag == wantEtag
+                  && chgObj.value(QStringLiteral("items")).toArray().size() == 2
+                  && chgObj.value(QStringLiteral("next")).isObject(),
+                  "changes: GET /api/v1/library/changes -> 200, ETag chg-<catalog_id>-<high_water>, next");
+            client.write("GET /api/v1/library/changes?limit=2 HTTP/1.1\r\nHost: 127.0.0.1\r\nIf-None-Match: " + chgEtag + "\r\n\r\n");
+            client.flush();
+            QByteArray rChg304;
+            CHECK(readHttpResponse(client, rChg304) && rChg304.startsWith("HTTP/1.1 304 Not Modified"),
+                  "changes: If-None-Match -> 304");
+            client.write("GET /api/v1/library/changes?limit=0 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            client.flush();
+            QByteArray rChgBad;
+            CHECK(readHttpResponse(client, rChgBad) && rChgBad.startsWith("HTTP/1.1 400"),
+                  "changes: limit invalide -> 400 bad_request");
+            client.write("GET /api/v1/index/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            client.flush();
+            QByteArray rChgStatus;
+            const bool gotChgStatus = readHttpResponse(client, rChgStatus);
+            const QJsonObject chgStatus = gotChgStatus
+                ? QJsonDocument::fromJson(rChgStatus.mid(rChgStatus.indexOf("\r\n\r\n") + 4)).object() : QJsonObject();
+            CHECK(chgStatus.value(QStringLiteral("catalog_id")) == chgObj.value(QStringLiteral("catalog_id"))
+                  && chgStatus.value(QStringLiteral("high_water")) == chgObj.value(QStringLiteral("high_water")),
+                  "changes: /api/v1/index/status expose catalog_id et high_water");
 
             // Requete 3 sur LA MEME socket : /api/v1/library/facets (single-pass + cache)
             client.write("GET /api/v1/library/facets HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");

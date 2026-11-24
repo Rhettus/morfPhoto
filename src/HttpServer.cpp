@@ -230,6 +230,8 @@ void HttpServer::onSocketReadyRead(QTcpSocket* sock) {
             route = "health";
         else if (logPath == "/api/v1/library/subfolders")
             route = "subfolders";
+        else if (logPath == "/api/v1/library/changes")
+            route = "changes";
         else if (logPath == "/api/v1/library" || logPath.startsWith("/api/v1/library/"))
             route = "catalog";
         else if (logPath.startsWith("/api/v1/thumbnail"))
@@ -363,6 +365,25 @@ void HttpServer::handleRequest(QTcpSocket* sock, const QByteArray& method,
             watcher->setFuture(QtConcurrent::run(&m_apiReadPool,
                 [photos, method, pathStr, queryString, body, isLibraryPath, ifNoneMatch]() -> ApiReadResult {
                     QByteArray extraHeaders;
+                    // Flux de changements : son ETag vient de (catalog_id, high_water), pas de
+                    // catalog_revision, et il faut lire une base en lecture pour le calculer.
+                    if (isLibraryPath && pathStr == QLatin1String("/api/v1/library/changes")) {
+                        QString catalogId;
+                        qint64 highWater = 0;
+                        if (photos->libraryEnabled() && photos->changeState(&catalogId, &highWater)) {
+                            const QByteArray etag = "\"chg-" + catalogId.toLatin1() + "-"
+                                + QByteArray::number(highWater) + "\"";
+                            if (etagMatches(ifNoneMatch, etag)) {
+                                return {{304, QByteArray(), QByteArrayLiteral("application/json; charset=utf-8")},
+                                        "Cache-Control: private, no-cache\r\nETag: " + etag + "\r\n"};
+                            }
+                        }
+                        PhotoApi::Result res = PhotoApi(photos).handle(method, pathStr, queryString, body);
+                        QByteArray headers;
+                        if (res.code == 200 && !res.etag.isEmpty())
+                            headers = "Cache-Control: private, no-cache\r\nETag: " + res.etag + "\r\n";
+                        return {std::move(res), headers};
+                    }
                     if (isLibraryPath && photos->libraryEnabled()) {
                         const QByteArray rev = photos->catalogRevision().toLatin1();
                         if (!rev.isEmpty()) {

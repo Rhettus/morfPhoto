@@ -23,7 +23,7 @@
 // -----------------------------------------------------------------------------
 namespace morfphoto {
 
-inline constexpr int kSchemaVersion = 10;
+inline constexpr int kSchemaVersion = 11;
 
 // Instructions de la migration 001 (création initiale). La colonne calculée
 // `taken_year` permet de regrouper par année sans reparser la date à chaque fois.
@@ -317,6 +317,47 @@ inline QStringList schemaV10Statements() {
     };
 }
 
+// Migration 011 : FLUX DE CHANGEMENTS (delta) pour les clients qui tiennent un miroir
+// local du catalogue. `meta` porte l'identite du catalogue (`catalog_id`, aleatoire,
+// cree une fois, tourne a la remise a zero) et le compteur `change_seq`. Chaque
+// ecriture REELLE d'une ligne de `files` y prend un numero, dans la meme transaction
+// d'ecriture que la modification : SQLite n'a qu'un ecrivain a la fois, donc l'ordre des
+// numeros est l'ordre des commits (jamais de compteur en memoire, il serait faux entre
+// la connexion d'indexation et la connexion de l'API). Les lignes existantes recoivent
+// des numeros distincts croissants (par id) et le compteur demarre apres eux.
+// `deleted_files` garde une pierre tombale par suppression DEFINITIVE (purge), posee
+// par un trigger pour couvrir tous les chemins de suppression. Si un id est recree
+// apres suppression (SQLite reutilise le plus grand rowid), la pierre tombale saute.
+inline QStringList schemaV11Statements() {
+    return {
+        QStringLiteral("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)"),
+        QStringLiteral("INSERT INTO meta (key, value) VALUES ('catalog_id', lower(hex(randomblob(8))))"),
+        QStringLiteral("ALTER TABLE files ADD COLUMN change_seq INTEGER NOT NULL DEFAULT 0"),
+        QStringLiteral("UPDATE files SET change_seq = id"),
+        QStringLiteral("INSERT INTO meta (key, value) "
+                       "SELECT 'change_seq', CAST(COALESCE(MAX(change_seq), 0) AS TEXT) FROM files"),
+        QStringLiteral("CREATE INDEX idx_files_change_seq ON files(change_seq, id)"),
+        QStringLiteral(
+            "CREATE TABLE deleted_files ("
+            "  id         INTEGER PRIMARY KEY,"
+            "  path       TEXT    NOT NULL,"
+            "  change_seq INTEGER NOT NULL"
+            ")"),
+        QStringLiteral("CREATE INDEX idx_deleted_files_seq ON deleted_files(change_seq, id)"),
+        QStringLiteral(
+            "CREATE TRIGGER files_change_ad AFTER DELETE ON files BEGIN "
+            "  UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'change_seq'; "
+            "  INSERT OR REPLACE INTO deleted_files (id, path, change_seq) "
+            "    VALUES (old.id, old.path, "
+            "            (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'change_seq')); "
+            "END"),
+        QStringLiteral(
+            "CREATE TRIGGER files_change_ai AFTER INSERT ON files BEGIN "
+            "  DELETE FROM deleted_files WHERE id = new.id; "
+            "END"),
+    };
+}
+
 // Instructions à exécuter pour atteindre une version de schéma donnée. Le dépôt
 // applique dans l'ordre chaque version manquante (voir applyMigrations).
 inline QStringList migrationStatements(int version) {
@@ -331,6 +372,7 @@ inline QStringList migrationStatements(int version) {
     case 8:  return schemaV8Statements();
     case 9:  return schemaV9Statements();
     case 10: return schemaV10Statements();
+    case 11: return schemaV11Statements();
     default: return {};
     }
 }

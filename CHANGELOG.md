@@ -11,6 +11,17 @@ et du [versionnage sémantique](https://semver.org/lang/fr/).
   uses a larger embedded camera preview when available and refreshes the existing
   cache as it warms.
 
+## [0.15.10] - 2026-11-23
+
+### Added
+
+- Change feed for local mirrors: `GET /api/v1/library/changes?after_seq=&after_id=&limit=` returns the files that changed after a `(seq, id)` cursor, ordered by `(seq, id)`, with `catalog_id`, `high_water` and the next cursor, in one read transaction. `present` items are whole files (every `/library` field and the complete `versions` list); `missing` and `deleted` (purged) items carry id, seq, state and path. `ETag: "chg-<catalog_id>-<high_water>"` and `If-None-Match` answer `304`. `GET /api/v1/index/status` reports `catalog_id` and `high_water`.
+- Schema v11: `meta` (`catalog_id`, `change_seq`), `files.change_seq` (indexed with `id`) and `deleted_files`, filled by a trigger on every hard delete. The number is taken from the persistent counter in the transaction that writes the row, never from memory. Only real changes are numbered: a new or modified file, a sidecar, version or keyword change, a file gone missing or back, a removed folder. An unchanged index pass numbers nothing. The reset of the catalogue (`purge` scope `all`) changes `catalog_id`.
+
+### Changed
+
+- Index batches now open with `BEGIN IMMEDIATE`, so the write lock is taken before the first change number is read.
+
 ## [0.15.5] - 2026-11-18
 
 ### Fixed

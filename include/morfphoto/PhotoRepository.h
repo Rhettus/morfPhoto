@@ -128,6 +128,14 @@ public:
     QJsonObject libraryPhoto(int fileId, bool* found);
     QJsonArray libraryPhotos(const QVector<int>& fileIds, bool withRaw);
 
+    // --- Flux de changements (delta) pour les miroirs locaux ---
+    // Identite du catalogue et plus haut numero attribue, lus dans UNE transaction.
+    bool changeState(QString* catalogId, qint64* highWater);
+    // Changements strictement apres le curseur (afterSeq, afterId), tries par
+    // (change_seq, id), dans une seule transaction de lecture. Objet vide si la base
+    // est illisible. Voir la description de /api/v1/library/changes.
+    QJsonObject libraryChanges(qint64 afterSeq, qint64 afterId, int limit);
+
     // --- Passes d'indexation ---
     int  startRun(const QString& mode, const QString& trigger, const QString& startedAt);
     void finishRun(int runId, const QString& state, const RunCounts& counts,
@@ -175,6 +183,15 @@ private:
     QJsonArray distinct(const QString& column, const QString& label);
     QJsonArray libraryItems(const QVector<int>& fileIds, const QHash<int, QString>& matched, bool withRaw);
     QSqlDatabase db() const;
+    // Ecritures qui numerotent un changement : si aucune transaction du lot n'est
+    // ouverte, en ouvrir une propre (BEGIN IMMEDIATE) pour que le numero soit pris dans
+    // la transaction qui ecrit la ligne. beginOwn() distingue : deja dans une transaction
+    // du lot (Outer), transaction propre ouverte (Began), ouverture impossible (Failed :
+    // l'appelant n'ecrit rien, sinon numero et ligne seraient commites separement).
+    enum class Own { Outer, Began, Failed };
+    bool beginImmediate();
+    Own beginOwn();
+    void endOwn(Own own, bool ok);
 
     QString m_connectionName;
     QString m_openError;

@@ -28,6 +28,8 @@ public:
         // Type MIME de la reponse. JSON par defaut ; certaines routes renvoient du
         // binaire (ex. une vignette image/jpeg). Le serveur HTTP l'utilise tel quel.
         QByteArray contentType = QByteArrayLiteral("application/json; charset=utf-8");
+        // ETag (avec guillemets) de la reponse, vide si la route n'en pose pas.
+        QByteArray etag;
     };
 
     explicit PhotoApi(PhotoModule* module);

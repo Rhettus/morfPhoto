@@ -21,6 +21,8 @@ namespace {
 
 constexpr int kDefaultPageSize = 50;
 constexpr int kMaxPageSize     = 500;
+constexpr int kDefaultChangesLimit = 500;   // /library/changes : page par defaut
+constexpr int kMaxChangesLimit     = 1000;
 
 QByteArray toBytes(const QJsonObject& o) {
     return QJsonDocument(o).toJson(QJsonDocument::Compact);
@@ -139,6 +141,31 @@ PhotoApi::Result PhotoApi::handle(const QByteArray& method, const QString& path,
                 return error(400, QStringLiteral("invalid_folder_path"));
             const QJsonObject result = m_module->librarySubfolders(folder);
             return result.isEmpty() ? error(503, QStringLiteral("catalog_unavailable")) : ok(result);
+        }
+        // Flux de changements : delta du catalogue pour les miroirs locaux.
+        if (seg.size() == 2 && seg[1] == QLatin1String("changes")) {
+            auto intParam = [&query](const QString& key, qint64 fallback, qint64 minimum, qint64* out) {
+                if (!query.hasQueryItem(key)) { *out = fallback; return true; }
+                bool okN = false;
+                const qint64 n = query.queryItemValue(key).toLongLong(&okN);
+                if (!okN || n < minimum) return false;
+                *out = n;
+                return true;
+            };
+            qint64 afterSeq = 0, afterId = 0, limit = kDefaultChangesLimit;
+            if (!intParam(QStringLiteral("after_seq"), 0, 0, &afterSeq)
+                || !intParam(QStringLiteral("after_id"), 0, 0, &afterId)
+                || !intParam(QStringLiteral("limit"), kDefaultChangesLimit, 1, &limit))
+                return error(400, QStringLiteral("bad_request"),
+                             QStringLiteral("after_seq/after_id/limit invalide"));
+            limit = qMin<qint64>(limit, kMaxChangesLimit);
+            const QJsonObject feed = m_module->libraryChanges(afterSeq, afterId, static_cast<int>(limit));
+            if (feed.isEmpty())
+                return error(503, QStringLiteral("catalog_unavailable"));
+            Result res = ok(feed);
+            res.etag = "\"chg-" + feed.value(QStringLiteral("catalog_id")).toString().toLatin1() + "-"
+                       + QByteArray::number(feed.value(QStringLiteral("high_water")).toInteger()) + "\"";
+            return res;
         }
         if (seg.size() == 2 && seg[1] != QLatin1String("facets")) {
             bool okId = false;

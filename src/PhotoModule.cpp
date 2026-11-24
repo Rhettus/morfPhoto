@@ -1189,6 +1189,14 @@ QJsonObject PhotoModule::indexStatus() const {
         o["last_run"] = QJsonValue(QJsonValue::Null);
     }
     o["catalog_revision"] = catalogRevision();
+    // Identite du catalogue et plus haut numero de changement : un miroir compare ces
+    // deux valeurs a les siennes pour savoir s'il est a jour sans lire le flux.
+    QString catalogId;
+    qint64 highWater = 0;
+    if (repo && repo->changeState(&catalogId, &highWater)) {
+        o["catalog_id"] = catalogId;
+        o["high_water"] = highWater;
+    }
     return o;
 }
 
@@ -1532,6 +1540,16 @@ QJsonObject PhotoModule::libraryPhoto(int fileId, bool* found) const {
 QJsonArray PhotoModule::libraryPhotos(const QVector<int>& fileIds, bool withRaw) const {
     PhotoRepository* repo = readRepo();
     return repo ? repo->libraryPhotos(fileIds, withRaw) : QJsonArray{};
+}
+
+QJsonObject PhotoModule::libraryChanges(qint64 afterSeq, qint64 afterId, int limit) const {
+    PhotoRepository* repo = readRepo();
+    return repo ? repo->libraryChanges(afterSeq, afterId, limit) : QJsonObject{};
+}
+
+bool PhotoModule::changeState(QString* catalogId, qint64* highWater) const {
+    PhotoRepository* repo = readRepo();
+    return repo && repo->changeState(catalogId, highWater);
 }
 
 // --- Contexte photographique (morfphoto-context/2) --------------------------

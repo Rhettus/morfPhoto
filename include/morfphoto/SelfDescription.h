@@ -40,6 +40,7 @@ inline void fillAnnouncedDetail(morfbeacon::PresenceConfig& pc) {
         {QStringLiteral("GET"),    QStringLiteral("/api/v1/photos/focals"),   QStringLiteral("focales brutes distinctes")},
         {QStringLiteral("GET"),    QStringLiteral("/api/v1/photos/years"),    QStringLiteral("annees + comptes")},
         {QStringLiteral("GET"),    QStringLiteral("/api/v1/library"),         QStringLiteral("EXIF + XMP reunis, filtres (xmp.enabled)")},
+        {QStringLiteral("GET"),    QStringLiteral("/api/v1/library/changes"), QStringLiteral("delta du catalogue apres un curseur (after_seq, after_id, limit)")},
         {QStringLiteral("GET"),    QStringLiteral("/api/v1/library/facets"),  QStringLiteral("valeurs filtrables et comptes")},
         {QStringLiteral("GET"),    QStringLiteral("/api/v1/library/{id}"),    QStringLiteral("fiche complete d'une photo")},
         {QStringLiteral("POST"),   QStringLiteral("/api/v1/index"),           QStringLiteral("declenche une passe (async)")},

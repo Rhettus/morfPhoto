@@ -95,6 +95,10 @@ public:
     QJsonObject libraryFacets(const LibraryFilter& filter) const;
     QJsonObject libraryPhoto(int fileId, bool* found) const;
     QJsonArray libraryPhotos(const QVector<int>& fileIds, bool withRaw) const;
+    // Flux de changements (GET /api/v1/library/changes) : voir PhotoRepository::libraryChanges.
+    QJsonObject libraryChanges(qint64 afterSeq, qint64 afterId, int limit) const;
+    // Identite du catalogue et plus haut numero de changement (false si base illisible).
+    bool        changeState(QString* catalogId, qint64* highWater) const;
 
     // --- Contexte photographique par répertoire (morfphoto-context/2) ---
     // Lectures : la liste des répertoires + leur contexte (écran de qualification

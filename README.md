@@ -135,12 +135,48 @@ only. The next pass reads each photo once, and extra formats such as CRW, SR2, A
 GET /api/v1/library          filtered photos, each with its nested versions
 GET /api/v1/library/facets   filterable values with counts
 GET /api/v1/library/{id}     one photo, with raw_exif and raw_xmp
+GET /api/v1/library/changes  what changed after a cursor (delta feed for local mirrors)
 ```
 
 Filters: `min_rating`, `rejected` (`hide`, `only`), `edited` (`edited`, `unedited`), `labels` (bits: red 1, yellow 2,
 green 4, blue 8, purple 16), `unlabeled`, `taken_from`, `taken_to`, `folder_path`, `recursive`, `filename`, and the
 repeatable `kind`, `camera`, `body`, `lens`, `keyword`, `iso`, `aperture`, `focal`, `shutter`. All conditions must
 match the same version, and `matched_versions` lists the ones that did.
+
+### Change feed
+
+A client that keeps a local copy of the catalogue reads `GET /api/v1/library/changes` instead of re-reading
+`/library`. Every real change to a file (new, modified, sidecar or keyword change, gone missing, back, folder
+removed, purged) gets the next number of a persistent counter, taken in the same transaction that writes it, so
+numbers follow commit order. A pass that finds nothing new changes nothing.
+
+```
+GET /api/v1/library/changes?after_seq=S&after_id=I&limit=N
+```
+
+Items come ordered by `(seq, id)`, strictly after the cursor `(after_seq, after_id)` (both default to 0). `limit`
+defaults to 500 and is at most 1000. Page with the cursor, not with `seq` alone: many files can share one `seq`.
+
+```json
+{ "catalog_id": "3f9c1a7e5b2d4c80", "high_water": 912345,
+  "next": { "seq": 901000, "id": 77 },
+  "items": [
+    { "id": 42, "seq": 900001, "state": "present", "path": "/photos/a.ARW", "...": "every /library field, all versions" },
+    { "id": 43, "seq": 900002, "state": "missing", "path": "/photos/b.ARW" },
+    { "id": 44, "seq": 900003, "state": "deleted", "path": "/photos/c.ARW" } ] }
+```
+
+- `present` items are whole files, with every field `/library` returns and the complete current `versions`
+  list: replace what you hold for that id. `missing` covers files that disappeared and files of a removed
+  folder. `deleted` is a purged file (a tombstone): drop it.
+- `next` is the cursor of the following page, or `null` when this page reaches the end. Everything up to
+  `high_water` has then been delivered: keep `(after_seq=high_water, after_id=9223372036854775807)` to resume.
+  All of it is read in one transaction, so a pass writing at the same time cannot make a page skip a row.
+- `catalog_id` identifies the catalogue. It changes when the database is reset (`purge` scope `all`) or
+  recreated; a client holding another one must discard its copy and start from 0.
+- The response carries `ETag: "chg-<catalog_id>-<high_water>"`; `If-None-Match` with it answers `304`.
+  `GET /api/v1/index/status` also reports `catalog_id` and `high_water`, enough to tell a copy is current.
+- Same authentication, compression and error shape as `/library`; `404 library_disabled` without `xmp.enabled`.
 
 ## Run
 

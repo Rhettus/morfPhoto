@@ -140,6 +140,7 @@ formats supplémentaires comme CRW, SR2, AVIF et JXL sont aussi indexés.
 GET /api/v1/library          photos filtrées, avec leurs versions imbriquées
 GET /api/v1/library/facets   valeurs filtrables et comptes
 GET /api/v1/library/{id}     une photo, avec raw_exif et raw_xmp
+GET /api/v1/library/changes  changements après un curseur (flux delta pour miroirs locaux)
 ```
 
 Filtres : `min_rating`, `rejected` (`hide`, `only`), `edited` (`edited`, `unedited`), `labels` (bits : rouge 1, jaune 2,
