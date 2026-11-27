@@ -331,11 +331,10 @@ QString PhotoRepository::catalogRevision() {
         || !q.next())
         return {};
 
-    QByteArray sig;
+    QByteArray sig = QByteArray::number(kSchemaVersion);
     sig.reserve(160);
     for (int i = 0; i < 11; ++i) {
-        if (i > 0)
-            sig.append('|');
+        sig.append('|');
         sig.append(q.value(i).toString().toUtf8());
     }
     return QString::fromLatin1(
@@ -607,15 +606,15 @@ int PhotoRepository::insertFile(int folderId, const FileInfo& info, const ExifDa
              "size, mtime, state, exif_ok, first_seen_at, last_seen_at, last_indexed_at, "
              "taken_at, make, camera_model, lens, focal_length, focal_length_35mm, aperture, "
              "shutter_speed, shutter_speed_s, iso, exposure_compensation, rating, latitude, "
-             "longitude, raw_exif, change_seq) VALUES "
-             "(?,?,?,?,?,?,?,?,'present',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,%1)")
+             "longitude, raw_exif, original_width, original_height, change_seq) VALUES "
+             "(?,?,?,?,?,?,?,?,'present',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,%1)")
              .arg(QString::fromLatin1(kSeqNow)),
         {folderId, info.path, info.directory, info.filename, info.extension, info.fileType,
          info.size, info.mtime, exifOk ? 1 : 0, now, now, now,
          exif.takenAt, exif.make, exif.cameraModel, exif.lens, exif.focalLength,
          exif.focalLength35mm, exif.aperture, exif.shutterSpeed, exif.shutterSpeedS,
          exif.iso, exif.exposureCompensation, exif.rating, exif.latitude, exif.longitude,
-         rawExifVariant(exif)});
+         rawExifVariant(exif), exif.originalWidth, exif.originalHeight});
     const int id = inserted ? q.lastInsertId().toInt() : -1;
     endOwn(own, inserted);
     return id;
@@ -644,6 +643,10 @@ void PhotoRepository::updateFile(int fileId, const FileInfo& info, const ExifDat
                               exif.shutterSpeed, exif.shutterSpeedS, exif.iso,
                               exif.exposureCompensation, exif.rating, exif.latitude,
                               exif.longitude, rawExifVariant(exif)};
+    }
+    if (exifOk || !exif.originalWidth.isNull()) {
+        sql += QStringLiteral(", original_width = ?, original_height = ?");
+        binds += QVariantList{exif.originalWidth, exif.originalHeight};
     }
     sql += QStringLiteral(" WHERE id = ?");
     binds += fileId;
@@ -964,10 +967,10 @@ void PhotoRepository::storeLibrary(int fileId, const QString& fingerprint, const
             run(row, QStringLiteral(
                     "INSERT INTO library_versions (file_id, version, is_copy, sidecar, rating, rejected, "
                     "labels, edited, taken_at, latitude, longitude, title, description, creator, rights, "
-                    "version_name, raw_xmp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+                    "version_name, raw_xmp, publisher, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
                 {fileId, v.version, v.copy ? 1 : 0, v.sidecar.isEmpty() ? QVariant() : QVariant(v.sidecar),
                  v.rating, v.rejected ? 1 : 0, v.labels, edited, v.takenAt, v.latitude, v.longitude,
-                 v.title, v.description, v.creator, v.rights, v.versionName, raw});
+                 v.title, v.description, v.creator, v.rights, v.versionName, raw, v.publisher, v.notes});
             const QVariant versionId = row.lastInsertId();
             if (!v.keywords.isEmpty() && !kwPrepared) {
                 kwPrepared = kw.prepare(QStringLiteral(
@@ -1020,7 +1023,7 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
         QSqlQuery q(db());
         q.exec(QStringLiteral("SELECT id, file_id, version, is_copy, sidecar, rating, rejected, labels, "
                               "edited, taken_at, latitude, longitude, title, description, creator, rights, "
-                              "version_name%1 FROM library_versions WHERE file_id IN (%2) ORDER BY version")
+                              "version_name, publisher, notes%1 FROM library_versions WHERE file_id IN (%2) ORDER BY version")
                    .arg(withRaw ? QStringLiteral(", raw_xmp") : QString(), ids));
         while (q.next()) {
             const int versionId = q.value(0).toInt();
@@ -1045,9 +1048,11 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
             o.insert(QStringLiteral("creator"), valOrNull(q, 14));
             o.insert(QStringLiteral("rights"), valOrNull(q, 15));
             o.insert(QStringLiteral("version_name"), valOrNull(q, 16));
+            o.insert(QStringLiteral("publisher"), valOrNull(q, 17));
+            o.insert(QStringLiteral("notes"), valOrNull(q, 18));
             o.insert(QStringLiteral("has_sidecar"), !sidecarV.isNull());
             if (withRaw) {
-                const QVariant rawV = q.value(17);
+                const QVariant rawV = q.value(19);
                 if (rawV.isNull()) {
                     o.insert(QStringLiteral("raw_xmp"), QJsonValue::Null);
                 } else {
@@ -1089,7 +1094,8 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
             "f.size, f.mtime, f.make, f.camera_model, f.lens, f.focal_length, f.focal_length_35mm, "
             "f.aperture, f.shutter_speed, f.shutter_speed_s, f.iso, f.exposure_compensation, "
             "lf.kind_label AS kind, lf.ext_label AS file_ext, lf.camera_label AS camera, lf.body_key, "
-            "lf.body_serial, lf.iso_label, lf.aperture_label, lf.focal_label, lf.shutter_label%1 "
+            "lf.body_serial, lf.iso_label, lf.aperture_label, lf.focal_label, lf.shutter_label, "
+            "f.original_width, f.original_height, f.first_seen_at%1 "
             "FROM files f JOIN library_files lf ON lf.file_id = f.id JOIN folders fo ON fo.id = f.folder_id "
             "WHERE f.id IN (%2)").arg(withRaw ? QStringLiteral(", f.raw_exif") : QString(), ids));
         while (q.next()) {
@@ -1125,8 +1131,11 @@ QJsonArray PhotoRepository::libraryItems(const QVector<int>& fileIds, const QHas
             o.insert(QStringLiteral("aperture_label"), valOrNull(q, 25));
             o.insert(QStringLiteral("focal_label"), valOrNull(q, 26));
             o.insert(QStringLiteral("shutter_label"), valOrNull(q, 27));
+            o.insert(QStringLiteral("original_width"), valOrNull(q, 28));
+            o.insert(QStringLiteral("original_height"), valOrNull(q, 29));
+            o.insert(QStringLiteral("first_seen_at"), valOrNull(q, 30));
             if (withRaw) {
-                const QVariant rawV = q.value(28);
+                const QVariant rawV = q.value(31);
                 if (rawV.isNull()) {
                     o.insert(QStringLiteral("raw_exif"), QJsonValue::Null);
                 } else {

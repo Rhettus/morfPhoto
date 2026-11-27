@@ -5,6 +5,12 @@ et du [versionnage sémantique](https://semver.org/lang/fr/).
 
 ## [Unreleased]
 
+### Added
+
+- Library and change feed responses include the first-indexed date, source image
+  dimensions, and per-version publisher and notes. The next scan of each
+  existing file fills in the new image and XMP metadata.
+
 ### Changed
 
 - NAS grid thumbnails fit within 400 × 400 pixels without upscaling. morfPhoto

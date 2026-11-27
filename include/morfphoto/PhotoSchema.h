@@ -23,7 +23,7 @@
 // -----------------------------------------------------------------------------
 namespace morfphoto {
 
-inline constexpr int kSchemaVersion = 11;
+inline constexpr int kSchemaVersion = 12;
 
 // Instructions de la migration 001 (création initiale). La colonne calculée
 // `taken_year` permet de regrouper par année sans reparser la date à chaque fois.
@@ -358,6 +358,25 @@ inline QStringList schemaV11Statements() {
     };
 }
 
+// Migration 012 : enrichit la projection de la bibliothèque et republie les
+// fiches existantes sur le flux, même si le disque n'est pas encore accessible.
+inline QStringList schemaV12Statements() {
+    return {
+        QStringLiteral("ALTER TABLE files ADD COLUMN original_width INTEGER"),
+        QStringLiteral("ALTER TABLE files ADD COLUMN original_height INTEGER"),
+        QStringLiteral("ALTER TABLE library_versions ADD COLUMN publisher TEXT"),
+        QStringLiteral("ALTER TABLE library_versions ADD COLUMN notes TEXT"),
+        QStringLiteral("UPDATE library_files SET fingerprint = ''"),
+        QStringLiteral("UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+                       "WHERE key = 'change_seq' AND EXISTS "
+                       "(SELECT 1 FROM library_files JOIN files ON files.id = library_files.file_id "
+                       "WHERE files.state = 'present')"),
+        QStringLiteral("UPDATE files SET change_seq = "
+                       "(SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'change_seq') "
+                       "WHERE state = 'present' AND id IN (SELECT file_id FROM library_files)"),
+    };
+}
+
 // Instructions à exécuter pour atteindre une version de schéma donnée. Le dépôt
 // applique dans l'ordre chaque version manquante (voir applyMigrations).
 inline QStringList migrationStatements(int version) {
@@ -373,6 +392,7 @@ inline QStringList migrationStatements(int version) {
     case 9:  return schemaV9Statements();
     case 10: return schemaV10Statements();
     case 11: return schemaV11Statements();
+    case 12: return schemaV12Statements();
     default: return {};
     }
 }

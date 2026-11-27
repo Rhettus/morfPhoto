@@ -148,6 +148,11 @@ vert 4, bleu 8, violet 16), `unlabeled`, `taken_from`, `taken_to`, `folder_path`
 répétables `kind`, `camera`, `body`, `lens`, `keyword`, `iso`, `aperture`, `focal`, `shutter`. Toutes les conditions
 portent sur la même version, et `matched_versions` indique celles qui correspondent.
 
+Les réponses incluent `first_seen_at` (date de première indexation par morfPhoto), `original_width`
+et `original_height` (dimensions en pixels de l'original, si connues). Chaque version inclut
+`publisher` et `notes` si ces champs sont renseignés dans les métadonnées XMP. Les fiches existantes
+sont enrichies lors de la prochaine lecture de leurs originaux et sidecars.
+
 ## Lancer
 
 ```sh

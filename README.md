@@ -143,6 +143,11 @@ green 4, blue 8, purple 16), `unlabeled`, `taken_from`, `taken_to`, `folder_path
 repeatable `kind`, `camera`, `body`, `lens`, `keyword`, `iso`, `aperture`, `focal`, `shutter`. All conditions must
 match the same version, and `matched_versions` lists the ones that did.
 
+Library responses include `first_seen_at`, the date morfPhoto first indexed the file, plus
+`original_width` and `original_height` in source pixels when available. Each version includes nullable
+`publisher` and `notes` from its XMP metadata. Existing entries receive these fields as their originals
+and sidecars are scanned again.
+
 ### Change feed
 
 A client that keeps a local copy of the catalogue reads `GET /api/v1/library/changes` instead of re-reading

@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QJsonDocument>
+#include <limits>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -42,7 +43,9 @@ const char* const kTags[] = {
 // raw_exif garde exactement son contenu habituel.
 const char* const kLibraryTags[] = {
     "-Subject", "-HierarchicalSubject", "-Label", "-Title", "-Description", "-Creator",
-    "-Rights", "-ExifIFD:SerialNumber",
+    "-Rights", "-XMP-dc:Publisher", "-XMP-acdsee:Notes", "-ExifIFD:SerialNumber",
+    "-ImageWidth#", "-ImageHeight#", "-RawImageWidth#", "-RawImageHeight#",
+    "-ExifIFD:ExifImageWidth#", "-ExifIFD:ExifImageHeight#",
 };
 
 // Format de date ISO imposé : « 2024-06-15 14:23:01 ». SQLite sait le lire, et
@@ -348,6 +351,25 @@ ExifData ExifExtractor::mapTags(const QString& json, QString* error) {
     raw.remove(QStringLiteral("SourceFile"));
     d.raw = raw;
     return d;
+}
+
+QSize ExifExtractor::originalSize(const QJsonObject& tags, bool raw) {
+    const auto dimension = [&tags](const char* key) {
+        const double value = numVar(tags, key).toDouble();
+        if (value >= 1 && value <= std::numeric_limits<int>::max()
+            && value == static_cast<int>(value))
+            return static_cast<int>(value);
+        return 0;
+    };
+    const auto size = [&dimension](const char* width, const char* height) {
+        return QSize(dimension(width), dimension(height));
+    };
+    if (!raw)
+        return size("ImageWidth", "ImageHeight");
+
+    // Un RAW peut annoncer les dimensions du JPEG d'aperçu dans les tags génériques.
+    const QSize exif = size("ExifImageWidth", "ExifImageHeight");
+    return exif.isEmpty() ? size("RawImageWidth", "RawImageHeight") : exif;
 }
 
 } // namespace morfphoto

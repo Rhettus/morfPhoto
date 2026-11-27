@@ -67,6 +67,8 @@ struct ExifData {
     QVariant rating;               // notation
     QVariant latitude;
     QVariant longitude;
+    QVariant originalWidth;
+    QVariant originalHeight;
     QJsonObject raw;               // tags renvoyés, pour extension future
     bool ok = false;               // extraction réussie ?
 };

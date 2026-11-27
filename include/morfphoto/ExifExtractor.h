@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 #include <QHash>
+#include <QSize>
 #include <QStringList>
 #include "morfphoto/PhotoTypes.h"
 
@@ -59,6 +60,7 @@ public:
     // Mappe une sortie JSON d'ExifTool sur ExifData. Statique et public pour être
     // testable sans lancer ExifTool (le cœur fragile de la souveraineté des valeurs).
     static ExifData mapTags(const QString& json, QString* error);
+    static QSize originalSize(const QJsonObject& tags, bool raw);
 
     // Position du marqueur « {readyN} » s'il occupe une ligne entiere du flux stay_open,
     // sinon -1. Public pour le test (un nom de fichier ne doit pas le simuler).

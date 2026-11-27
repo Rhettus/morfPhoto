@@ -15,6 +15,7 @@
 #include <QSet>
 #include <QDir>
 #include <QFileInfo>
+#include <QImageReader>
 #include <QFile>
 #include <QMutexLocker>
 
@@ -377,8 +378,8 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
                 item.knownState = it->state;
                 if (m_library) {
                     const auto fp = fingerprints.constFind(it->id);
-                    if (fp == fingerprints.constEnd()) {
-                        // Indexee avant l'activation : il manque les champs demandes a ExifTool.
+                    if (fp == fingerprints.constEnd() || fp->isEmpty()) {
+                        // Activation de la bibliothèque ou migration des métadonnées d'origine.
                         item.action = ChunkAction::Update;
                         item.needsExif = true;
                     } else if (*fp != info.sidecarFingerprint) {
@@ -417,6 +418,21 @@ bool Indexer::reconcileScope(const FolderRow& folder, const QString& scopePath, 
                     item.exif = m_extractor->extract(item.info->path, &item.exifError);
                 }
                 item.exifOk = item.exif.ok;
+            }
+
+            if (item.needsExif && m_library) {
+                const bool raw = item.info->fileType == QLatin1String("raw");
+                QSize size;
+                if (!raw) {
+                    QImageReader reader(item.info->path);
+                    size = reader.size();
+                }
+                if (size.isEmpty())
+                    size = ExifExtractor::originalSize(item.exif.raw, raw);
+                if (!size.isEmpty()) {
+                    item.exif.originalWidth = size.width();
+                    item.exif.originalHeight = size.height();
+                }
             }
 
             if (item.action != ChunkAction::Insert && item.action != ChunkAction::Update

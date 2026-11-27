@@ -32,6 +32,7 @@ QString prefixFor(QStringView uri) {
         {QStringLiteral("http://ns.adobe.com/xap/1.0/"), QStringLiteral("xmp")},
         {QStringLiteral("http://purl.org/dc/elements/1.1/"), QStringLiteral("dc")},
         {QStringLiteral("http://ns.adobe.com/lightroom/1.0/"), QStringLiteral("lr")},
+        {QStringLiteral("http://ns.acdsee.com/iptc/1.0/"), QStringLiteral("acdsee")},
         {QStringLiteral("http://darktable.sf.net/"), QStringLiteral("darktable")},
         {QStringLiteral("http://ns.adobe.com/exif/1.0/"), QStringLiteral("exif")},
         {QStringLiteral("http://ns.adobe.com/camera-raw-settings/1.0/"), QStringLiteral("crs")},
@@ -312,6 +313,13 @@ LibraryVersion mergeVersion(int version, const QString& sidecarPath, const Sidec
     out.description = textOr(firstOf(sidecar, "dc:description"), raw, "Description", authoritative);
     out.creator = textOr(firstOf(sidecar, "dc:creator"), raw, "Creator", authoritative);
     out.rights = textOr(firstOf(sidecar, "dc:rights"), raw, "Rights", authoritative);
+    out.publisher = textOr(firstOf(sidecar, "dc:publisher"), raw, "Publisher", authoritative);
+    if (sidecar && sidecar->properties.contains(QStringLiteral("acdsee:notes"))) {
+        const QString notes = firstOf(sidecar, "acdsee:notes");
+        out.notes = notes.isEmpty() ? QVariant() : QVariant(notes);
+    } else {
+        out.notes = textOr(firstOf(sidecar, "darktable:notes"), raw, "Notes", authoritative);
+    }
     const QString versionName = firstOf(sidecar, "darktable:version_name");
     out.versionName = versionName.isEmpty() ? QVariant() : QVariant(versionName);
 

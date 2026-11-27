@@ -46,6 +46,8 @@ struct LibraryVersion {
     QVariant    creator;
     QVariant    rights;
     QVariant    versionName;
+    QVariant    publisher;
+    QVariant    notes;
     QStringList keywords;             // niveaux separes par « | »
     QJsonObject rawXmp;
 };

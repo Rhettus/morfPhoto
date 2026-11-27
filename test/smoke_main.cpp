@@ -167,11 +167,23 @@ int main(int argc, char** argv) {
         "[{\"SourceFile\":\"x\",\"DateTimeOriginal\":\"2017-02-11 22:18:38\","
         "\"Make\":\"NIKON\",\"Model\":\"NIKON D7200\",\"LensModel\":\"18-105\","
         "\"FocalLength\":30.0,\"FNumber\":7.1,\"ExposureTime\":0.0166,"
-        "\"ShutterSpeed\":\"1/60\",\"ISO\":3200}]");
+        "\"ShutterSpeed\":\"1/60\",\"ISO\":3200,\"ImageWidth\":160,\"ImageHeight\":120,"
+        "\"RawImageWidth\":6048,\"RawImageHeight\":4024,\"ExifImageWidth\":6000,\"ExifImageHeight\":4000}]");
     QString mapErr;
     const ExifData d = ExifExtractor::mapTags(json, &mapErr);
     CHECK(mapErr.isEmpty() && d.ok, "mapTags: succes");
     CHECK(d.focalLength.toDouble() == 30.0, "focale brute preservee (30)");
+    CHECK(ExifExtractor::originalSize(d.raw, true) == QSize(6000, 4000),
+          "RAW: dimensions EXIF pleine résolution prioritaires");
+    CHECK(ExifExtractor::originalSize(d.raw, false) == QSize(160, 120),
+          "raster: dimensions du conteneur prioritaires sur celles d’EXIF");
+    QJsonObject rawSizeTags = d.raw;
+    rawSizeTags.remove(QStringLiteral("ExifImageHeight"));
+    CHECK(ExifExtractor::originalSize(rawSizeTags, true) == QSize(6048, 4024),
+          "RAW: paire RAW explicite si la paire EXIF est incomplète");
+    rawSizeTags.remove(QStringLiteral("RawImageWidth"));
+    CHECK(ExifExtractor::originalSize(rawSizeTags, true).isEmpty(),
+          "RAW: dimensions inconnues si seul l’aperçu est mesuré");
     CHECK(d.shutterSpeed.toString() == QLatin1String("1/60"), "vitesse lisible conservee");
     CHECK(d.shutterSpeedS.toDouble() == 0.0166, "vitesse numerique conservee");
     CHECK(d.cameraModel.toString() == QLatin1String("NIKON D7200"), "boitier mappe");
@@ -640,6 +652,7 @@ int main(int argc, char** argv) {
             "xmlns:x=\"adobe:ns:meta/\" xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" "
             "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
             "xmlns:lr=\"http://ns.adobe.com/lightroom/1.0/\" xmlns:darktable=\"http://darktable.sf.net/\" "
+            "xmlns:acdsee=\"http://ns.acdsee.com/iptc/1.0/\" "
             "xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" xmlns:immage=\"https://github.com/Rhettus/immage/ns/1.0/\"";
         auto xmp = [&ns](const QByteArray& attributes, const QByteArray& body) {
             return "<x:xmpmeta " + ns + "><rdf:RDF><rdf:Description rdf:about=\"\" " + attributes + ">"
@@ -649,6 +662,8 @@ int main(int argc, char** argv) {
             "<darktable:history><rdf:Seq><rdf:li darktable:num=\"0\"/></rdf:Seq></darktable:history>"
             "<darktable:colorlabels><rdf:Seq><rdf:li>0</rdf:li><rdf:li>3</rdf:li></rdf:Seq></darktable:colorlabels>"
             "<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Titre</rdf:li></rdf:Alt></dc:title>"
+            "<dc:publisher><rdf:Bag><rdf:li>Studio</rdf:li></rdf:Bag></dc:publisher>"
+            "<acdsee:notes>Notes de la version</acdsee:notes>"
             "<dc:subject><rdf:Bag><rdf:li>japan</rdf:li></rdf:Bag></dc:subject>"
             "<lr:hierarchicalSubject><rdf:Bag><rdf:li>travel|japan</rdf:li>"
             "<rdf:li>darktable|format|orf</rdf:li></rdf:Bag></lr:hierarchicalSubject>";
@@ -677,6 +692,8 @@ int main(int argc, char** argv) {
         CHECK(v.takenAt.toString() == QLatin1String("2023-02-19 17:52:53"), "xmp: date du sidecar prioritaire");
         CHECK(qFuzzyCompare(v.latitude.toDouble(), -48.5), "xmp: GPS sud converti");
         CHECK(v.title.toString() == QLatin1String("Titre"), "xmp: titre lu");
+        CHECK(v.publisher.toString() == QLatin1String("Studio") &&
+              v.notes.toString() == QLatin1String("Notes de la version"), "xmp: éditeur et notes par version");
 
         const SidecarData autoOnly = parseSidecar(xmp(
             "darktable:xmp_version=\"5\" darktable:history_auto_hash=\"a\" "
@@ -685,6 +702,21 @@ int main(int argc, char** argv) {
         CHECK(av.edited.isValid() && !av.edited.toBool(), "xmp: reglages automatiques seuls -> non retouchee");
         CHECK(av.rejected && av.rating == 0, "xmp: note -1 -> rejetee");
         CHECK(av.keywords.isEmpty(), "xmp: sidecar darktable sans mot-cle fait foi");
+
+        exifBase.raw[QStringLiteral("Notes")] = QStringLiteral("Embedded");
+        const SidecarData oldNotes = parseSidecar(xmp("darktable:notes=\"Old Immage\"", ""));
+        const SidecarData bothNotes = parseSidecar(xmp(
+            "darktable:notes=\"Old Immage\" acdsee:notes=\"Current\"", ""));
+        const SidecarData clearedNotes = parseSidecar(xmp(
+            "darktable:notes=\"Old Immage\"", "<acdsee:notes/>"));
+        CHECK(mergeVersion(0, QStringLiteral("/x.xmp"), &oldNotes, exifBase).notes.toString()
+                  == QLatin1String("Old Immage")
+              && mergeVersion(0, QStringLiteral("/x.xmp"), &bothNotes, exifBase).notes.toString()
+                  == QLatin1String("Current")
+              && mergeVersion(0, QStringLiteral("/x.xmp"), &clearedNotes, exifBase).notes.isNull()
+              && mergeVersion(0, QStringLiteral("/x.xmp"), &autoOnly, exifBase).notes.isNull()
+              && mergeVersion(0, QString(), nullptr, exifBase).notes.toString() == QLatin1String("Embedded"),
+              "xmp: priorité aux notes standard et repli sur les anciennes notes Immage");
 
         const SidecarData managed = parseSidecar(xmp("immage:locationManaged=\"True\"", ""));
         CHECK(mergeVersion(0, QStringLiteral("/x.xmp"), &managed, exifBase).latitude.isNull(),
@@ -709,7 +741,9 @@ int main(int argc, char** argv) {
         };
         writeBytes(lib + QStringLiteral("/2024/a.nef"), 100);
         writeBytes(lib + QStringLiteral("/2024/a_01.nef"), 110);       // vrai fichier, pas une copie
-        writeBytes(lib + QStringLiteral("/2024/b.jpg"), 120);
+        QImage source(640, 480, QImage::Format_RGB32);
+        source.fill(Qt::blue);
+        CHECK(source.save(lib + QStringLiteral("/2024/b.jpg"), "JPEG"), "bibliothèque: JPEG test généré");
         writeBytes(lib + QStringLiteral("/2024/sub/c.sr2"), 130);      // format supplementaire
         put(lib + QStringLiteral("/2024/a.nef.xmp"), edited);
         put(lib + QStringLiteral("/2024/a_02.nef.xmp"), xmp(
@@ -772,6 +806,17 @@ int main(int argc, char** argv) {
         CHECK(total(realFile) == 1, "sidecar: un vrai fichier a_01 garde le sien");
         LibraryFilter shared; shared.filename = QStringLiteral("b.jpg"); shared.minRating = 3;
         CHECK(total(shared) == 1, "sidecar: repli sur b.xmp");
+        const QJsonObject jpeg = lrepo.libraryList(shared, 1, 50).value(QStringLiteral("items"))
+            .toArray().at(0).toObject();
+        CHECK(jpeg.value(QStringLiteral("original_width")).toInt() == 640 &&
+              jpeg.value(QStringLiteral("original_height")).toInt() == 480,
+              "bibliothèque: dimensions du fichier JPEG sans extracteur EXIF");
+        const QJsonArray metadataVersions = item.value(QStringLiteral("versions")).toArray();
+        CHECK(metadataVersions.at(0).toObject().value(QStringLiteral("publisher")).toString() == QLatin1String("Studio") &&
+              metadataVersions.at(0).toObject().value(QStringLiteral("notes")).toString() == QLatin1String("Notes de la version") &&
+              metadataVersions.at(1).toObject().value(QStringLiteral("publisher")).isNull() &&
+              metadataVersions.at(1).toObject().value(QStringLiteral("notes")).isNull(),
+              "bibliothèque: éditeur et notes sont spécifiques à la version");
         LibraryFilter kind; kind.kinds = {QStringLiteral("RAW")};
         CHECK(total(kind) == 3, "filtre: groupe RAW");
         LibraryFilter folder; folder.folderPath = lib + QStringLiteral("/2024");
@@ -1060,7 +1105,7 @@ int main(int argc, char** argv) {
         cr.close();
     }
 
-    // Migration 11 depuis une base v10 : numeros distincts croissants pour l'existant.
+    // Migrations 11 et 12 : initialisation du flux puis republication des fiches.
     {
         const QString v10 = base + QStringLiteral("/v10.sqlite");
         {
@@ -1090,12 +1135,16 @@ int main(int argc, char** argv) {
         QSqlDatabase::removeDatabase(QStringLiteral("smoke:v10"));
         PhotoRepository mig(QStringLiteral("smoke:v10repo"));
         CHECK(mig.open(v10), "migration 11: base v10 migree");
-        const QMap<qint64, FeedEntry> m = drainFeed(mig, 0, 0, 500);
-        QSet<qint64> seqs;
-        for (const FeedEntry& e : m) seqs.insert(e.seq);
+        const QMap<qint64, FeedEntry> m = drainFeed(mig, 12, kAfterAll, 1);
         const qint64 hw = feedHighWater(mig);
-        CHECK(m.size() == 3 && seqs.size() == 3 && hw == 12 && *std::max_element(seqs.begin(), seqs.end()) <= hw,
-              "migration 11: lignes existantes numerotees distinctement, compteur apres elles");
+        CHECK(m.size() == 3 && hw == 13 && m.value(5).seq == hw && m.value(9).seq == hw && m.value(12).seq == hw,
+              "migration 12: les fiches existantes sont renvoyées aux miroirs avec le même numéro");
+        const QJsonObject migrated = mig.libraryChanges(12, kAfterAll, 1)
+            .value(QStringLiteral("items")).toArray().at(0).toObject();
+        CHECK(migrated.value(QStringLiteral("first_seen_at")).toString() == QLatin1String("x")
+              && migrated.value(QStringLiteral("original_width")).isNull()
+              && migrated.value(QStringLiteral("original_height")).isNull(),
+              "migration 12: date de première apparition conservée, dimensions inconnues avant le scan");
         mig.close();
     }
 
